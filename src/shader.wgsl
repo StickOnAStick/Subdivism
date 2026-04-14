@@ -39,33 +39,6 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     return out;
 }
 
-fn terrain_height(world_x: f32, world_z: f32, seed: f32) -> f32 {
-    let s = seed * 0.0001;
-    let terrain = round(
-        sin(world_x * 0.035 + s) * 6.5
-            + cos(world_z * 0.028 + s * 2.0) * 5.0
-            + sin((world_x + world_z) * 0.012) * 3.0
-    );
-    return clamp(32.0 + terrain, 2.0, 60.0);
-}
-
-fn terrain_shadow(world_pos: vec3<f32>, light_dir: vec3<f32>, seed: f32) -> f32 {
-    var shadow = 1.0;
-    var distance = 8.0;
-
-    for (var i: i32 = 0; i < 4; i = i + 1) {
-        let sample = world_pos + light_dir * distance;
-        let terrain_y = terrain_height(sample.x, sample.z, seed);
-        if terrain_y > sample.y - 0.15 {
-            let weight = 1.0 - f32(i) * 0.18;
-            shadow = min(shadow, 1.0 - 0.45 * weight);
-        }
-        distance = distance + 12.0;
-    }
-
-    return shadow;
-}
-
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let n = normalize(in.normal);
@@ -74,26 +47,20 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let sun_intensity = lighting.params.x;
     let moon_intensity = lighting.params.y;
     let ambient = lighting.params.z;
-    let seed = lighting.params.w;
 
     let sun_ndotl = max(dot(n, sun_dir), 0.0);
     let moon_ndotl = max(dot(n, moon_dir), 0.0);
     let soft_sun = smoothstep(0.0, 0.85, sun_ndotl);
     let soft_moon = smoothstep(0.0, 0.95, moon_ndotl);
 
-    var sun_shadow = 1.0;
-    if sun_intensity > 0.02 && sun_ndotl > 0.02 {
-        sun_shadow = terrain_shadow(in.world_position, sun_dir, seed);
-    }
-    let sun_light = soft_sun * sun_intensity * sun_shadow;
-    let moon_light = soft_moon * moon_intensity * 0.85;
+    let sky_visibility = smoothstep(-0.35, 0.90, dot(n, vec3<f32>(0.0, 1.0, 0.0)));
+    let ambient_light = ambient * mix(0.70, 1.0, sky_visibility);
+    let sun_light = soft_sun * sun_intensity;
+    let moon_light = soft_moon * moon_intensity * 0.82;
+    let underground = smoothstep(6.0, -6.0, in.world_position.y);
+    let depth_dim = mix(1.0, 0.88, underground);
 
-    let surface_y = terrain_height(in.world_position.x, in.world_position.z, seed);
-    let depth_below_surface = max(surface_y - in.world_position.y, 0.0);
-    let cave_darkness = smoothstep(0.5, 9.0, depth_below_surface);
-    let cave_factor = 1.0 - cave_darkness * 0.82;
-
-    let total_light = (ambient + sun_light + moon_light) * cave_factor;
+    let total_light = clamp(ambient_light + sun_light + moon_light, 0.06, 2.2) * depth_dim;
     let base = in.color * total_light;
     return vec4<f32>(base, 1.0);
 }

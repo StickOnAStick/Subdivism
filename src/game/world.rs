@@ -5,11 +5,13 @@ use std::{
 
 use glam::Vec3;
 
-use crate::mesh::{push_quad, Vertex};
+use crate::mesh::{Vertex, push_quad};
 
 pub const CHUNK_SIZE: i64 = 16;
 pub const WORLD_HEIGHT: i32 = 64;
+pub const DEFAULT_WORLD_SEED: i64 = 0x5EED_BA5E_u64 as i64;
 
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Block {
     Air,
@@ -21,6 +23,19 @@ pub enum Block {
 impl Block {
     pub fn is_solid(self) -> bool {
         !matches!(self, Self::Air)
+    }
+
+    fn to_id(self) -> u8 {
+        self as u8
+    }
+
+    fn from_id(id: u8) -> Self {
+        match id {
+            1 => Self::Grass,
+            2 => Self::Dirt,
+            3 => Self::Stone,
+            _ => Self::Air,
+        }
     }
 }
 
@@ -95,6 +110,16 @@ impl TerrainConfig {
             ..Self::balanced()
         }
     }
+
+    pub fn from_profile_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "balanced" => Some(Self::balanced()),
+            "alpine" | "mountain" | "mountains" => Some(Self::alpine()),
+            "canyon" | "cliff" | "cliffs" => Some(Self::canyon()),
+            "valleylands" | "valley" | "valleys" => Some(Self::valleylands()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -111,7 +136,10 @@ impl World {
     }
 
     pub fn generate_with_terrain(terrain: TerrainConfig) -> Self {
-        let seed = 0x5EED_BA5E_u64 as i64;
+        Self::generate_with_terrain_and_seed(terrain, DEFAULT_WORLD_SEED)
+    }
+
+    pub fn generate_with_terrain_and_seed(terrain: TerrainConfig, seed: i64) -> Self {
         let mut world = Self {
             overrides: Arc::new(RwLock::new(HashMap::new())),
             spawn_point: Vec3::ZERO,
@@ -167,9 +195,8 @@ impl World {
         let mut vertices = Vec::new();
 
         let mut sampled_heights = vec![0.0_f32; ((cells + 1) * (cells + 1)) as usize];
-        let height_at = |heights: &[f32], x: i64, z: i64| -> f32 {
-            heights[(z * (cells + 1) + x) as usize]
-        };
+        let height_at =
+            |heights: &[f32], x: i64, z: i64| -> f32 { heights[(z * (cells + 1) + x) as usize] };
         let set_height = |heights: &mut [f32], x: i64, z: i64, value: f32| {
             let index = (z * (cells + 1) + x) as usize;
             heights[index] = value;
@@ -314,27 +341,75 @@ impl World {
         chunk: (i64, i64),
         overrides: &HashMap<BlockPos, Block>,
     ) -> Vec<Vertex> {
-        let mut vertices = Vec::new();
         let base_x = chunk.0 * CHUNK_SIZE;
         let base_z = chunk.1 * CHUNK_SIZE;
+        let xz_extent = (CHUNK_SIZE + 2) as usize;
+        let y_extent = WORLD_HEIGHT as usize;
+        let layer_stride = xz_extent * xz_extent;
+        let mut block_ids = vec![Block::Air.to_id(); layer_stride * y_extent];
+        let mut column_top = vec![0_usize; xz_extent * xz_extent];
 
-        for local_z in 0..CHUNK_SIZE {
-            for local_x in 0..CHUNK_SIZE {
-                let world_x = base_x + local_x;
-                let world_z = base_z + local_z;
+        let grid_index = |x: usize, y: usize, z: usize| y * layer_stride + z * xz_extent + x;
+        let column_index = |x: usize, z: usize| z * xz_extent + x;
+
+        // Populate a chunk-local voxel cache (with a 1-block border) once, then mesh from it.
+        for local_z in 0..xz_extent {
+            let world_z = base_z + local_z as i64 - 1;
+            for local_x in 0..xz_extent {
+                let world_x = base_x + local_x as i64 - 1;
                 let surface_y = self.surface_height(world_x, world_z);
-                for y in 0..=surface_y {
-                    let block = self.block_at_with_overrides(overrides, world_x, y, world_z);
-                    if !block.is_solid() {
+                let clamped_top = surface_y.clamp(0, WORLD_HEIGHT - 1) as usize;
+                column_top[column_index(local_x, local_z)] = clamped_top;
+                for y in 0..=clamped_top {
+                    let block = procedural_block_for_height(surface_y, y as i32);
+                    block_ids[grid_index(local_x, y, local_z)] = block.to_id();
+                }
+            }
+        }
+
+        if !overrides.is_empty() {
+            let min_x = base_x - 1;
+            let max_x = base_x + CHUNK_SIZE;
+            let min_z = base_z - 1;
+            let max_z = base_z + CHUNK_SIZE;
+            for (pos, block) in overrides {
+                if !(0..WORLD_HEIGHT).contains(&pos.y) {
+                    continue;
+                }
+                if pos.x < min_x || pos.x > max_x || pos.z < min_z || pos.z > max_z {
+                    continue;
+                }
+                let local_x = (pos.x - base_x + 1) as usize;
+                let local_z = (pos.z - base_z + 1) as usize;
+                let y = pos.y as usize;
+                block_ids[grid_index(local_x, y, local_z)] = block.to_id();
+                if block.is_solid() {
+                    let top = &mut column_top[column_index(local_x, local_z)];
+                    if y > *top {
+                        *top = y;
+                    }
+                }
+            }
+        }
+
+        let mut vertices = Vec::with_capacity(24_576);
+        for local_z in 1..=CHUNK_SIZE as usize {
+            let world_z = base_z + local_z as i64 - 1;
+            for local_x in 1..=CHUNK_SIZE as usize {
+                let world_x = base_x + local_x as i64 - 1;
+                let top =
+                    column_top[column_index(local_x, local_z)].min(y_extent.saturating_sub(1));
+                for y in 0..=top {
+                    let block_id = block_ids[grid_index(local_x, y, local_z)];
+                    if block_id == Block::Air.to_id() {
                         continue;
                     }
-
+                    let block = Block::from_id(block_id);
                     let base = Vec3::new(world_x as f32, y as f32, world_z as f32);
                     let (top_color, side_color, bottom_color) = palette(block, world_x, world_z);
 
-                    if !self
-                        .block_at_with_overrides(overrides, world_x, y + 1, world_z)
-                        .is_solid()
+                    if y + 1 >= y_extent
+                        || block_ids[grid_index(local_x, y + 1, local_z)] == Block::Air.to_id()
                     {
                         push_quad(
                             &mut vertices,
@@ -348,10 +423,7 @@ impl World {
                             Vec3::Y,
                         );
                     }
-                    if y > 0
-                        && !self
-                            .block_at_with_overrides(overrides, world_x, y - 1, world_z)
-                            .is_solid()
+                    if y > 0 && block_ids[grid_index(local_x, y - 1, local_z)] == Block::Air.to_id()
                     {
                         push_quad(
                             &mut vertices,
@@ -365,10 +437,7 @@ impl World {
                             -Vec3::Y,
                         );
                     }
-                    if !self
-                        .block_at_with_overrides(overrides, world_x - 1, y, world_z)
-                        .is_solid()
-                    {
+                    if block_ids[grid_index(local_x - 1, y, local_z)] == Block::Air.to_id() {
                         push_quad(
                             &mut vertices,
                             [
@@ -381,10 +450,7 @@ impl World {
                             -Vec3::X,
                         );
                     }
-                    if !self
-                        .block_at_with_overrides(overrides, world_x + 1, y, world_z)
-                        .is_solid()
-                    {
+                    if block_ids[grid_index(local_x + 1, y, local_z)] == Block::Air.to_id() {
                         push_quad(
                             &mut vertices,
                             [
@@ -397,10 +463,7 @@ impl World {
                             Vec3::X,
                         );
                     }
-                    if !self
-                        .block_at_with_overrides(overrides, world_x, y, world_z - 1)
-                        .is_solid()
-                    {
+                    if block_ids[grid_index(local_x, y, local_z - 1)] == Block::Air.to_id() {
                         push_quad(
                             &mut vertices,
                             [
@@ -413,10 +476,7 @@ impl World {
                             -Vec3::Z,
                         );
                     }
-                    if !self
-                        .block_at_with_overrides(overrides, world_x, y, world_z + 1)
-                        .is_solid()
-                    {
+                    if block_ids[grid_index(local_x, y, local_z + 1)] == Block::Air.to_id() {
                         push_quad(
                             &mut vertices,
                             [
@@ -463,13 +523,7 @@ impl World {
         if y > surface_y {
             return Block::Air;
         }
-        if y == surface_y {
-            return Block::Grass;
-        }
-        if y >= surface_y - 2 {
-            return Block::Dirt;
-        }
-        Block::Stone
+        procedural_block_for_height(surface_y, y)
     }
 
     fn surface_height(&self, x: i64, z: i64) -> i32 {
@@ -477,7 +531,14 @@ impl World {
         let fx = x as f32;
         let fz = z as f32;
 
-        let macro_noise = fbm_2d(self.seed, fx * cfg.macro_scale, fz * cfg.macro_scale, 4, 2.0, 0.5);
+        let macro_noise = fbm_2d(
+            self.seed,
+            fx * cfg.macro_scale,
+            fz * cfg.macro_scale,
+            4,
+            2.0,
+            0.5,
+        );
         let detail_noise = fbm_2d(
             self.seed.wrapping_add(0x6A09_E667),
             fx * cfg.detail_scale,
@@ -531,21 +592,18 @@ impl World {
     }
 }
 
-fn ridge_fbm_2d(
-    seed: i64,
-    x: f32,
-    z: f32,
-    octaves: u32,
-    lacunarity: f32,
-    gain: f32,
-) -> f32 {
+fn ridge_fbm_2d(seed: i64, x: f32, z: f32, octaves: u32, lacunarity: f32, gain: f32) -> f32 {
     let mut amplitude = 1.0;
     let mut frequency = 1.0;
     let mut sum = 0.0;
     let mut norm = 0.0;
 
     for octave in 0..octaves {
-        let n = value_noise_2d(seed.wrapping_add(octave as i64 * 97), x * frequency, z * frequency);
+        let n = value_noise_2d(
+            seed.wrapping_add(octave as i64 * 97),
+            x * frequency,
+            z * frequency,
+        );
         let ridge = 1.0 - n.abs();
         sum += ridge * amplitude;
         norm += amplitude;
@@ -567,7 +625,11 @@ fn fbm_2d(seed: i64, x: f32, z: f32, octaves: u32, lacunarity: f32, gain: f32) -
     let mut norm = 0.0;
 
     for octave in 0..octaves {
-        let n = value_noise_2d(seed.wrapping_add(octave as i64 * 131), x * frequency, z * frequency);
+        let n = value_noise_2d(
+            seed.wrapping_add(octave as i64 * 131),
+            x * frequency,
+            z * frequency,
+        );
         sum += n * amplitude;
         norm += amplitude;
         amplitude *= gain;
@@ -628,6 +690,16 @@ fn div_floor(value: i64, divisor: i64) -> i64 {
         result -= 1;
     }
     result
+}
+
+fn procedural_block_for_height(surface_y: i32, y: i32) -> Block {
+    if y == surface_y {
+        return Block::Grass;
+    }
+    if y >= surface_y - 2 {
+        return Block::Dirt;
+    }
+    Block::Stone
 }
 
 fn palette(block: Block, x: i64, z: i64) -> ([f32; 3], [f32; 3], [f32; 3]) {

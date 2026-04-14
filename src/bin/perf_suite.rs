@@ -3,6 +3,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Write},
     path::Path,
+    process::Command,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -63,9 +64,14 @@ fn main() {
     let theoretical_chunks_per_sec = peak_chunks_per_sec * hw_threads;
     let theoretical_vertices_per_sec = peak_vertices_per_sec * hw_threads;
     let previous = read_previous_chunks_per_sec(LATEST_RESULTS_FILE);
+    let run_number = next_run_number(HISTORY_FILE);
+    let git_hash = current_git_state_hash();
+    archive_previous_latest(run_number, &git_hash);
 
     write_latest_results(
         run_epoch,
+        run_number,
+        &git_hash,
         run_mode,
         &results,
         query_qps,
@@ -75,6 +81,8 @@ fn main() {
     );
     append_history(
         run_epoch,
+        run_number,
+        &git_hash,
         run_mode,
         &results,
         query_qps,
@@ -84,7 +92,7 @@ fn main() {
     );
 
     println!("Perf suite complete.");
-    println!("Mode: {}", run_mode);
+    println!("Mode: {} (run #{}, git {})", run_mode, run_number, git_hash);
     println!("Use `cargo run --bin perf_suite -- --full` for full coverage.");
     println!("Wrote {}", LATEST_RESULTS_FILE);
     println!("Wrote {}", HISTORY_FILE);
@@ -147,7 +155,11 @@ fn warm_up(world: &World) {
     }
 }
 
-fn run_chunk_mesh_scenario(world: &World, scenario: &str, keys: &[ChunkRenderKey]) -> ScenarioResult {
+fn run_chunk_mesh_scenario(
+    world: &World,
+    scenario: &str,
+    keys: &[ChunkRenderKey],
+) -> ScenarioResult {
     let mut lod_counts = [0_u32; 8];
     let start = Instant::now();
     let mut vertices_total = 0_usize;
@@ -313,6 +325,8 @@ fn collect_lod_ring(
 
 fn write_latest_results(
     run_epoch: u64,
+    run_number: u64,
+    git_hash: &str,
     run_mode: &str,
     results: &[ScenarioResult],
     query_qps: f64,
@@ -324,15 +338,17 @@ fn write_latest_results(
     let mut file = File::create(LATEST_RESULTS_FILE).expect("failed to create latest results file");
     writeln!(
         file,
-        "run_epoch,mode,scenario,lod_distribution,chunks,elapsed_ms,chunks_per_sec,vertices_total,vertices_per_chunk,vertices_per_sec,query_qps,hw_threads,theoretical_chunks_per_sec,theoretical_vertices_per_sec"
+        "run_epoch,run_number,git_hash,mode,scenario,lod_distribution,chunks,elapsed_ms,chunks_per_sec,vertices_total,vertices_per_chunk,vertices_per_sec,query_qps,hw_threads,theoretical_chunks_per_sec,theoretical_vertices_per_sec"
     )
     .expect("failed to write header");
 
     for result in results {
         writeln!(
             file,
-            "{},{},{},{},{},{:.4},{:.4},{},{:.4},{:.4},{:.4},{:.0},{:.4},{:.4}",
+            "{},{},{},{},{},{},{},{:.4},{:.4},{},{:.4},{:.4},{:.4},{:.0},{:.4},{:.4}",
             run_epoch,
+            run_number,
+            git_hash,
             run_mode,
             result.scenario,
             result.lod_distribution,
@@ -353,6 +369,8 @@ fn write_latest_results(
 
 fn append_history(
     run_epoch: u64,
+    run_number: u64,
+    git_hash: &str,
     run_mode: &str,
     results: &[ScenarioResult],
     query_qps: f64,
@@ -361,7 +379,7 @@ fn append_history(
     theoretical_vertices_per_sec: f64,
 ) {
     fs::create_dir_all(OUTPUT_DIR).expect("failed to create perf output directory");
-    const HISTORY_HEADER: &str = "run_epoch,mode,peak_chunks_per_sec,peak_vertices_per_sec,theoretical_chunks_per_sec,theoretical_vertices_per_sec,rd128_elapsed_ms,rd128_chunks,query_qps,hw_threads";
+    const HISTORY_HEADER: &str = "run_epoch,run_number,git_hash,mode,peak_chunks_per_sec,peak_vertices_per_sec,theoretical_chunks_per_sec,theoretical_vertices_per_sec,rd128_elapsed_ms,rd128_chunks,query_qps,hw_threads";
     let mut needs_header = true;
     if Path::new(HISTORY_FILE).exists() {
         if let Ok(file) = File::open(HISTORY_FILE) {
@@ -402,8 +420,10 @@ fn append_history(
 
     writeln!(
         file,
-        "{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{},{:.4},{:.0}",
+        "{},{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{},{:.4},{:.0}",
         run_epoch,
+        run_number,
+        git_hash,
         run_mode,
         peak_chunks,
         peak_vertices,
@@ -424,22 +444,140 @@ fn read_previous_chunks_per_sec(path: &str) -> HashMap<String, f64> {
         Err(_) => return map,
     };
     let reader = BufReader::new(file);
+    let mut scenario_index = 4_usize;
+    let mut chunks_per_sec_index = 8_usize;
     for (index, line) in reader.lines().enumerate() {
         let Ok(line) = line else {
             continue;
         };
-        if index == 0 || line.trim().is_empty() {
+        if line.trim().is_empty() {
             continue;
         }
         let cols: Vec<&str> = line.split(',').collect();
-        if cols.len() < 7 {
+        if index == 0 {
+            for (i, name) in cols.iter().enumerate() {
+                if *name == "scenario" {
+                    scenario_index = i;
+                }
+                if *name == "chunks_per_sec" {
+                    chunks_per_sec_index = i;
+                }
+            }
             continue;
         }
-        if let Ok(chunks_per_sec) = cols[6].parse::<f64>() {
-            map.insert(cols[2].to_string(), chunks_per_sec);
+        if cols.len() <= scenario_index || cols.len() <= chunks_per_sec_index {
+            continue;
+        }
+        if let Ok(chunks_per_sec) = cols[chunks_per_sec_index].parse::<f64>() {
+            map.insert(cols[scenario_index].to_string(), chunks_per_sec);
         }
     }
     map
+}
+
+fn next_run_number(path: &str) -> u64 {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => return 1,
+    };
+    let reader = BufReader::new(file);
+    let mut max_run_number = 0_u64;
+    let mut run_number_index = None;
+    let mut rows = 0_u64;
+    for (index, line) in reader.lines().enumerate() {
+        let Ok(line) = line else {
+            continue;
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split(',').collect();
+        if index == 0 {
+            for (i, name) in cols.iter().enumerate() {
+                if *name == "run_number" {
+                    run_number_index = Some(i);
+                    break;
+                }
+            }
+            continue;
+        }
+        rows += 1;
+        if let Some(idx) = run_number_index {
+            if idx < cols.len()
+                && let Ok(value) = cols[idx].parse::<u64>()
+            {
+                max_run_number = max_run_number.max(value);
+            }
+        }
+    }
+    if max_run_number > 0 {
+        max_run_number + 1
+    } else {
+        rows + 1
+    }
+}
+
+fn current_git_state_hash() -> String {
+    let hash = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|out| {
+            if out.status.success() {
+                Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "nogit".to_string());
+    let dirty = Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()
+        .map(|out| out.status.success() && !String::from_utf8_lossy(&out.stdout).trim().is_empty())
+        .unwrap_or(false);
+    if dirty { format!("{hash}_dirty") } else { hash }
+}
+
+fn archive_previous_latest(run_number: u64, git_hash: &str) {
+    let latest_path = Path::new(LATEST_RESULTS_FILE);
+    if !latest_path.exists() {
+        return;
+    }
+    fs::create_dir_all(OUTPUT_DIR).expect("failed to create perf output directory");
+    let safe_hash = sanitize_label(git_hash);
+    let mut archive_path = format!(
+        "{}/metrics_latest_run_{:05}_{}.csv",
+        OUTPUT_DIR, run_number, safe_hash
+    );
+    let mut suffix = 1_u32;
+    while Path::new(&archive_path).exists() {
+        archive_path = format!(
+            "{}/metrics_latest_run_{:05}_{}_{}.csv",
+            OUTPUT_DIR, run_number, safe_hash, suffix
+        );
+        suffix = suffix.saturating_add(1);
+    }
+    fs::rename(latest_path, archive_path).expect("failed to archive previous latest metrics file");
+}
+
+fn sanitize_label(raw: &str) -> String {
+    let sanitized = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized
+    }
 }
 
 fn rand_u64(state: &mut u64) -> u64 {

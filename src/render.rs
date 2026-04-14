@@ -123,7 +123,9 @@ impl GpuState {
         let size = window.inner_size();
 
         let instance = wgpu::Instance::default();
-        let surface = instance.create_surface(window).expect("failed to create surface");
+        let surface = instance
+            .create_surface(window)
+            .expect("failed to create surface");
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -405,16 +407,19 @@ impl GpuState {
 
     pub fn upsert_chunk_mesh(&mut self, key: ChunkRenderKey, vertices: &[Vertex]) {
         let needed = vertices.len().max(1);
-        let entry = self.world_chunks.entry(key).or_insert_with(|| ChunkMeshGpu {
-            vertex_buffer: self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("world_chunk_vertex_buffer"),
-                size: (needed.next_power_of_two() * std::mem::size_of::<Vertex>()) as u64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }),
-            vertex_capacity: needed.next_power_of_two(),
-            vertex_count: 0,
-        });
+        let entry = self
+            .world_chunks
+            .entry(key)
+            .or_insert_with(|| ChunkMeshGpu {
+                vertex_buffer: self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("world_chunk_vertex_buffer"),
+                    size: (needed.next_power_of_two() * std::mem::size_of::<Vertex>()) as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+                vertex_capacity: needed.next_power_of_two(),
+                vertex_count: 0,
+            });
 
         if needed > entry.vertex_capacity {
             entry.vertex_capacity = needed.next_power_of_two();
@@ -692,6 +697,7 @@ pub fn celestial_state_for_time(time_seconds: f32) -> CelestialState {
 
 struct ChunkCullContext {
     frustum_planes: [Vec4; 5],
+    camera_position: Vec3,
 }
 
 impl ChunkCullContext {
@@ -712,6 +718,7 @@ impl ChunkCullContext {
 
         Self {
             frustum_planes: planes,
+            camera_position: camera.position,
         }
     }
 
@@ -728,14 +735,28 @@ impl ChunkCullContext {
             WORLD_HEIGHT as f32,
             min.z + world_span as f32,
         );
+
+        // Keep nearby chunks resident even if frustum math is on the edge for a frame.
+        let closest = Vec3::new(
+            self.camera_position.x.clamp(min.x, max.x),
+            self.camera_position.y.clamp(min.y, max.y),
+            self.camera_position.z.clamp(min.z, max.z),
+        );
+        let close_radius = (world_span as f32 * 1.5).max(CHUNK_SIZE as f32 * 3.0);
+        if self.camera_position.distance_squared(closest) <= close_radius * close_radius {
+            return true;
+        }
+
+        let cull_slack = world_span as f32 * 0.35 + 2.0;
         for plane in self.frustum_planes {
             let positive = Vec3::new(
                 if plane.x >= 0.0 { max.x } else { min.x },
                 if plane.y >= 0.0 { max.y } else { min.y },
                 if plane.z >= 0.0 { max.z } else { min.z },
             );
-            let distance = plane.x * positive.x + plane.y * positive.y + plane.z * positive.z + plane.w;
-            if distance < 0.0 {
+            let distance =
+                plane.x * positive.x + plane.y * positive.y + plane.z * positive.z + plane.w;
+            if distance < -cull_slack {
                 return false;
             }
         }

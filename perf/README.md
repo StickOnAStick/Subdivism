@@ -15,6 +15,7 @@ cargo run --bin perf_suite -- --full
 Outputs:
 
 - `perf/metrics_latest.csv`: last run, per-scenario metrics + theoretical ceilings.
+- `perf/metrics_latest_run_<run#>_<git-hash>.csv`: archived previous `metrics_latest.csv` from each run (never overwritten).
 - `perf/metrics_history.csv`: append-only summary for trend tracking.
 - `perf/metrics_history.csv.legacy_*`: auto backups when history schema changes.
 

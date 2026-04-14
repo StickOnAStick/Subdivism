@@ -7,6 +7,7 @@ pub const PLAYER_HEIGHT: f32 = 1.8;
 
 pub struct PhysicsConfig {
     pub player_move_speed: f32,
+    pub player_sprint_multiplier: f32,
     pub player_jump_speed: f32,
     pub gravity: f32,
     pub collision_step: f32,
@@ -17,6 +18,7 @@ impl Default for PhysicsConfig {
     fn default() -> Self {
         Self {
             player_move_speed: 6.0,
+            player_sprint_multiplier: 1.8,
             player_jump_speed: 8.5,
             gravity: 26.0,
             collision_step: 0.05,
@@ -30,6 +32,7 @@ pub struct MovementInput {
     pub forward: f32,
     pub strafe: f32,
     pub jump_pressed: bool,
+    pub sprint_held: bool,
 }
 
 pub fn update_player(
@@ -42,8 +45,13 @@ pub fn update_player(
     let forward_flat = actor.forward_flat();
     let right_flat = forward_flat.cross(Vec3::Y).normalize_or_zero();
     let wish_dir = forward_flat * input.forward + right_flat * input.strafe;
+    let sprint_factor = if input.sprint_held {
+        physics.player_sprint_multiplier
+    } else {
+        1.0
+    };
     let horizontal_velocity = if wish_dir.length_squared() > 0.0 {
-        wish_dir.normalize() * physics.player_move_speed
+        wish_dir.normalize() * physics.player_move_speed * sprint_factor
     } else {
         Vec3::ZERO
     };

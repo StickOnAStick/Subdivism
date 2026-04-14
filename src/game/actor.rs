@@ -66,7 +66,10 @@ impl ActorRoster {
     pub fn new(local_player_spawn: Vec3) -> Self {
         let local_player = ActorId(0);
         let actors = vec![ActorState::player(local_player, local_player_spawn)];
-        Self { actors, local_player }
+        Self {
+            actors,
+            local_player,
+        }
     }
 
     pub fn local_player(&self) -> &ActorState {

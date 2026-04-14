@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::{mpsc, Arc, Mutex},
+    path::PathBuf,
+    sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -19,12 +20,13 @@ use crate::{
     debug_overlay::{DebugOverlay, OverlayVertex},
     game::{
         actor::{ActorRoster, PLAYER_EYE_HEIGHT},
-        inventory::Inventory,
+        inventory::{BACKPACK_SIZE, HOTBAR_SIZE, Inventory},
         physics::{self, MovementInput, PhysicsConfig},
-        world::{Block, TerrainConfig, World, CHUNK_SIZE},
+        terrain_recipe::TerrainRecipe,
+        world::{Block, CHUNK_SIZE, DEFAULT_WORLD_SEED, TerrainConfig, World},
     },
     mesh::Vertex,
-    render::{celestial_state_for_time, ChunkRenderKey, GpuState, RenderOutcome},
+    render::{ChunkRenderKey, GpuState, RenderOutcome, celestial_state_for_time},
 };
 
 const FREE_CAMERA_SPEED: f32 = 10.0;
@@ -41,9 +43,53 @@ const MID_DETAIL_RADIUS_CHUNKS: i64 = 32;
 const LOW_DETAIL_RADIUS_CHUNKS: i64 = 64;
 
 pub fn run() {
+    let options = AppLaunchOptions::from_env();
     let event_loop = EventLoop::new().expect("failed to create event loop");
-    let mut app = App::new();
+    let mut app = App::new(options);
     event_loop.run_app(&mut app).expect("event loop error");
+}
+
+#[derive(Clone, Debug)]
+struct AppLaunchOptions {
+    seed_override: Option<i64>,
+    terrain_file: Option<PathBuf>,
+    dev_mode: bool,
+}
+
+impl AppLaunchOptions {
+    fn from_env() -> Self {
+        let mut seed_override = None;
+        let mut terrain_file = None;
+        let mut dev_mode = false;
+        let mut args = std::env::args().skip(1);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--seed" => {
+                    if let Some(raw) = args.next() {
+                        if let Ok(seed) = raw.parse::<i64>() {
+                            seed_override = Some(seed);
+                        } else {
+                            eprintln!("ignoring invalid --seed value: {raw}");
+                        }
+                    }
+                }
+                "--terrain-file" => {
+                    if let Some(path) = args.next() {
+                        terrain_file = Some(PathBuf::from(path));
+                    }
+                }
+                "--dev" | "--dev-mode" => {
+                    dev_mode = true;
+                }
+                _ => {}
+            }
+        }
+        Self {
+            seed_override,
+            terrain_file,
+            dev_mode,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -65,6 +111,7 @@ impl CameraMode {
 enum UiMode {
     Playing,
     Paused,
+    Inventory,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -72,6 +119,18 @@ enum MenuPage {
     Main,
     Settings,
     Graphics,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InventorySection {
+    Hotbar,
+    Backpack,
+}
+
+#[derive(Clone, Copy)]
+struct InventoryCursor {
+    section: InventorySection,
+    index: usize,
 }
 
 struct InputState {
@@ -171,6 +230,7 @@ struct App {
     ui_mode: UiMode,
     menu_page: MenuPage,
     menu_index: usize,
+    inventory_cursor: InventoryCursor,
     input: InputState,
     debug_overlay: DebugOverlay,
     physics: PhysicsConfig,
@@ -184,6 +244,10 @@ struct App {
     chunk_versions: HashMap<ChunkRenderKey, u64>,
     chunk_pipeline: ChunkBuildPipeline,
     inventory: Inventory,
+    world_seed: i64,
+    terrain_profile: String,
+    terrain_recipe_path: Option<PathBuf>,
+    dev_mode: bool,
     world_time_seconds: f32,
     last_chunk_center: (i64, i64),
     last_frame: Instant,
@@ -192,10 +256,26 @@ struct App {
 }
 
 impl App {
-    fn new() -> Self {
-        // Swap preset here as terrain tooling expands:
-        // balanced(), alpine(), canyon(), valleylands()
-        let world = World::generate_with_terrain(TerrainConfig::balanced());
+    fn new(options: AppLaunchOptions) -> Self {
+        let mut terrain = TerrainConfig::balanced();
+        let mut world_seed = options.seed_override.unwrap_or(DEFAULT_WORLD_SEED);
+        let mut terrain_profile = "balanced".to_string();
+        let mut terrain_recipe_path = None;
+        if let Some(path) = options.terrain_file.as_ref() {
+            match TerrainRecipe::from_file(path) {
+                Ok(recipe) => {
+                    terrain = recipe.terrain;
+                    terrain_profile = recipe.profile;
+                    world_seed = options.seed_override.unwrap_or(recipe.seed);
+                    terrain_recipe_path = Some(path.clone());
+                }
+                Err(err) => {
+                    eprintln!("failed to load terrain recipe {}: {err}", path.display());
+                }
+            }
+        }
+
+        let world = World::generate_with_terrain_and_seed(terrain, world_seed);
         let lens = CameraLens::default();
         let actors = ActorRoster::new(world.spawn_point());
         let free_camera = actors.local_player().camera(lens);
@@ -216,6 +296,10 @@ impl App {
             ui_mode: UiMode::Playing,
             menu_page: MenuPage::Main,
             menu_index: 0,
+            inventory_cursor: InventoryCursor {
+                section: InventorySection::Hotbar,
+                index: 0,
+            },
             input: InputState::new(),
             debug_overlay: DebugOverlay::new(),
             physics: PhysicsConfig::default(),
@@ -229,6 +313,10 @@ impl App {
             chunk_versions: HashMap::new(),
             chunk_pipeline: pipeline,
             inventory: Inventory::new(),
+            world_seed,
+            terrain_profile,
+            terrain_recipe_path,
+            dev_mode: options.dev_mode,
             world_time_seconds: 0.0,
             last_chunk_center: (0, 0),
             last_frame: Instant::now(),
@@ -263,6 +351,67 @@ impl App {
         self.sync_lens_to_cameras();
     }
 
+    fn replace_world(
+        &mut self,
+        world: World,
+        world_seed: i64,
+        terrain_profile: String,
+        terrain_recipe_path: Option<PathBuf>,
+    ) {
+        let mut existing_keys = self.visible_chunks.clone();
+        existing_keys.extend(self.resident_chunks.iter().copied());
+        if let Some(gpu) = self.gpu.as_mut() {
+            for key in existing_keys {
+                gpu.remove_chunk_mesh(key);
+            }
+        }
+
+        self.world = world;
+        self.world_seed = world_seed;
+        self.terrain_profile = terrain_profile;
+        self.terrain_recipe_path = terrain_recipe_path;
+        self.chunk_pipeline = ChunkBuildPipeline::new(self.world.clone());
+        self.visible_chunks.clear();
+        self.resident_chunks.clear();
+        self.requested_chunks.clear();
+        self.dirty_chunks.clear();
+        self.chunk_versions.clear();
+
+        self.actors.respawn_local_player(self.world.spawn_point());
+        self.free_camera = self.actors.local_player().camera(self.lens);
+        self.last_chunk_center = self.current_chunk_center();
+        self.schedule_visible_chunks();
+        self.sync_active_camera();
+        self.refresh_window_title();
+    }
+
+    fn reload_dev_world(&mut self) {
+        if !self.dev_mode {
+            return;
+        }
+        let mut terrain = self.world.terrain_config();
+        let mut seed = self.world_seed;
+        let mut profile = self.terrain_profile.clone();
+        let recipe_path = self.terrain_recipe_path.clone();
+
+        if let Some(path) = recipe_path.as_ref() {
+            match TerrainRecipe::from_file(path) {
+                Ok(recipe) => {
+                    terrain = recipe.terrain;
+                    seed = recipe.seed;
+                    profile = recipe.profile;
+                }
+                Err(err) => {
+                    eprintln!("failed to reload terrain recipe {}: {err}", path.display());
+                    return;
+                }
+            }
+        }
+
+        let world = World::generate_with_terrain_and_seed(terrain, seed);
+        self.replace_world(world, seed, profile, recipe_path);
+    }
+
     fn current_frame_cap(&self) -> Option<u32> {
         FRAME_CAP_PRESETS[self.frame_cap_index]
     }
@@ -276,11 +425,14 @@ impl App {
 
     fn refresh_window_title(&self) {
         if let Some(window) = &self.window {
+            let dev_flag = if self.dev_mode { " DEV" } else { "" };
             window.set_title(&format!(
-                "Voxel Starter [{} | {} | RD {}]",
+                "Voxel Starter [{} | {} | RD {} | SEED {}{}]",
                 self.frame_cap_label(),
                 self.camera_mode.label(),
-                self.render_distance_chunks
+                self.render_distance_chunks,
+                self.world_seed,
+                dev_flag
             ));
         }
     }
@@ -332,8 +484,21 @@ impl App {
         self.ui_mode = UiMode::Playing;
     }
 
+    fn open_inventory(&mut self) {
+        self.ui_mode = UiMode::Inventory;
+        self.inventory_cursor = InventoryCursor {
+            section: InventorySection::Hotbar,
+            index: self.inventory.selected_hotbar_index(),
+        };
+        self.release_mouse();
+    }
+
+    fn close_inventory(&mut self) {
+        self.ui_mode = UiMode::Playing;
+    }
+
     fn update(&mut self, dt: f32) {
-        if self.ui_mode == UiMode::Paused {
+        if self.ui_mode != UiMode::Playing {
             return;
         }
         match self.camera_mode {
@@ -348,6 +513,7 @@ impl App {
             forward: axis_value(self.input.key(KeyCode::KeyW), self.input.key(KeyCode::KeyS)),
             strafe: axis_value(self.input.key(KeyCode::KeyD), self.input.key(KeyCode::KeyA)),
             jump_pressed: self.input.key(KeyCode::Space),
+            sprint_held: self.input.key(KeyCode::ShiftLeft) || self.input.key(KeyCode::ShiftRight),
         };
 
         physics::update_player(
@@ -404,7 +570,8 @@ impl App {
 
     fn schedule_visible_chunks(&mut self) {
         let center = self.current_chunk_center();
-        let render_distance = (self.render_distance_chunks as i64).clamp(1, MAX_RENDER_DISTANCE_CHUNKS as i64);
+        let render_distance =
+            (self.render_distance_chunks as i64).clamp(1, MAX_RENDER_DISTANCE_CHUNKS as i64);
         let mut desired = Vec::new();
         collect_lod_ring(
             &mut desired,
@@ -608,6 +775,64 @@ impl App {
         }
     }
 
+    fn handle_inventory_navigation(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::ArrowUp => {
+                self.inventory_cursor.section = InventorySection::Hotbar;
+                self.inventory_cursor.index = self
+                    .inventory_cursor
+                    .index
+                    .min(self.inventory_section_len(InventorySection::Hotbar) - 1);
+            }
+            KeyCode::ArrowDown => {
+                self.inventory_cursor.section = InventorySection::Backpack;
+                self.inventory_cursor.index = self
+                    .inventory_cursor
+                    .index
+                    .min(self.inventory_section_len(InventorySection::Backpack) - 1);
+            }
+            KeyCode::ArrowLeft => {
+                let len = self.inventory_section_len(self.inventory_cursor.section);
+                self.inventory_cursor.index = if self.inventory_cursor.index == 0 {
+                    len - 1
+                } else {
+                    self.inventory_cursor.index - 1
+                };
+            }
+            KeyCode::ArrowRight => {
+                let len = self.inventory_section_len(self.inventory_cursor.section);
+                self.inventory_cursor.index = (self.inventory_cursor.index + 1) % len;
+            }
+            KeyCode::Enter | KeyCode::Space => {
+                self.activate_inventory_selection();
+            }
+            KeyCode::Escape | KeyCode::KeyE => {
+                self.close_inventory();
+            }
+            _ => {}
+        }
+    }
+
+    fn inventory_section_len(&self, section: InventorySection) -> usize {
+        match section {
+            InventorySection::Hotbar => HOTBAR_SIZE,
+            InventorySection::Backpack => BACKPACK_SIZE,
+        }
+    }
+
+    fn activate_inventory_selection(&mut self) {
+        match self.inventory_cursor.section {
+            InventorySection::Hotbar => {
+                self.inventory.select_index(self.inventory_cursor.index);
+            }
+            InventorySection::Backpack => {
+                let hotbar_index = self.inventory.selected_hotbar_index();
+                self.inventory
+                    .move_backpack_slot_to_hotbar(self.inventory_cursor.index, hotbar_index);
+            }
+        }
+    }
+
     fn menu_item_count(&self) -> usize {
         match self.menu_page {
             MenuPage::Main => 4,
@@ -676,11 +901,10 @@ impl App {
 
     fn adjust_render_distance(&mut self, delta: i32) {
         let value = self.render_distance_chunks as i32 + delta;
-        self.render_distance_chunks = value
-            .clamp(
-                MIN_RENDER_DISTANCE_CHUNKS as i32,
-                MAX_RENDER_DISTANCE_CHUNKS as i32,
-            ) as u32;
+        self.render_distance_chunks = value.clamp(
+            MIN_RENDER_DISTANCE_CHUNKS as i32,
+            MAX_RENDER_DISTANCE_CHUNKS as i32,
+        ) as u32;
         self.update_far_plane_for_render_distance();
         self.schedule_visible_chunks();
         self.refresh_window_title();
@@ -714,17 +938,75 @@ impl App {
         }
     }
 
+    fn inventory_overlay(&self) -> (String, Vec<String>, usize) {
+        let selected_hotbar = self.inventory.selected_hotbar_index();
+        let hotbar_slot = self.inventory.hotbar()[selected_hotbar];
+        let backpack_index = self.inventory_cursor.index.min(BACKPACK_SIZE - 1);
+        let backpack_slot = self
+            .inventory
+            .backpack_slot(backpack_index)
+            .unwrap_or_default();
+        let selected_line = match self.inventory_cursor.section {
+            InventorySection::Hotbar => 1,
+            InventorySection::Backpack => 2,
+        };
+
+        (
+            "INVENTORY".to_string(),
+            vec![
+                "ARROWS MOVE ENTER APPLY".to_string(),
+                format!(
+                    "HOTBAR SLOT {} {} {}",
+                    selected_hotbar + 1,
+                    block_label(hotbar_slot.block),
+                    hotbar_slot.count
+                ),
+                format!(
+                    "BACKPACK SLOT {} {} {}",
+                    backpack_index + 1,
+                    block_label(backpack_slot.block),
+                    backpack_slot.count
+                ),
+                format!("ACTIVE HOTBAR {}", selected_hotbar + 1),
+                "E OR ESC CLOSE".to_string(),
+            ],
+            selected_line,
+        )
+    }
+
     fn hud_lines(&self) -> Vec<String> {
         let slot = self.inventory.selected_slot();
-        let slots = self.inventory.slots();
-        vec![
+        let hotbar = self.inventory.hotbar();
+        let mut lines = vec![
             format!("SUN {:.1}", self.world_time_seconds),
-            format!("SEL {} {}", block_label(slot.block), slot.count),
+            format!("SEED {}", self.world_seed),
             format!(
-                "G {} D {} S {}",
-                slots[0].count, slots[1].count, slots[2].count
+                "SLOT {} {} {}",
+                self.inventory.selected_hotbar_index() + 1,
+                block_label(slot.block),
+                slot.count
             ),
-        ]
+            format!(
+                "HB1 {} HB2 {} HB3 {}",
+                hotbar[0].count, hotbar[1].count, hotbar[2].count
+            ),
+            format!(
+                "INV {} OF {}",
+                self.inventory.filled_slots(),
+                self.inventory.slot_capacity()
+            ),
+        ];
+        if self.dev_mode {
+            lines.push(format!(
+                "DEV PROFILE {}",
+                self.terrain_profile.to_uppercase()
+            ));
+            if self.terrain_recipe_path.is_some() {
+                lines.push("DEV FILE ON".to_string());
+                lines.push("F6 RELOAD".to_string());
+            }
+        }
+        lines
     }
 
     fn sky_body_overlay(&self) -> Vec<OverlayVertex> {
@@ -781,8 +1063,10 @@ impl App {
             if matches!(block, Block::Air) {
                 return;
             }
+            if !self.inventory.add_block(block) {
+                return;
+            }
             self.world.set_block_i64(hit.0, hit.1, hit.2, Block::Air);
-            self.inventory.add_block(block);
             self.mark_block_change_dirty(hit.0, hit.2);
             return;
         }
@@ -807,7 +1091,10 @@ impl App {
             return;
         }
 
-        if !matches!(self.world.block_at_i64(place.0, place.1, place.2), Block::Air) {
+        if !matches!(
+            self.world.block_at_i64(place.0, place.1, place.2),
+            Block::Air
+        ) {
             return;
         }
 
@@ -876,14 +1163,22 @@ impl ApplicationHandler for App {
                 self.sync_lens_to_cameras();
             }
             WindowEvent::RedrawRequested => {
-                let menu_overlay = if self.ui_mode == UiMode::Paused {
-                    let (title, lines, selected) = self.menu_overlay();
-                    Some(
-                        self.debug_overlay
-                            .build_menu_vertices(&title, &lines, selected),
-                    )
-                } else {
-                    None
+                let menu_overlay = match self.ui_mode {
+                    UiMode::Paused => {
+                        let (title, lines, selected) = self.menu_overlay();
+                        Some(
+                            self.debug_overlay
+                                .build_menu_vertices(&title, &lines, selected),
+                        )
+                    }
+                    UiMode::Inventory => {
+                        let (title, lines, selected) = self.inventory_overlay();
+                        Some(
+                            self.debug_overlay
+                                .build_menu_vertices(&title, &lines, selected),
+                        )
+                    }
+                    UiMode::Playing => None,
                 };
                 let hud_lines = self.hud_lines();
                 let sky_overlay = self.sky_body_overlay();
@@ -917,6 +1212,10 @@ impl ApplicationHandler for App {
                                 self.handle_menu_navigation(code);
                                 return;
                             }
+                            if self.ui_mode == UiMode::Inventory {
+                                self.handle_inventory_navigation(code);
+                                return;
+                            }
 
                             if code == KeyCode::F3 && !event.repeat {
                                 self.debug_overlay.visible = !self.debug_overlay.visible;
@@ -927,17 +1226,19 @@ impl ApplicationHandler for App {
                             if code == KeyCode::F5 && !event.repeat {
                                 self.toggle_camera_mode();
                             }
+                            if code == KeyCode::F6 && !event.repeat {
+                                self.reload_dev_world();
+                            }
                             if code == KeyCode::Escape && !event.repeat {
                                 self.open_pause_menu();
                             }
-                            if code == KeyCode::Digit1 && !event.repeat {
-                                self.inventory.select_index(0);
+                            if code == KeyCode::KeyE && !event.repeat {
+                                self.open_inventory();
                             }
-                            if code == KeyCode::Digit2 && !event.repeat {
-                                self.inventory.select_index(1);
-                            }
-                            if code == KeyCode::Digit3 && !event.repeat {
-                                self.inventory.select_index(2);
+                            if let Some(index) = digit_to_hotbar_index(code) {
+                                if !event.repeat {
+                                    self.inventory.select_index(index);
+                                }
                             }
                         }
                         ElementState::Released => {
@@ -951,7 +1252,7 @@ impl ApplicationHandler for App {
                 button,
                 ..
             } => {
-                if self.ui_mode == UiMode::Paused {
+                if self.ui_mode != UiMode::Playing {
                     return;
                 }
                 if !self.input.mouse_captured && button == MouseButton::Left {
@@ -976,7 +1277,7 @@ impl ApplicationHandler for App {
         _device_id: winit::event::DeviceId,
         event: DeviceEvent,
     ) {
-        if !self.input.mouse_captured || self.ui_mode == UiMode::Paused {
+        if !self.input.mouse_captured || self.ui_mode != UiMode::Playing {
             return;
         }
 
@@ -1040,6 +1341,21 @@ impl ApplicationHandler for App {
 
 fn axis_value(positive: bool, negative: bool) -> f32 {
     positive as i8 as f32 - negative as i8 as f32
+}
+
+fn digit_to_hotbar_index(code: KeyCode) -> Option<usize> {
+    match code {
+        KeyCode::Digit1 => Some(0),
+        KeyCode::Digit2 => Some(1),
+        KeyCode::Digit3 => Some(2),
+        KeyCode::Digit4 => Some(3),
+        KeyCode::Digit5 => Some(4),
+        KeyCode::Digit6 => Some(5),
+        KeyCode::Digit7 => Some(6),
+        KeyCode::Digit8 => Some(7),
+        KeyCode::Digit9 => Some(8),
+        _ => None,
+    }
 }
 
 fn aligned_origin(chunk: (i64, i64), step_chunks: i64) -> (i64, i64) {
