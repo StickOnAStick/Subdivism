@@ -31,20 +31,92 @@ pub struct BlockPos {
     pub z: i64,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct TerrainConfig {
+    pub base_height: f32,
+    pub macro_scale: f32,
+    pub macro_amplitude: f32,
+    pub detail_scale: f32,
+    pub detail_amplitude: f32,
+    pub mountain_scale: f32,
+    pub mountain_amplitude: f32,
+    pub valley_scale: f32,
+    pub valley_depth: f32,
+    pub cliff_scale: f32,
+    pub cliff_strength: f32,
+    pub terrace_step: f32,
+}
+
+impl TerrainConfig {
+    pub fn balanced() -> Self {
+        Self {
+            base_height: (WORLD_HEIGHT as f32) * 0.50,
+            macro_scale: 0.012,
+            macro_amplitude: 8.0,
+            detail_scale: 0.045,
+            detail_amplitude: 2.0,
+            mountain_scale: 0.009,
+            mountain_amplitude: 10.0,
+            valley_scale: 0.010,
+            valley_depth: 6.0,
+            cliff_scale: 0.020,
+            cliff_strength: 0.30,
+            terrace_step: 2.5,
+        }
+    }
+
+    pub fn alpine() -> Self {
+        Self {
+            mountain_amplitude: 18.0,
+            valley_depth: 4.0,
+            cliff_strength: 0.42,
+            ..Self::balanced()
+        }
+    }
+
+    pub fn canyon() -> Self {
+        Self {
+            base_height: (WORLD_HEIGHT as f32) * 0.44,
+            macro_amplitude: 6.0,
+            mountain_amplitude: 5.0,
+            valley_depth: 12.0,
+            cliff_strength: 0.62,
+            terrace_step: 3.5,
+            ..Self::balanced()
+        }
+    }
+
+    pub fn valleylands() -> Self {
+        Self {
+            macro_amplitude: 7.0,
+            mountain_amplitude: 6.0,
+            valley_depth: 9.0,
+            cliff_strength: 0.24,
+            ..Self::balanced()
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct World {
     overrides: Arc<RwLock<HashMap<BlockPos, Block>>>,
     spawn_point: Vec3,
     seed: i64,
+    terrain: TerrainConfig,
 }
 
 impl World {
     pub fn generate(_size_x: i32, _size_y: i32, _size_z: i32) -> Self {
+        Self::generate_with_terrain(TerrainConfig::balanced())
+    }
+
+    pub fn generate_with_terrain(terrain: TerrainConfig) -> Self {
         let seed = 0x5EED_BA5E_u64 as i64;
         let mut world = Self {
             overrides: Arc::new(RwLock::new(HashMap::new())),
             spawn_point: Vec3::ZERO,
             seed,
+            terrain,
         };
         world.spawn_point = world
             .spawn_point_for_column(0, 0)
@@ -72,9 +144,136 @@ impl World {
         self.seed
     }
 
+    pub fn terrain_config(&self) -> TerrainConfig {
+        self.terrain
+    }
+
     pub fn build_chunk_mesh(&self, chunk: (i64, i64)) -> Vec<Vertex> {
         let overrides = self.overrides.read().expect("overrides read lock poisoned");
         self.build_chunk_mesh_with_overrides(chunk, &overrides)
+    }
+
+    pub fn build_chunk_mesh_lod(&self, origin_chunk: (i64, i64), lod_level: u8) -> Vec<Vertex> {
+        if lod_level == 0 {
+            return self.build_chunk_mesh(origin_chunk);
+        }
+
+        let chunk_span = 1_i64 << lod_level;
+        let tile_size_blocks = CHUNK_SIZE * chunk_span;
+        let sample_blocks = 2_i64 << lod_level;
+        let cells = tile_size_blocks / sample_blocks;
+        let base_x = origin_chunk.0 * CHUNK_SIZE;
+        let base_z = origin_chunk.1 * CHUNK_SIZE;
+        let mut vertices = Vec::new();
+
+        let mut sampled_heights = vec![0.0_f32; ((cells + 1) * (cells + 1)) as usize];
+        let height_at = |heights: &[f32], x: i64, z: i64| -> f32 {
+            heights[(z * (cells + 1) + x) as usize]
+        };
+        let set_height = |heights: &mut [f32], x: i64, z: i64, value: f32| {
+            let index = (z * (cells + 1) + x) as usize;
+            heights[index] = value;
+        };
+
+        for gz in 0..=cells {
+            for gx in 0..=cells {
+                let sample_x = base_x + gx * sample_blocks + sample_blocks / 2;
+                let sample_z = base_z + gz * sample_blocks + sample_blocks / 2;
+                let top_y = self.surface_height(sample_x, sample_z) as f32 + 1.0;
+                set_height(&mut sampled_heights, gx, gz, top_y);
+            }
+        }
+
+        for gz in 0..cells {
+            for gx in 0..cells {
+                let wx0 = base_x + gx * sample_blocks;
+                let wz0 = base_z + gz * sample_blocks;
+                let wx1 = wx0 + sample_blocks;
+                let wz1 = wz0 + sample_blocks;
+
+                let center_x = wx0 + sample_blocks / 2;
+                let center_z = wz0 + sample_blocks / 2;
+                let top_y = height_at(&sampled_heights, gx, gz);
+                let east_y = height_at(&sampled_heights, gx + 1, gz);
+                let south_y = height_at(&sampled_heights, gx, gz + 1);
+                let block = self.procedural_block(center_x, top_y as i32 - 1, center_z);
+                let (top_color, side_color, _) = palette(block, center_x, center_z);
+
+                push_quad(
+                    &mut vertices,
+                    [
+                        Vec3::new(wx0 as f32, top_y, wz0 as f32),
+                        Vec3::new(wx0 as f32, top_y, wz1 as f32),
+                        Vec3::new(wx1 as f32, top_y, wz1 as f32),
+                        Vec3::new(wx1 as f32, top_y, wz0 as f32),
+                    ],
+                    top_color,
+                    Vec3::Y,
+                );
+
+                if (top_y - east_y).abs() > 0.01 {
+                    let low = top_y.min(east_y);
+                    let high = top_y.max(east_y);
+                    if top_y > east_y {
+                        push_quad(
+                            &mut vertices,
+                            [
+                                Vec3::new(wx1 as f32, low, wz1 as f32),
+                                Vec3::new(wx1 as f32, low, wz0 as f32),
+                                Vec3::new(wx1 as f32, high, wz0 as f32),
+                                Vec3::new(wx1 as f32, high, wz1 as f32),
+                            ],
+                            side_color,
+                            Vec3::X,
+                        );
+                    } else {
+                        push_quad(
+                            &mut vertices,
+                            [
+                                Vec3::new(wx1 as f32, low, wz0 as f32),
+                                Vec3::new(wx1 as f32, low, wz1 as f32),
+                                Vec3::new(wx1 as f32, high, wz1 as f32),
+                                Vec3::new(wx1 as f32, high, wz0 as f32),
+                            ],
+                            side_color,
+                            -Vec3::X,
+                        );
+                    }
+                }
+
+                if (top_y - south_y).abs() > 0.01 {
+                    let low = top_y.min(south_y);
+                    let high = top_y.max(south_y);
+                    if top_y > south_y {
+                        push_quad(
+                            &mut vertices,
+                            [
+                                Vec3::new(wx0 as f32, low, wz1 as f32),
+                                Vec3::new(wx1 as f32, low, wz1 as f32),
+                                Vec3::new(wx1 as f32, high, wz1 as f32),
+                                Vec3::new(wx0 as f32, high, wz1 as f32),
+                            ],
+                            side_color,
+                            Vec3::Z,
+                        );
+                    } else {
+                        push_quad(
+                            &mut vertices,
+                            [
+                                Vec3::new(wx1 as f32, low, wz1 as f32),
+                                Vec3::new(wx0 as f32, low, wz1 as f32),
+                                Vec3::new(wx0 as f32, high, wz1 as f32),
+                                Vec3::new(wx1 as f32, high, wz1 as f32),
+                            ],
+                            side_color,
+                            -Vec3::Z,
+                        );
+                    }
+                }
+            }
+        }
+
+        vertices
     }
 
     pub fn is_solid(&self, x: i32, y: i32, z: i32) -> bool {
@@ -274,15 +473,152 @@ impl World {
     }
 
     fn surface_height(&self, x: i64, z: i64) -> i32 {
+        let cfg = self.terrain;
         let fx = x as f32;
         let fz = z as f32;
-        let s = self.seed as f32 * 0.0001;
-        let terrain = ((fx * 0.035 + s).sin() * 6.5
-            + (fz * 0.028 + s * 2.0).cos() * 5.0
-            + ((fx + fz) * 0.012).sin() * 3.0)
-            .round() as i32;
-        (WORLD_HEIGHT / 2 + terrain).clamp(2, WORLD_HEIGHT - 4)
+
+        let macro_noise = fbm_2d(self.seed, fx * cfg.macro_scale, fz * cfg.macro_scale, 4, 2.0, 0.5);
+        let detail_noise = fbm_2d(
+            self.seed.wrapping_add(0x6A09_E667),
+            fx * cfg.detail_scale,
+            fz * cfg.detail_scale,
+            3,
+            2.0,
+            0.55,
+        );
+        let mountain_noise = ridge_fbm_2d(
+            self.seed.wrapping_add(0xBB67_AE85),
+            fx * cfg.mountain_scale,
+            fz * cfg.mountain_scale,
+            4,
+            2.0,
+            0.48,
+        );
+        let valley_noise = fbm_2d(
+            self.seed.wrapping_add(0x3C6E_F372),
+            fx * cfg.valley_scale,
+            fz * cfg.valley_scale,
+            3,
+            2.0,
+            0.50,
+        )
+        .max(0.0)
+        .powf(1.35);
+
+        let mut height = cfg.base_height
+            + macro_noise * cfg.macro_amplitude
+            + detail_noise * cfg.detail_amplitude
+            + mountain_noise * cfg.mountain_amplitude
+            - valley_noise * cfg.valley_depth;
+
+        if cfg.cliff_strength > 0.0 {
+            let cliff_mask = fbm_2d(
+                self.seed.wrapping_add(0xA54F_F53A),
+                fx * cfg.cliff_scale,
+                fz * cfg.cliff_scale,
+                2,
+                2.0,
+                0.5,
+            )
+            .abs()
+            .powf(1.4);
+            let terraced = (height / cfg.terrace_step).round() * cfg.terrace_step;
+            let blend = (cliff_mask * cfg.cliff_strength).clamp(0.0, 1.0);
+            height = height * (1.0 - blend) + terraced * blend;
+        }
+
+        (height.round() as i32).clamp(2, WORLD_HEIGHT - 4)
     }
+}
+
+fn ridge_fbm_2d(
+    seed: i64,
+    x: f32,
+    z: f32,
+    octaves: u32,
+    lacunarity: f32,
+    gain: f32,
+) -> f32 {
+    let mut amplitude = 1.0;
+    let mut frequency = 1.0;
+    let mut sum = 0.0;
+    let mut norm = 0.0;
+
+    for octave in 0..octaves {
+        let n = value_noise_2d(seed.wrapping_add(octave as i64 * 97), x * frequency, z * frequency);
+        let ridge = 1.0 - n.abs();
+        sum += ridge * amplitude;
+        norm += amplitude;
+        amplitude *= gain;
+        frequency *= lacunarity;
+    }
+
+    if norm <= f32::EPSILON {
+        0.0
+    } else {
+        (sum / norm) * 2.0 - 1.0
+    }
+}
+
+fn fbm_2d(seed: i64, x: f32, z: f32, octaves: u32, lacunarity: f32, gain: f32) -> f32 {
+    let mut amplitude = 1.0;
+    let mut frequency = 1.0;
+    let mut sum = 0.0;
+    let mut norm = 0.0;
+
+    for octave in 0..octaves {
+        let n = value_noise_2d(seed.wrapping_add(octave as i64 * 131), x * frequency, z * frequency);
+        sum += n * amplitude;
+        norm += amplitude;
+        amplitude *= gain;
+        frequency *= lacunarity;
+    }
+
+    if norm <= f32::EPSILON {
+        0.0
+    } else {
+        sum / norm
+    }
+}
+
+fn value_noise_2d(seed: i64, x: f32, z: f32) -> f32 {
+    let x0 = x.floor() as i64;
+    let z0 = z.floor() as i64;
+    let x1 = x0 + 1;
+    let z1 = z0 + 1;
+    let tx = smoothstep(x - x.floor());
+    let tz = smoothstep(z - z.floor());
+
+    let v00 = hash2_to_unit(seed, x0, z0);
+    let v10 = hash2_to_unit(seed, x1, z0);
+    let v01 = hash2_to_unit(seed, x0, z1);
+    let v11 = hash2_to_unit(seed, x1, z1);
+
+    let a = lerp(v00, v10, tx);
+    let b = lerp(v01, v11, tx);
+    lerp(a, b, tz)
+}
+
+fn smoothstep(t: f32) -> f32 {
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+fn hash2_to_unit(seed: i64, x: i64, z: i64) -> f32 {
+    let mut h = seed as u64;
+    h ^= (x as u64).wrapping_mul(0x9E37_79B1_85EB_CA87);
+    h ^= (z as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xC4CE_B9FE_1A85_EC53);
+    h ^= h >> 33;
+
+    let u = (h as f64) / (u64::MAX as f64);
+    (u as f32) * 2.0 - 1.0
 }
 
 fn div_floor(value: i64, divisor: i64) -> i64 {
@@ -307,5 +643,35 @@ fn palette(block: Block, x: i64, z: i64) -> ([f32; 3], [f32; 3], [f32; 3]) {
         Block::Dirt => ([0.40, 0.28, 0.18], [0.35, 0.23, 0.14], [0.22, 0.14, 0.09]),
         Block::Stone => ([0.55, 0.57, 0.60], [0.48, 0.50, 0.53], [0.35, 0.36, 0.39]),
         Block::Air => ([0.0; 3], [0.0; 3], [0.0; 3]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn height_stays_within_world_bounds() {
+        let world = World::generate(64, 32, 64);
+        for z in -128..=128 {
+            for x in -128..=128 {
+                let y = world.surface_height(x, z);
+                assert!((2..=(WORLD_HEIGHT - 4)).contains(&y));
+            }
+        }
+    }
+
+    #[test]
+    fn terrain_presets_produce_different_profiles() {
+        let balanced = World::generate_with_terrain(TerrainConfig::balanced());
+        let alpine = World::generate_with_terrain(TerrainConfig::alpine());
+        let canyon = World::generate_with_terrain(TerrainConfig::canyon());
+
+        let point = (96, -48);
+        let a = balanced.surface_height(point.0, point.1);
+        let b = alpine.surface_height(point.0, point.1);
+        let c = canyon.surface_height(point.0, point.1);
+
+        assert!(a != b || b != c || a != c);
     }
 }

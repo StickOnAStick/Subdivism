@@ -21,21 +21,24 @@ use crate::{
         actor::{ActorRoster, PLAYER_EYE_HEIGHT},
         inventory::Inventory,
         physics::{self, MovementInput, PhysicsConfig},
-        world::{Block, World},
+        world::{Block, TerrainConfig, World, CHUNK_SIZE},
     },
     mesh::Vertex,
-    render::{celestial_state_for_time, GpuState, RenderOutcome},
+    render::{celestial_state_for_time, ChunkRenderKey, GpuState, RenderOutcome},
 };
 
 const FREE_CAMERA_SPEED: f32 = 10.0;
 const LOOK_SENSITIVITY: f32 = 0.0025;
 const MAX_PITCH: f32 = 1.54;
 const FRAME_CAP_PRESETS: [Option<u32>; 5] = [None, Some(60), Some(120), Some(144), Some(240)];
-const DEFAULT_FRAME_CAP_INDEX: usize = 3;
-const DEFAULT_RENDER_DISTANCE_CHUNKS: u32 = 10;
+const DEFAULT_FRAME_CAP_INDEX: usize = 0;
+const DEFAULT_RENDER_DISTANCE_CHUNKS: u32 = 24;
 const MIN_RENDER_DISTANCE_CHUNKS: u32 = 2;
 const MAX_RENDER_DISTANCE_CHUNKS: u32 = 128;
-const MAX_CHUNK_UPLOADS_PER_FRAME: usize = 4;
+const MAX_CHUNK_UPLOADS_PER_FRAME: usize = 8;
+const FULL_DETAIL_RADIUS_CHUNKS: i64 = 16;
+const MID_DETAIL_RADIUS_CHUNKS: i64 = 32;
+const LOW_DETAIL_RADIUS_CHUNKS: i64 = 64;
 
 pub fn run() {
     let event_loop = EventLoop::new().expect("failed to create event loop");
@@ -91,12 +94,12 @@ impl InputState {
 
 #[derive(Clone, Copy)]
 struct ChunkBuildRequest {
-    chunk: (i64, i64),
+    key: ChunkRenderKey,
     version: u64,
 }
 
 struct ChunkBuildResult {
-    chunk: (i64, i64),
+    key: ChunkRenderKey,
     version: u64,
     vertices: Vec<Vertex>,
 }
@@ -132,10 +135,11 @@ impl ChunkBuildPipeline {
                             Ok(request) => request,
                             Err(_) => break,
                         };
-                        let vertices = worker_world.build_chunk_mesh(request.chunk);
+                        let vertices = worker_world
+                            .build_chunk_mesh_lod(request.key.origin_chunk, request.key.lod_level);
                         if tx
                             .send(ChunkBuildResult {
-                                chunk: request.chunk,
+                                key: request.key,
                                 version: request.version,
                                 vertices,
                             })
@@ -173,11 +177,11 @@ struct App {
     lens: CameraLens,
     frame_cap_index: usize,
     render_distance_chunks: u32,
-    visible_chunks: HashSet<(i64, i64)>,
-    resident_chunks: HashSet<(i64, i64)>,
-    requested_chunks: HashSet<(i64, i64)>,
-    dirty_chunks: HashSet<(i64, i64)>,
-    chunk_versions: HashMap<(i64, i64), u64>,
+    visible_chunks: HashSet<ChunkRenderKey>,
+    resident_chunks: HashSet<ChunkRenderKey>,
+    requested_chunks: HashSet<ChunkRenderKey>,
+    dirty_chunks: HashSet<ChunkRenderKey>,
+    chunk_versions: HashMap<ChunkRenderKey, u64>,
     chunk_pipeline: ChunkBuildPipeline,
     inventory: Inventory,
     world_time_seconds: f32,
@@ -189,7 +193,9 @@ struct App {
 
 impl App {
     fn new() -> Self {
-        let world = World::generate(64, 32, 64);
+        // Swap preset here as terrain tooling expands:
+        // balanced(), alpine(), canyon(), valleylands()
+        let world = World::generate_with_terrain(TerrainConfig::balanced());
         let lens = CameraLens::default();
         let actors = ActorRoster::new(world.spawn_point());
         let free_camera = actors.local_player().camera(lens);
@@ -243,6 +249,18 @@ impl App {
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.set_camera(camera);
         }
+    }
+
+    fn sync_lens_to_cameras(&mut self) {
+        self.free_camera.lens = self.lens;
+        self.sync_active_camera();
+    }
+
+    fn update_far_plane_for_render_distance(&mut self) {
+        let target_far = ((self.render_distance_chunks as f32 + 2.0) * CHUNK_SIZE as f32 * 2.0)
+            .clamp(500.0, 8192.0);
+        self.lens.z_far = target_far;
+        self.sync_lens_to_cameras();
     }
 
     fn current_frame_cap(&self) -> Option<u32> {
@@ -386,46 +404,72 @@ impl App {
 
     fn schedule_visible_chunks(&mut self) {
         let center = self.current_chunk_center();
-        let render_distance = self.render_distance_chunks as i64;
-        let radius_sq = render_distance * render_distance;
+        let render_distance = (self.render_distance_chunks as i64).clamp(1, MAX_RENDER_DISTANCE_CHUNKS as i64);
         let mut desired = Vec::new();
-        for dz in -render_distance..=render_distance {
-            for dx in -render_distance..=render_distance {
-                if dx * dx + dz * dz > radius_sq {
-                    continue;
-                }
-                desired.push((center.0 + dx, center.1 + dz));
-            }
+        collect_lod_ring(
+            &mut desired,
+            center,
+            0,
+            render_distance.min(FULL_DETAIL_RADIUS_CHUNKS),
+            0,
+        );
+        if render_distance > FULL_DETAIL_RADIUS_CHUNKS {
+            collect_lod_ring(
+                &mut desired,
+                center,
+                FULL_DETAIL_RADIUS_CHUNKS,
+                render_distance.min(MID_DETAIL_RADIUS_CHUNKS),
+                1,
+            );
         }
-        desired.sort_by_key(|(x, z)| {
-            let dx = x - center.0;
-            let dz = z - center.1;
-            dx * dx + dz * dz
-        });
-        let desired_set: HashSet<(i64, i64)> = desired.iter().copied().collect();
+        if render_distance > MID_DETAIL_RADIUS_CHUNKS {
+            collect_lod_ring(
+                &mut desired,
+                center,
+                MID_DETAIL_RADIUS_CHUNKS,
+                render_distance.min(LOW_DETAIL_RADIUS_CHUNKS),
+                2,
+            );
+        }
+        if render_distance > LOW_DETAIL_RADIUS_CHUNKS {
+            collect_lod_ring(
+                &mut desired,
+                center,
+                LOW_DETAIL_RADIUS_CHUNKS,
+                render_distance,
+                3,
+            );
+        }
 
-        let chunks_to_remove: Vec<(i64, i64)> = self
+        desired.sort_by_key(|key| {
+            let dx = key.origin_chunk.0 - center.0;
+            let dz = key.origin_chunk.1 - center.1;
+            (dx * dx + dz * dz, key.lod_level)
+        });
+        let desired_set: HashSet<ChunkRenderKey> = desired.iter().copied().collect();
+
+        let chunks_to_remove: Vec<ChunkRenderKey> = self
             .visible_chunks
             .difference(&desired_set)
             .copied()
             .collect();
         if let Some(gpu) = self.gpu.as_mut() {
-            for chunk in &chunks_to_remove {
-                gpu.remove_chunk_mesh(*chunk);
+            for key in &chunks_to_remove {
+                gpu.remove_chunk_mesh(*key);
             }
         }
-        for chunk in &chunks_to_remove {
-            self.resident_chunks.remove(chunk);
+        for key in &chunks_to_remove {
+            self.resident_chunks.remove(key);
         }
 
         self.visible_chunks = desired_set;
         self.last_chunk_center = center;
 
-        for chunk in desired {
-            if self.resident_chunks.contains(&chunk) && !self.dirty_chunks.contains(&chunk) {
+        for key in desired {
+            if self.resident_chunks.contains(&key) && !self.dirty_chunks.contains(&key) {
                 continue;
             }
-            self.ensure_chunk_requested(chunk);
+            self.ensure_chunk_requested(key);
         }
     }
 
@@ -439,53 +483,53 @@ impl App {
                 Err(mpsc::TryRecvError::Disconnected) => break,
             };
 
-            self.requested_chunks.remove(&result.chunk);
-            let newest_version = self.chunk_versions.get(&result.chunk).copied().unwrap_or(0);
+            self.requested_chunks.remove(&result.key);
+            let newest_version = self.chunk_versions.get(&result.key).copied().unwrap_or(0);
             if result.version != newest_version {
-                self.ensure_chunk_requested(result.chunk);
+                self.ensure_chunk_requested(result.key);
                 continue;
             }
-            if !self.visible_chunks.contains(&result.chunk) {
+            if !self.visible_chunks.contains(&result.key) {
                 continue;
             }
 
             if let Some(gpu) = self.gpu.as_mut() {
-                gpu.upsert_chunk_mesh(result.chunk, &result.vertices);
+                gpu.upsert_chunk_mesh(result.key, &result.vertices);
             }
-            self.resident_chunks.insert(result.chunk);
-            self.dirty_chunks.remove(&result.chunk);
+            self.resident_chunks.insert(result.key);
+            self.dirty_chunks.remove(&result.key);
             uploads_remaining -= 1;
         }
     }
 
-    fn ensure_chunk_requested(&mut self, chunk: (i64, i64)) {
-        if self.requested_chunks.contains(&chunk) {
+    fn ensure_chunk_requested(&mut self, key: ChunkRenderKey) {
+        if self.requested_chunks.contains(&key) {
             return;
         }
-        let version = *self.chunk_versions.entry(chunk).or_insert(1);
+        let version = *self.chunk_versions.entry(key).or_insert(1);
         if self
             .chunk_pipeline
             .request_tx
-            .send(ChunkBuildRequest { chunk, version })
+            .send(ChunkBuildRequest { key, version })
             .is_ok()
         {
-            self.requested_chunks.insert(chunk);
+            self.requested_chunks.insert(key);
         }
     }
 
-    fn mark_chunk_dirty(&mut self, chunk: (i64, i64)) {
+    fn mark_chunk_dirty(&mut self, key: ChunkRenderKey) {
         let version = self
             .chunk_versions
-            .entry(chunk)
+            .entry(key)
             .and_modify(|v| *v = v.saturating_add(1))
             .or_insert(1);
-        self.dirty_chunks.insert(chunk);
-        if self.visible_chunks.contains(&chunk) && !self.requested_chunks.contains(&chunk) {
+        self.dirty_chunks.insert(key);
+        if self.visible_chunks.contains(&key) && !self.requested_chunks.contains(&key) {
             let _ = self.chunk_pipeline.request_tx.send(ChunkBuildRequest {
-                chunk,
+                key,
                 version: *version,
             });
-            self.requested_chunks.insert(chunk);
+            self.requested_chunks.insert(key);
         }
     }
 
@@ -493,8 +537,18 @@ impl App {
         let chunk = World::world_to_chunk(x, z);
         for dz in -1..=1 {
             for dx in -1..=1 {
-                self.mark_chunk_dirty((chunk.0 + dx, chunk.1 + dz));
+                self.mark_chunk_dirty(ChunkRenderKey {
+                    origin_chunk: (chunk.0 + dx, chunk.1 + dz),
+                    lod_level: 0,
+                });
             }
+        }
+        for lod_level in 1..=3 {
+            let step = 1_i64 << lod_level;
+            self.mark_chunk_dirty(ChunkRenderKey {
+                origin_chunk: aligned_origin(chunk, step),
+                lod_level,
+            });
         }
     }
 
@@ -627,6 +681,7 @@ impl App {
                 MIN_RENDER_DISTANCE_CHUNKS as i32,
                 MAX_RENDER_DISTANCE_CHUNKS as i32,
             ) as u32;
+        self.update_far_plane_for_render_distance();
         self.schedule_visible_chunks();
         self.refresh_window_title();
     }
@@ -785,6 +840,7 @@ impl ApplicationHandler for App {
         self.lens = self
             .lens
             .with_aspect(size.width.max(1) as f32 / size.height.max(1) as f32);
+        self.update_far_plane_for_render_distance();
         self.free_camera = self.actors.local_player().camera(self.lens);
         let gpu = pollster::block_on(GpuState::new(window.clone(), self.active_camera()));
 
@@ -817,7 +873,7 @@ impl ApplicationHandler for App {
                 self.lens = self
                     .lens
                     .with_aspect(size.width.max(1) as f32 / size.height.max(1) as f32);
-                self.sync_active_camera();
+                self.sync_lens_to_cameras();
             }
             WindowEvent::RedrawRequested => {
                 let menu_overlay = if self.ui_mode == UiMode::Paused {
@@ -984,6 +1040,58 @@ impl ApplicationHandler for App {
 
 fn axis_value(positive: bool, negative: bool) -> f32 {
     positive as i8 as f32 - negative as i8 as f32
+}
+
+fn aligned_origin(chunk: (i64, i64), step_chunks: i64) -> (i64, i64) {
+    (
+        chunk.0.div_euclid(step_chunks) * step_chunks,
+        chunk.1.div_euclid(step_chunks) * step_chunks,
+    )
+}
+
+fn collect_lod_ring(
+    out: &mut Vec<ChunkRenderKey>,
+    center_chunk: (i64, i64),
+    min_radius: i64,
+    max_radius: i64,
+    lod_level: u8,
+) {
+    if max_radius <= 0 || max_radius <= min_radius {
+        return;
+    }
+    let step = 1_i64 << lod_level;
+    let min_sq = min_radius * min_radius;
+    let max_sq = max_radius * max_radius;
+    let start_x = (center_chunk.0 - max_radius).div_euclid(step) * step;
+    let end_x = (center_chunk.0 + max_radius).div_euclid(step) * step;
+    let start_z = (center_chunk.1 - max_radius).div_euclid(step) * step;
+    let end_z = (center_chunk.1 + max_radius).div_euclid(step) * step;
+    let half_step = step as f32 * 0.5;
+
+    let mut origin_z = start_z;
+    while origin_z <= end_z {
+        let mut origin_x = start_x;
+        while origin_x <= end_x {
+            let center_x = origin_x as f32 + half_step;
+            let center_z = origin_z as f32 + half_step;
+            let dx = center_x - center_chunk.0 as f32;
+            let dz = center_z - center_chunk.1 as f32;
+            let dist_sq = dx * dx + dz * dz;
+            let in_min = if min_radius == 0 {
+                dist_sq >= 0.0
+            } else {
+                dist_sq > min_sq as f32
+            };
+            if dist_sq <= max_sq as f32 && in_min {
+                out.push(ChunkRenderKey {
+                    origin_chunk: (origin_x, origin_z),
+                    lod_level,
+                });
+            }
+            origin_x += step;
+        }
+        origin_z += step;
+    }
 }
 
 fn block_label(block: Block) -> &'static str {

@@ -81,11 +81,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let soft_sun = smoothstep(0.0, 0.85, sun_ndotl);
     let soft_moon = smoothstep(0.0, 0.95, moon_ndotl);
 
-    let sun_shadow = if sun_intensity > 0.02 && sun_ndotl > 0.02 {
-        terrain_shadow(in.world_position, sun_dir, seed)
-    } else {
-        1.0
-    };
+    var sun_shadow = 1.0;
+    if sun_intensity > 0.02 && sun_ndotl > 0.02 {
+        sun_shadow = terrain_shadow(in.world_position, sun_dir, seed);
+    }
     let sun_light = soft_sun * sun_intensity * sun_shadow;
     let moon_light = soft_moon * moon_intensity * 0.85;
 

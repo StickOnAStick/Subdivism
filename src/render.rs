@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use bytemuck::{Pod, Zeroable};
-use glam::Vec3;
+use glam::{Vec3, Vec4};
 use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, window::Window};
 
@@ -82,6 +82,12 @@ struct ChunkMeshGpu {
     vertex_count: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ChunkRenderKey {
+    pub origin_chunk: (i64, i64),
+    pub lod_level: u8,
+}
+
 pub enum RenderOutcome {
     Success,
     Reconfigure,
@@ -95,7 +101,7 @@ pub struct GpuState {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     render_pipeline: wgpu::RenderPipeline,
-    world_chunks: HashMap<(i64, i64), ChunkMeshGpu>,
+    world_chunks: HashMap<ChunkRenderKey, ChunkMeshGpu>,
     camera: Camera,
     camera_uniform: CameraUniform,
     camera_buffer: wgpu::Buffer,
@@ -397,9 +403,9 @@ impl GpuState {
         }
     }
 
-    pub fn upsert_chunk_mesh(&mut self, chunk: (i64, i64), vertices: &[Vertex]) {
+    pub fn upsert_chunk_mesh(&mut self, key: ChunkRenderKey, vertices: &[Vertex]) {
         let needed = vertices.len().max(1);
-        let entry = self.world_chunks.entry(chunk).or_insert_with(|| ChunkMeshGpu {
+        let entry = self.world_chunks.entry(key).or_insert_with(|| ChunkMeshGpu {
             vertex_buffer: self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("world_chunk_vertex_buffer"),
                 size: (needed.next_power_of_two() * std::mem::size_of::<Vertex>()) as u64,
@@ -426,8 +432,8 @@ impl GpuState {
         }
     }
 
-    pub fn remove_chunk_mesh(&mut self, chunk: (i64, i64)) {
-        self.world_chunks.remove(&chunk);
+    pub fn remove_chunk_mesh(&mut self, key: ChunkRenderKey) {
+        self.world_chunks.remove(&key);
     }
 
     pub fn resize(&mut self, new_size: PhysicalSize<u32>) {
@@ -581,11 +587,11 @@ impl GpuState {
             });
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            for (chunk_coord, chunk) in &self.world_chunks {
+            for (key, chunk) in &self.world_chunks {
                 if chunk.vertex_count == 0 {
                     continue;
                 }
-                if !cull_context.chunk_in_view(*chunk_coord) {
+                if !cull_context.chunk_in_view(*key) {
                     continue;
                 }
                 render_pass.set_vertex_buffer(0, chunk.vertex_buffer.slice(..));
@@ -685,46 +691,63 @@ pub fn celestial_state_for_time(time_seconds: f32) -> CelestialState {
 }
 
 struct ChunkCullContext {
-    camera_position: Vec3,
-    camera_forward: Vec3,
-    z_far: f32,
-    max_half_fov: f32,
+    frustum_planes: [Vec4; 5],
 }
 
 impl ChunkCullContext {
     fn new(camera: Camera) -> Self {
-        let half_vertical = camera.lens.fov_y_radians * 0.5;
-        let half_horizontal = (half_vertical.tan() * camera.lens.aspect).atan();
+        let m = camera.view_proj().to_cols_array_2d();
+        let r0 = Vec4::new(m[0][0], m[1][0], m[2][0], m[3][0]);
+        let r1 = Vec4::new(m[0][1], m[1][1], m[2][1], m[3][1]);
+        let r2 = Vec4::new(m[0][2], m[1][2], m[2][2], m[3][2]);
+        let r3 = Vec4::new(m[0][3], m[1][3], m[2][3], m[3][3]);
+
+        let planes = [
+            normalize_plane(r3 + r0),
+            normalize_plane(r3 - r0),
+            normalize_plane(r3 + r1),
+            normalize_plane(r3 - r1),
+            normalize_plane(r3 - r2),
+        ];
+
         Self {
-            camera_position: camera.position,
-            camera_forward: camera.forward(),
-            z_far: camera.lens.z_far,
-            max_half_fov: half_vertical.max(half_horizontal),
+            frustum_planes: planes,
         }
     }
 
-    fn chunk_in_view(&self, chunk: (i64, i64)) -> bool {
-        let min = Vec3::new((chunk.0 * CHUNK_SIZE) as f32, 0.0, (chunk.1 * CHUNK_SIZE) as f32);
-        let max = Vec3::new(
-            ((chunk.0 + 1) * CHUNK_SIZE) as f32,
-            WORLD_HEIGHT as f32,
-            ((chunk.1 + 1) * CHUNK_SIZE) as f32,
+    fn chunk_in_view(&self, key: ChunkRenderKey) -> bool {
+        let span = 1_i64 << key.lod_level;
+        let world_span = CHUNK_SIZE * span;
+        let min = Vec3::new(
+            (key.origin_chunk.0 * CHUNK_SIZE) as f32,
+            0.0,
+            (key.origin_chunk.1 * CHUNK_SIZE) as f32,
         );
-        let center = (min + max) * 0.5;
-        let radius = (max - center).length();
-        let to_chunk = center - self.camera_position;
-        let distance = to_chunk.length().max(0.001);
-
-        if distance - radius > self.z_far {
-            return false;
+        let max = Vec3::new(
+            min.x + world_span as f32,
+            WORLD_HEIGHT as f32,
+            min.z + world_span as f32,
+        );
+        for plane in self.frustum_planes {
+            let positive = Vec3::new(
+                if plane.x >= 0.0 { max.x } else { min.x },
+                if plane.y >= 0.0 { max.y } else { min.y },
+                if plane.z >= 0.0 { max.z } else { min.z },
+            );
+            let distance = plane.x * positive.x + plane.y * positive.y + plane.z * positive.z + plane.w;
+            if distance < 0.0 {
+                return false;
+            }
         }
-        if distance <= radius {
-            return true;
-        }
-
-        let angular_radius = (radius / distance).clamp(0.0, 1.0).asin();
-        let max_angle = self.max_half_fov + angular_radius + 0.08;
-        let cos_limit = max_angle.cos();
-        self.camera_forward.dot(to_chunk / distance) >= cos_limit
+        true
     }
+}
+
+fn normalize_plane(plane: Vec4) -> Vec4 {
+    let normal = Vec3::new(plane.x, plane.y, plane.z);
+    let length = normal.length();
+    if length <= f32::EPSILON {
+        return plane;
+    }
+    plane / length
 }
