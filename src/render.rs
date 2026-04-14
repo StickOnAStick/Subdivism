@@ -1,10 +1,16 @@
 use std::{collections::HashMap, sync::Arc};
 
 use bytemuck::{Pod, Zeroable};
+use glam::Vec3;
 use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, window::Window};
 
-use crate::{camera::Camera, debug_overlay::OverlayVertex, mesh::Vertex};
+use crate::{
+    camera::Camera,
+    debug_overlay::OverlayVertex,
+    game::world::{CHUNK_SIZE, WORLD_HEIGHT},
+    mesh::Vertex,
+};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -17,6 +23,28 @@ struct CameraUniform {
 struct ScreenUniform {
     screen_size: [f32; 2],
     _padding: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct LightingUniform {
+    sun_direction: [f32; 4],
+    moon_direction: [f32; 4],
+    sky_top: [f32; 4],
+    sky_bottom: [f32; 4],
+    camera_position: [f32; 4],
+    params: [f32; 4],
+}
+
+#[derive(Clone, Copy)]
+pub struct CelestialState {
+    pub sun_direction: Vec3,
+    pub moon_direction: Vec3,
+    pub sky_top: [f32; 3],
+    pub sky_bottom: [f32; 3],
+    pub sun_intensity: f32,
+    pub moon_intensity: f32,
+    pub ambient: f32,
 }
 
 struct DepthTexture {
@@ -71,7 +99,10 @@ pub struct GpuState {
     camera: Camera,
     camera_uniform: CameraUniform,
     camera_buffer: wgpu::Buffer,
+    lighting_uniform: LightingUniform,
+    lighting_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+    clear_color: wgpu::Color,
     depth: DepthTexture,
     overlay_pipeline: wgpu::RenderPipeline,
     overlay_vertex_buffer: wgpu::Buffer,
@@ -109,14 +140,53 @@ impl GpuState {
             .await
             .expect("failed to create device");
 
+        let caps = surface.get_capabilities(&adapter);
         let mut config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .expect("surface is not supported by adapter");
-        config.present_mode = wgpu::PresentMode::AutoNoVsync;
+        config.present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
+            wgpu::PresentMode::Immediate
+        } else {
+            wgpu::PresentMode::AutoNoVsync
+        };
         surface.configure(&device, &config);
 
         let camera_uniform = CameraUniform {
             view_proj: camera.view_proj().to_cols_array_2d(),
+        };
+        let celestial = celestial_state_for_time(0.0);
+        let lighting_uniform = LightingUniform {
+            sun_direction: [
+                celestial.sun_direction.x,
+                celestial.sun_direction.y,
+                celestial.sun_direction.z,
+                0.0,
+            ],
+            moon_direction: [
+                celestial.moon_direction.x,
+                celestial.moon_direction.y,
+                celestial.moon_direction.z,
+                0.0,
+            ],
+            sky_top: [
+                celestial.sky_top[0],
+                celestial.sky_top[1],
+                celestial.sky_top[2],
+                1.0,
+            ],
+            sky_bottom: [
+                celestial.sky_bottom[0],
+                celestial.sky_bottom[1],
+                celestial.sky_bottom[2],
+                1.0,
+            ],
+            camera_position: [camera.position.x, camera.position.y, camera.position.z, 0.0],
+            params: [
+                celestial.sun_intensity,
+                celestial.moon_intensity,
+                celestial.ambient,
+                0.0,
+            ],
         };
         let screen_uniform = ScreenUniform {
             screen_size: [config.width as f32, config.height as f32],
@@ -128,6 +198,11 @@ impl GpuState {
             contents: bytemuck::cast_slice(&[camera_uniform]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+        let lighting_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("lighting_buffer"),
+            contents: bytemuck::bytes_of(&lighting_uniform),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
         let screen_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("screen_uniform_buffer"),
             contents: bytemuck::bytes_of(&screen_uniform),
@@ -137,24 +212,42 @@ impl GpuState {
         let camera_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("camera_bind_group_layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                }],
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
             });
         let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("camera_bind_group"),
             layout: &camera_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: lighting_buffer.as_entire_binding(),
+                },
+            ],
         });
 
         let screen_bind_group_layout =
@@ -285,7 +378,15 @@ impl GpuState {
             camera,
             camera_uniform,
             camera_buffer,
+            lighting_uniform,
+            lighting_buffer,
             camera_bind_group,
+            clear_color: wgpu::Color {
+                r: celestial.sky_bottom[0] as f64,
+                g: celestial.sky_bottom[1] as f64,
+                b: celestial.sky_bottom[2] as f64,
+                a: 1.0,
+            },
             depth,
             overlay_pipeline,
             overlay_vertex_buffer,
@@ -353,6 +454,59 @@ impl GpuState {
         self.update_camera();
     }
 
+    pub fn set_environment(
+        &mut self,
+        time_seconds: f32,
+        camera_position: Vec3,
+        terrain_seed: i64,
+    ) -> CelestialState {
+        let celestial = celestial_state_for_time(time_seconds);
+        self.lighting_uniform.sun_direction = [
+            celestial.sun_direction.x,
+            celestial.sun_direction.y,
+            celestial.sun_direction.z,
+            0.0,
+        ];
+        self.lighting_uniform.moon_direction = [
+            celestial.moon_direction.x,
+            celestial.moon_direction.y,
+            celestial.moon_direction.z,
+            0.0,
+        ];
+        self.lighting_uniform.sky_top = [
+            celestial.sky_top[0],
+            celestial.sky_top[1],
+            celestial.sky_top[2],
+            1.0,
+        ];
+        self.lighting_uniform.sky_bottom = [
+            celestial.sky_bottom[0],
+            celestial.sky_bottom[1],
+            celestial.sky_bottom[2],
+            1.0,
+        ];
+        self.lighting_uniform.camera_position =
+            [camera_position.x, camera_position.y, camera_position.z, 0.0];
+        self.lighting_uniform.params = [
+            celestial.sun_intensity,
+            celestial.moon_intensity,
+            celestial.ambient,
+            terrain_seed as f32,
+        ];
+        self.clear_color = wgpu::Color {
+            r: celestial.sky_bottom[0] as f64,
+            g: celestial.sky_bottom[1] as f64,
+            b: celestial.sky_bottom[2] as f64,
+            a: 1.0,
+        };
+        self.queue.write_buffer(
+            &self.lighting_buffer,
+            0,
+            bytemuck::bytes_of(&self.lighting_uniform),
+        );
+        celestial
+    }
+
     pub fn estimated_gpu_memory_bytes(&self) -> u64 {
         let world_vertex_bytes = self
             .world_chunks
@@ -401,6 +555,7 @@ impl GpuState {
             });
 
         {
+            let cull_context = ChunkCullContext::new(self.camera);
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("render_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -408,12 +563,7 @@ impl GpuState {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.04,
-                            g: 0.05,
-                            b: 0.08,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(self.clear_color),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -431,8 +581,11 @@ impl GpuState {
             });
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            for chunk in self.world_chunks.values() {
+            for (chunk_coord, chunk) in &self.world_chunks {
                 if chunk.vertex_count == 0 {
+                    continue;
+                }
+                if !cull_context.chunk_in_view(*chunk_coord) {
                     continue;
                 }
                 render_pass.set_vertex_buffer(0, chunk.vertex_buffer.slice(..));
@@ -489,5 +642,89 @@ impl GpuState {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+    }
+}
+
+pub fn celestial_state_for_time(time_seconds: f32) -> CelestialState {
+    let day_length_seconds = 180.0;
+    let phase = (time_seconds / day_length_seconds).fract() * std::f32::consts::TAU;
+    let sun_direction = Vec3::new(phase.cos() * 0.55, phase.sin(), phase.sin() * 0.55).normalize();
+    let moon_direction = -sun_direction;
+    let sun_elevation = sun_direction.y.clamp(-1.0, 1.0);
+    let sun_up = sun_elevation.max(0.0);
+    let moon_up = (-sun_elevation).max(0.0);
+    let horizon_blend = (1.0 - sun_elevation.abs()).powf(2.2);
+
+    let day_top = Vec3::new(0.33, 0.63, 0.95);
+    let day_bottom = Vec3::new(0.62, 0.82, 0.99);
+    let night_top = Vec3::new(0.03, 0.05, 0.11);
+    let night_bottom = Vec3::new(0.06, 0.09, 0.17);
+    let sunrise = Vec3::new(1.00, 0.50, 0.30);
+    let sunset = Vec3::new(1.00, 0.66, 0.42);
+    let sherbet = (sunrise + sunset) * 0.5;
+
+    let daylight = sun_up.powf(0.42);
+    let mut sky_top = night_top.lerp(day_top, daylight);
+    let mut sky_bottom = night_bottom.lerp(day_bottom, daylight);
+    sky_top = sky_top.lerp(sherbet, horizon_blend * 0.35);
+    sky_bottom = sky_bottom.lerp(sherbet, horizon_blend * 0.55);
+
+    let sun_intensity = (sun_up * 1.05).powf(0.75);
+    let moon_intensity = (moon_up * 0.38).powf(0.8);
+    let ambient = 0.06 + sun_intensity * 0.22 + moon_intensity * 0.16;
+
+    CelestialState {
+        sun_direction,
+        moon_direction,
+        sky_top: sky_top.to_array(),
+        sky_bottom: sky_bottom.to_array(),
+        sun_intensity,
+        moon_intensity,
+        ambient,
+    }
+}
+
+struct ChunkCullContext {
+    camera_position: Vec3,
+    camera_forward: Vec3,
+    z_far: f32,
+    max_half_fov: f32,
+}
+
+impl ChunkCullContext {
+    fn new(camera: Camera) -> Self {
+        let half_vertical = camera.lens.fov_y_radians * 0.5;
+        let half_horizontal = (half_vertical.tan() * camera.lens.aspect).atan();
+        Self {
+            camera_position: camera.position,
+            camera_forward: camera.forward(),
+            z_far: camera.lens.z_far,
+            max_half_fov: half_vertical.max(half_horizontal),
+        }
+    }
+
+    fn chunk_in_view(&self, chunk: (i64, i64)) -> bool {
+        let min = Vec3::new((chunk.0 * CHUNK_SIZE) as f32, 0.0, (chunk.1 * CHUNK_SIZE) as f32);
+        let max = Vec3::new(
+            ((chunk.0 + 1) * CHUNK_SIZE) as f32,
+            WORLD_HEIGHT as f32,
+            ((chunk.1 + 1) * CHUNK_SIZE) as f32,
+        );
+        let center = (min + max) * 0.5;
+        let radius = (max - center).length();
+        let to_chunk = center - self.camera_position;
+        let distance = to_chunk.length().max(0.001);
+
+        if distance - radius > self.z_far {
+            return false;
+        }
+        if distance <= radius {
+            return true;
+        }
+
+        let angular_radius = (radius / distance).clamp(0.0, 1.0).asin();
+        let max_angle = self.max_half_fov + angular_radius + 0.08;
+        let cos_limit = max_angle.cos();
+        self.camera_forward.dot(to_chunk / distance) >= cos_limit
     }
 }

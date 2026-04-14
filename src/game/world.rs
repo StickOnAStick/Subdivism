@@ -68,6 +68,10 @@ impl World {
         (0, 0)
     }
 
+    pub fn terrain_seed(&self) -> i64 {
+        self.seed
+    }
+
     pub fn build_chunk_mesh(&self, chunk: (i64, i64)) -> Vec<Vertex> {
         let overrides = self.overrides.read().expect("overrides read lock poisoned");
         self.build_chunk_mesh_with_overrides(chunk, &overrides)
@@ -79,6 +83,10 @@ impl World {
 
     pub fn is_solid_i64(&self, x: i64, y: i32, z: i64) -> bool {
         self.block_at(x, y, z).is_solid()
+    }
+
+    pub fn block_at_i64(&self, x: i64, y: i32, z: i64) -> Block {
+        self.block_at(x, y, z)
     }
 
     pub fn set_block_i64(&mut self, x: i64, y: i32, z: i64, block: Block) {
@@ -138,6 +146,7 @@ impl World {
                                 base + Vec3::new(1.0, 1.0, 0.0),
                             ],
                             top_color,
+                            Vec3::Y,
                         );
                     }
                     if y > 0
@@ -154,6 +163,7 @@ impl World {
                                 base + Vec3::new(1.0, 0.0, 1.0),
                             ],
                             bottom_color,
+                            -Vec3::Y,
                         );
                     }
                     if !self
@@ -169,6 +179,7 @@ impl World {
                                 base + Vec3::new(0.0, 1.0, 0.0),
                             ],
                             side_color,
+                            -Vec3::X,
                         );
                     }
                     if !self
@@ -184,6 +195,7 @@ impl World {
                                 base + Vec3::new(1.0, 1.0, 1.0),
                             ],
                             side_color,
+                            Vec3::X,
                         );
                     }
                     if !self
@@ -199,6 +211,7 @@ impl World {
                                 base + Vec3::new(1.0, 1.0, 0.0),
                             ],
                             side_color,
+                            -Vec3::Z,
                         );
                     }
                     if !self
@@ -214,6 +227,7 @@ impl World {
                                 base + Vec3::new(0.0, 1.0, 1.0),
                             ],
                             side_color,
+                            Vec3::Z,
                         );
                     }
                 }

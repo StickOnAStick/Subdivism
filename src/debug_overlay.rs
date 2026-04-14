@@ -60,14 +60,15 @@ impl DebugOverlay {
         }
     }
 
-    pub fn build_vertices(&self, memory_bytes: u64) -> Vec<OverlayVertex> {
+    pub fn build_vertices(&self, memory_bytes: u64, extra_lines: &[String]) -> Vec<OverlayVertex> {
         if !self.visible {
             return Vec::new();
         }
 
         let fps_line = format!("FPS {:.1}", self.fps);
         let memory_line = format!("GPU MEM {:.2} MB", memory_bytes as f64 / (1024.0 * 1024.0));
-        let lines = [fps_line, memory_line];
+        let mut lines = vec![fps_line, memory_line];
+        lines.extend(extra_lines.iter().cloned());
 
         let glyph_h = 7.0 * OVERLAY_GLYPH_SCALE;
         let advance = 6.0 * OVERLAY_GLYPH_SCALE;

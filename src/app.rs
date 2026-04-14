@@ -16,14 +16,15 @@ use winit::{
 
 use crate::{
     camera::{Camera, CameraLens},
-    debug_overlay::DebugOverlay,
+    debug_overlay::{DebugOverlay, OverlayVertex},
     game::{
         actor::{ActorRoster, PLAYER_EYE_HEIGHT},
+        inventory::Inventory,
         physics::{self, MovementInput, PhysicsConfig},
         world::{Block, World},
     },
     mesh::Vertex,
-    render::{GpuState, RenderOutcome},
+    render::{celestial_state_for_time, GpuState, RenderOutcome},
 };
 
 const FREE_CAMERA_SPEED: f32 = 10.0;
@@ -33,7 +34,7 @@ const FRAME_CAP_PRESETS: [Option<u32>; 5] = [None, Some(60), Some(120), Some(144
 const DEFAULT_FRAME_CAP_INDEX: usize = 3;
 const DEFAULT_RENDER_DISTANCE_CHUNKS: u32 = 10;
 const MIN_RENDER_DISTANCE_CHUNKS: u32 = 2;
-const MAX_RENDER_DISTANCE_CHUNKS: u32 = 24;
+const MAX_RENDER_DISTANCE_CHUNKS: u32 = 128;
 const MAX_CHUNK_UPLOADS_PER_FRAME: usize = 4;
 
 pub fn run() {
@@ -178,6 +179,8 @@ struct App {
     dirty_chunks: HashSet<(i64, i64)>,
     chunk_versions: HashMap<(i64, i64), u64>,
     chunk_pipeline: ChunkBuildPipeline,
+    inventory: Inventory,
+    world_time_seconds: f32,
     last_chunk_center: (i64, i64),
     last_frame: Instant,
     next_frame_at: Instant,
@@ -219,6 +222,8 @@ impl App {
             dirty_chunks: HashSet::new(),
             chunk_versions: HashMap::new(),
             chunk_pipeline: pipeline,
+            inventory: Inventory::new(),
+            world_time_seconds: 0.0,
             last_chunk_center: (0, 0),
             last_frame: Instant::now(),
             next_frame_at: Instant::now(),
@@ -382,9 +387,13 @@ impl App {
     fn schedule_visible_chunks(&mut self) {
         let center = self.current_chunk_center();
         let render_distance = self.render_distance_chunks as i64;
+        let radius_sq = render_distance * render_distance;
         let mut desired = Vec::new();
         for dz in -render_distance..=render_distance {
             for dx in -render_distance..=render_distance {
+                if dx * dx + dz * dz > radius_sq {
+                    continue;
+                }
                 desired.push((center.0 + dx, center.1 + dz));
             }
         }
@@ -650,6 +659,57 @@ impl App {
         }
     }
 
+    fn hud_lines(&self) -> Vec<String> {
+        let slot = self.inventory.selected_slot();
+        let slots = self.inventory.slots();
+        vec![
+            format!("SUN {:.1}", self.world_time_seconds),
+            format!("SEL {} {}", block_label(slot.block), slot.count),
+            format!(
+                "G {} D {} S {}",
+                slots[0].count, slots[1].count, slots[2].count
+            ),
+        ]
+    }
+
+    fn sky_body_overlay(&self) -> Vec<OverlayVertex> {
+        let mut vertices = Vec::new();
+        let Some(window) = &self.window else {
+            return vertices;
+        };
+        let size = window.inner_size();
+        if size.width == 0 || size.height == 0 {
+            return vertices;
+        }
+        let camera = self.active_camera();
+        let celestial = celestial_state_for_time(self.world_time_seconds);
+
+        if let Some((x, y)) = direction_to_screen(
+            camera,
+            celestial.sun_direction,
+            size.width as f32,
+            size.height as f32,
+        ) {
+            let glow = 16.0 + 22.0 * celestial.sun_intensity;
+            let core = 5.0 + 7.0 * celestial.sun_intensity;
+            push_circle(&mut vertices, x, y, glow, [1.0, 0.62, 0.34, 0.24], 18);
+            push_circle(&mut vertices, x, y, core, [1.0, 0.90, 0.72, 0.95], 14);
+        }
+        if let Some((x, y)) = direction_to_screen(
+            camera,
+            celestial.moon_direction,
+            size.width as f32,
+            size.height as f32,
+        ) {
+            let glow = 9.0 + 10.0 * celestial.moon_intensity;
+            let core = 3.0 + 4.0 * celestial.moon_intensity;
+            push_circle(&mut vertices, x, y, glow, [0.72, 0.80, 1.0, 0.18], 14);
+            push_circle(&mut vertices, x, y, core, [0.90, 0.94, 1.0, 0.85], 12);
+        }
+
+        vertices
+    }
+
     fn edit_block_from_click(&mut self, remove: bool) {
         if self.ui_mode != UiMode::Playing {
             return;
@@ -662,7 +722,12 @@ impl App {
         };
 
         if remove {
+            let block = self.world.block_at_i64(hit.0, hit.1, hit.2);
+            if matches!(block, Block::Air) {
+                return;
+            }
             self.world.set_block_i64(hit.0, hit.1, hit.2, Block::Air);
+            self.inventory.add_block(block);
             self.mark_block_change_dirty(hit.0, hit.2);
             return;
         }
@@ -687,8 +752,16 @@ impl App {
             return;
         }
 
+        if !matches!(self.world.block_at_i64(place.0, place.1, place.2), Block::Air) {
+            return;
+        }
+
+        let Some(block_to_place) = self.inventory.try_take_selected() else {
+            return;
+        };
+
         self.world
-            .set_block_i64(place.0, place.1, place.2, Block::Stone);
+            .set_block_i64(place.0, place.1, place.2, block_to_place);
         self.mark_block_change_dirty(place.0, place.2);
     }
 }
@@ -756,9 +829,14 @@ impl ApplicationHandler for App {
                 } else {
                     None
                 };
+                let hud_lines = self.hud_lines();
+                let sky_overlay = self.sky_body_overlay();
                 if let Some(gpu) = self.gpu.as_mut() {
-                    let mut overlay_vertices =
-                        self.debug_overlay.build_vertices(gpu.estimated_gpu_memory_bytes());
+                    let mut overlay_vertices = sky_overlay;
+                    overlay_vertices.extend(
+                        self.debug_overlay
+                            .build_vertices(gpu.estimated_gpu_memory_bytes(), &hud_lines),
+                    );
                     if let Some(menu_vertices) = menu_overlay {
                         overlay_vertices.extend(menu_vertices);
                     }
@@ -795,6 +873,15 @@ impl ApplicationHandler for App {
                             }
                             if code == KeyCode::Escape && !event.repeat {
                                 self.open_pause_menu();
+                            }
+                            if code == KeyCode::Digit1 && !event.repeat {
+                                self.inventory.select_index(0);
+                            }
+                            if code == KeyCode::Digit2 && !event.repeat {
+                                self.inventory.select_index(1);
+                            }
+                            if code == KeyCode::Digit3 && !event.repeat {
+                                self.inventory.select_index(2);
                             }
                         }
                         ElementState::Released => {
@@ -872,6 +959,7 @@ impl ApplicationHandler for App {
 
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
+        self.world_time_seconds += dt;
         self.debug_overlay.record_frame(dt);
         self.update(dt);
         let center = self.current_chunk_center();
@@ -879,6 +967,14 @@ impl ApplicationHandler for App {
             self.schedule_visible_chunks();
         }
         self.process_chunk_build_results();
+        let camera = self.active_camera();
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.set_environment(
+                self.world_time_seconds,
+                camera.position,
+                self.world.terrain_seed(),
+            );
+        }
 
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -888,6 +984,15 @@ impl ApplicationHandler for App {
 
 fn axis_value(positive: bool, negative: bool) -> f32 {
     positive as i8 as f32 - negative as i8 as f32
+}
+
+fn block_label(block: Block) -> &'static str {
+    match block {
+        Block::Air => "AIR",
+        Block::Grass => "GRASS",
+        Block::Dirt => "DIRT",
+        Block::Stone => "STONE",
+    }
 }
 
 fn random_i32_inclusive(state: &mut u64, min: i32, max: i32) -> i32 {
@@ -939,4 +1044,62 @@ fn voxel_coords(point: Vec3) -> (i64, i32, i64) {
         point.y.floor() as i32,
         point.z.floor() as i64,
     )
+}
+
+fn direction_to_screen(
+    camera: Camera,
+    direction: Vec3,
+    width: f32,
+    height: f32,
+) -> Option<(f32, f32)> {
+    let world_point = camera.position + direction.normalize_or_zero() * 1000.0;
+    let clip = camera.view_proj() * world_point.extend(1.0);
+    if clip.w <= 0.0 {
+        return None;
+    }
+    let ndc = clip.truncate() / clip.w;
+    if ndc.z < 0.0 || ndc.z > 1.0 {
+        return None;
+    }
+    if ndc.x.abs() > 1.2 || ndc.y.abs() > 1.2 {
+        return None;
+    }
+
+    let x = (ndc.x * 0.5 + 0.5) * width;
+    let y = (1.0 - (ndc.y * 0.5 + 0.5)) * height;
+    Some((x, y))
+}
+
+fn push_circle(
+    vertices: &mut Vec<OverlayVertex>,
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    color: [f32; 4],
+    segments: usize,
+) {
+    if segments < 3 || radius <= 0.0 {
+        return;
+    }
+    let step = std::f32::consts::TAU / segments as f32;
+    for i in 0..segments {
+        let a0 = i as f32 * step;
+        let a1 = (i + 1) as f32 * step;
+        let p0 = [cx + a0.cos() * radius, cy + a0.sin() * radius];
+        let p1 = [cx + a1.cos() * radius, cy + a1.sin() * radius];
+        vertices.extend_from_slice(&[
+            OverlayVertex {
+                position: [cx, cy],
+                color,
+            },
+            OverlayVertex {
+                position: p0,
+                color,
+            },
+            OverlayVertex {
+                position: p1,
+                color,
+            },
+        ]);
+    }
 }
