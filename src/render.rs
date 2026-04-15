@@ -1,16 +1,11 @@
 use std::{collections::HashMap, sync::Arc};
 
 use bytemuck::{Pod, Zeroable};
-use glam::{Vec3, Vec4};
+use glam::Vec3;
 use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, window::Window};
 
-use crate::{
-    camera::Camera,
-    debug_overlay::OverlayVertex,
-    game::world::{CHUNK_SIZE, WORLD_HEIGHT},
-    mesh::Vertex,
-};
+use crate::{camera::Camera, debug_overlay::OverlayVertex, mesh::Vertex};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -566,7 +561,6 @@ impl GpuState {
             });
 
         {
-            let cull_context = ChunkCullContext::new(self.camera);
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("render_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -592,11 +586,8 @@ impl GpuState {
             });
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            for (key, chunk) in &self.world_chunks {
+            for chunk in self.world_chunks.values() {
                 if chunk.vertex_count == 0 {
-                    continue;
-                }
-                if !cull_context.chunk_in_view(*key) {
                     continue;
                 }
                 render_pass.set_vertex_buffer(0, chunk.vertex_buffer.slice(..));
@@ -693,82 +684,4 @@ pub fn celestial_state_for_time(time_seconds: f32) -> CelestialState {
         moon_intensity,
         ambient,
     }
-}
-
-struct ChunkCullContext {
-    frustum_planes: [Vec4; 5],
-    camera_position: Vec3,
-}
-
-impl ChunkCullContext {
-    fn new(camera: Camera) -> Self {
-        let m = camera.view_proj().to_cols_array_2d();
-        let r0 = Vec4::new(m[0][0], m[1][0], m[2][0], m[3][0]);
-        let r1 = Vec4::new(m[0][1], m[1][1], m[2][1], m[3][1]);
-        let r2 = Vec4::new(m[0][2], m[1][2], m[2][2], m[3][2]);
-        let r3 = Vec4::new(m[0][3], m[1][3], m[2][3], m[3][3]);
-
-        let planes = [
-            normalize_plane(r3 + r0),
-            normalize_plane(r3 - r0),
-            normalize_plane(r3 + r1),
-            normalize_plane(r3 - r1),
-            normalize_plane(r3 - r2),
-        ];
-
-        Self {
-            frustum_planes: planes,
-            camera_position: camera.position,
-        }
-    }
-
-    fn chunk_in_view(&self, key: ChunkRenderKey) -> bool {
-        let span = 1_i64 << key.lod_level;
-        let world_span = CHUNK_SIZE * span;
-        let min = Vec3::new(
-            (key.origin_chunk.0 * CHUNK_SIZE) as f32,
-            0.0,
-            (key.origin_chunk.1 * CHUNK_SIZE) as f32,
-        );
-        let max = Vec3::new(
-            min.x + world_span as f32,
-            WORLD_HEIGHT as f32,
-            min.z + world_span as f32,
-        );
-
-        // Keep nearby chunks resident even if frustum math is on the edge for a frame.
-        let closest = Vec3::new(
-            self.camera_position.x.clamp(min.x, max.x),
-            self.camera_position.y.clamp(min.y, max.y),
-            self.camera_position.z.clamp(min.z, max.z),
-        );
-        let close_radius = (world_span as f32 * 1.5).max(CHUNK_SIZE as f32 * 3.0);
-        if self.camera_position.distance_squared(closest) <= close_radius * close_radius {
-            return true;
-        }
-
-        let cull_slack = world_span as f32 * 0.35 + 2.0;
-        for plane in self.frustum_planes {
-            let positive = Vec3::new(
-                if plane.x >= 0.0 { max.x } else { min.x },
-                if plane.y >= 0.0 { max.y } else { min.y },
-                if plane.z >= 0.0 { max.z } else { min.z },
-            );
-            let distance =
-                plane.x * positive.x + plane.y * positive.y + plane.z * positive.z + plane.w;
-            if distance < -cull_slack {
-                return false;
-            }
-        }
-        true
-    }
-}
-
-fn normalize_plane(plane: Vec4) -> Vec4 {
-    let normal = Vec3::new(plane.x, plane.y, plane.z);
-    let length = normal.length();
-    if length <= f32::EPSILON {
-        return plane;
-    }
-    plane / length
 }

@@ -59,8 +59,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let moon_light = soft_moon * moon_intensity * 0.82;
     let underground = smoothstep(6.0, -6.0, in.world_position.y);
     let depth_dim = mix(1.0, 0.88, underground);
+    let horizontal_distance = distance(in.world_position.xz, lighting.camera_position.xz);
+    let far_t = smoothstep(120.0, 420.0, horizontal_distance);
+    let side_facing = 1.0 - sky_visibility;
+    let far_shadow_lift = far_t * side_facing * 0.18;
+    let min_light = 0.06 + far_shadow_lift;
 
-    let total_light = clamp(ambient_light + sun_light + moon_light, 0.06, 2.2) * depth_dim;
+    let total_light = clamp(ambient_light + sun_light + moon_light, min_light, 2.2) * depth_dim;
     let base = in.color * total_light;
     return vec4<f32>(base, 1.0);
 }

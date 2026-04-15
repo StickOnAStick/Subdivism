@@ -300,6 +300,163 @@ impl World {
             }
         }
 
+        let boundary_height = |sample_x: i64, sample_z: i64| -> f32 {
+            self.surface_height(sample_x, sample_z) as f32 + 1.0
+        };
+
+        // Close seams on tile borders so differing neighbor heights do not expose void slits.
+        for gz in 0..cells {
+            let wz0 = base_z + gz * sample_blocks;
+            let wz1 = wz0 + sample_blocks;
+            let sample_z = wz0 + sample_blocks / 2;
+
+            let west_inside = height_at(&sampled_heights, 0, gz);
+            let west_outside = boundary_height(base_x - sample_blocks / 2, sample_z);
+            let center_z = wz0 + sample_blocks / 2;
+            let west_block = self.procedural_block(base_x, west_inside as i32 - 1, center_z);
+            let (_, west_side_color, _) = palette(west_block, base_x, center_z);
+            if (west_inside - west_outside).abs() > 0.01 {
+                let low = west_inside.min(west_outside);
+                let high = west_inside.max(west_outside);
+                if west_inside > west_outside {
+                    push_quad(
+                        &mut vertices,
+                        [
+                            Vec3::new(base_x as f32, low, wz0 as f32),
+                            Vec3::new(base_x as f32, low, wz1 as f32),
+                            Vec3::new(base_x as f32, high, wz1 as f32),
+                            Vec3::new(base_x as f32, high, wz0 as f32),
+                        ],
+                        west_side_color,
+                        -Vec3::X,
+                    );
+                } else {
+                    push_quad(
+                        &mut vertices,
+                        [
+                            Vec3::new(base_x as f32, low, wz1 as f32),
+                            Vec3::new(base_x as f32, low, wz0 as f32),
+                            Vec3::new(base_x as f32, high, wz0 as f32),
+                            Vec3::new(base_x as f32, high, wz1 as f32),
+                        ],
+                        west_side_color,
+                        Vec3::X,
+                    );
+                }
+            }
+
+            let east_x = base_x + tile_size_blocks;
+            let east_inside = height_at(&sampled_heights, cells - 1, gz);
+            let east_outside = boundary_height(east_x + sample_blocks / 2, sample_z);
+            let east_block = self.procedural_block(east_x - 1, east_inside as i32 - 1, center_z);
+            let (_, east_side_color, _) = palette(east_block, east_x - 1, center_z);
+            if (east_inside - east_outside).abs() > 0.01 {
+                let low = east_inside.min(east_outside);
+                let high = east_inside.max(east_outside);
+                if east_inside > east_outside {
+                    push_quad(
+                        &mut vertices,
+                        [
+                            Vec3::new(east_x as f32, low, wz1 as f32),
+                            Vec3::new(east_x as f32, low, wz0 as f32),
+                            Vec3::new(east_x as f32, high, wz0 as f32),
+                            Vec3::new(east_x as f32, high, wz1 as f32),
+                        ],
+                        east_side_color,
+                        Vec3::X,
+                    );
+                } else {
+                    push_quad(
+                        &mut vertices,
+                        [
+                            Vec3::new(east_x as f32, low, wz0 as f32),
+                            Vec3::new(east_x as f32, low, wz1 as f32),
+                            Vec3::new(east_x as f32, high, wz1 as f32),
+                            Vec3::new(east_x as f32, high, wz0 as f32),
+                        ],
+                        east_side_color,
+                        -Vec3::X,
+                    );
+                }
+            }
+        }
+
+        for gx in 0..cells {
+            let wx0 = base_x + gx * sample_blocks;
+            let wx1 = wx0 + sample_blocks;
+            let sample_x = wx0 + sample_blocks / 2;
+
+            let north_inside = height_at(&sampled_heights, gx, 0);
+            let north_outside = boundary_height(sample_x, base_z - sample_blocks / 2);
+            let center_x = wx0 + sample_blocks / 2;
+            let north_block = self.procedural_block(center_x, north_inside as i32 - 1, base_z);
+            let (_, north_side_color, _) = palette(north_block, center_x, base_z);
+            if (north_inside - north_outside).abs() > 0.01 {
+                let low = north_inside.min(north_outside);
+                let high = north_inside.max(north_outside);
+                if north_inside > north_outside {
+                    push_quad(
+                        &mut vertices,
+                        [
+                            Vec3::new(wx1 as f32, low, base_z as f32),
+                            Vec3::new(wx0 as f32, low, base_z as f32),
+                            Vec3::new(wx0 as f32, high, base_z as f32),
+                            Vec3::new(wx1 as f32, high, base_z as f32),
+                        ],
+                        north_side_color,
+                        -Vec3::Z,
+                    );
+                } else {
+                    push_quad(
+                        &mut vertices,
+                        [
+                            Vec3::new(wx0 as f32, low, base_z as f32),
+                            Vec3::new(wx1 as f32, low, base_z as f32),
+                            Vec3::new(wx1 as f32, high, base_z as f32),
+                            Vec3::new(wx0 as f32, high, base_z as f32),
+                        ],
+                        north_side_color,
+                        Vec3::Z,
+                    );
+                }
+            }
+
+            let south_z = base_z + tile_size_blocks;
+            let south_inside = height_at(&sampled_heights, gx, cells - 1);
+            let south_outside = boundary_height(sample_x, south_z + sample_blocks / 2);
+            let south_block = self.procedural_block(center_x, south_inside as i32 - 1, south_z - 1);
+            let (_, south_side_color, _) = palette(south_block, center_x, south_z - 1);
+            if (south_inside - south_outside).abs() > 0.01 {
+                let low = south_inside.min(south_outside);
+                let high = south_inside.max(south_outside);
+                if south_inside > south_outside {
+                    push_quad(
+                        &mut vertices,
+                        [
+                            Vec3::new(wx0 as f32, low, south_z as f32),
+                            Vec3::new(wx1 as f32, low, south_z as f32),
+                            Vec3::new(wx1 as f32, high, south_z as f32),
+                            Vec3::new(wx0 as f32, high, south_z as f32),
+                        ],
+                        south_side_color,
+                        Vec3::Z,
+                    );
+                } else {
+                    push_quad(
+                        &mut vertices,
+                        [
+                            Vec3::new(wx1 as f32, low, south_z as f32),
+                            Vec3::new(wx0 as f32, low, south_z as f32),
+                            Vec3::new(wx0 as f32, high, south_z as f32),
+                            Vec3::new(wx1 as f32, high, south_z as f32),
+                        ],
+                        south_side_color,
+                        -Vec3::Z,
+                    );
+                }
+            }
+        }
+
         vertices
     }
 
@@ -721,6 +878,7 @@ fn palette(block: Block, x: i64, z: i64) -> ([f32; 3], [f32; 3], [f32; 3]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glam::Vec3;
 
     #[test]
     fn height_stays_within_world_bounds() {
@@ -745,5 +903,75 @@ mod tests {
         let c = canyon.surface_height(point.0, point.1);
 
         assert!(a != b || b != c || a != c);
+    }
+
+    #[test]
+    fn lod_mesh_has_no_degenerate_or_invalid_triangles() {
+        let world = World::generate(64, 32, 64);
+        let origins = [(0, 0), (8, -8), (24, 24), (-40, 16)];
+
+        for lod in 1..=3 {
+            for origin in origins {
+                let vertices = world.build_chunk_mesh_lod(origin, lod);
+                assert_eq!(
+                    vertices.len() % 3,
+                    0,
+                    "mesh triangle list must be 3-aligned for lod {lod} at {origin:?}"
+                );
+
+                for tri in vertices.chunks_exact(3) {
+                    let a = v3(tri[0].position);
+                    let b = v3(tri[1].position);
+                    let c = v3(tri[2].position);
+                    let area = (b - a).cross(c - a).length() * 0.5;
+                    assert!(
+                        area > 1e-4,
+                        "degenerate triangle in lod {lod} at {origin:?}: {a:?} {b:?} {c:?}"
+                    );
+                    for v in [a, b, c] {
+                        assert!(
+                            v.is_finite(),
+                            "non-finite vertex in lod {lod} at {origin:?}: {v:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lod_top_surface_fully_covers_tile_area() {
+        let world = World::generate(64, 32, 64);
+        let origins = [(0, 0), (12, -12), (40, 8), (-32, -24)];
+
+        for lod in 1..=3 {
+            let span_blocks = CHUNK_SIZE * (1_i64 << lod);
+            let expected_area = (span_blocks * span_blocks) as f32;
+            for origin in origins {
+                let vertices = world.build_chunk_mesh_lod(origin, lod);
+                let mut top_area = 0.0_f32;
+                for tri in vertices.chunks_exact(3) {
+                    let normal = v3(tri[0].normal);
+                    if normal.y < 0.99 {
+                        continue;
+                    }
+                    let a = v3(tri[0].position);
+                    let b = v3(tri[1].position);
+                    let c = v3(tri[2].position);
+                    let area_2d =
+                        ((b.x - a.x) * (c.z - a.z) - (b.z - a.z) * (c.x - a.x)).abs() * 0.5;
+                    top_area += area_2d;
+                }
+                let tolerance = expected_area * 0.0025;
+                assert!(
+                    (top_area - expected_area).abs() <= tolerance,
+                    "lod {lod} at {origin:?} top coverage mismatch: got {top_area}, expected {expected_area}"
+                );
+            }
+        }
+    }
+
+    fn v3(value: [f32; 3]) -> Vec3 {
+        Vec3::new(value[0], value[1], value[2])
     }
 }

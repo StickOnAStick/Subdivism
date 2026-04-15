@@ -1376,29 +1376,46 @@ fn collect_lod_ring(
         return;
     }
     let step = 1_i64 << lod_level;
-    let min_sq = min_radius * min_radius;
-    let max_sq = max_radius * max_radius;
+    let min_sq = (min_radius * min_radius) as f32;
+    let max_sq = (max_radius * max_radius) as f32;
     let start_x = (center_chunk.0 - max_radius).div_euclid(step) * step;
     let end_x = (center_chunk.0 + max_radius).div_euclid(step) * step;
     let start_z = (center_chunk.1 - max_radius).div_euclid(step) * step;
     let end_z = (center_chunk.1 + max_radius).div_euclid(step) * step;
-    let half_step = step as f32 * 0.5;
+    let center_x = center_chunk.0 as f32;
+    let center_z = center_chunk.1 as f32;
+    let step_f = step as f32;
 
     let mut origin_z = start_z;
     while origin_z <= end_z {
         let mut origin_x = start_x;
         while origin_x <= end_x {
-            let center_x = origin_x as f32 + half_step;
-            let center_z = origin_z as f32 + half_step;
-            let dx = center_x - center_chunk.0 as f32;
-            let dz = center_z - center_chunk.1 as f32;
-            let dist_sq = dx * dx + dz * dz;
-            let in_min = if min_radius == 0 {
-                dist_sq >= 0.0
+            let tile_min_x = origin_x as f32;
+            let tile_min_z = origin_z as f32;
+            let tile_max_x = tile_min_x + step_f;
+            let tile_max_z = tile_min_z + step_f;
+
+            let nearest_x = center_x.clamp(tile_min_x, tile_max_x);
+            let nearest_z = center_z.clamp(tile_min_z, tile_max_z);
+            let min_dx = nearest_x - center_x;
+            let min_dz = nearest_z - center_z;
+            let tile_min_dist_sq = min_dx * min_dx + min_dz * min_dz;
+
+            let farthest_x = if (center_x - tile_min_x).abs() > (center_x - tile_max_x).abs() {
+                tile_min_x
             } else {
-                dist_sq > min_sq as f32
+                tile_max_x
             };
-            if dist_sq <= max_sq as f32 && in_min {
+            let farthest_z = if (center_z - tile_min_z).abs() > (center_z - tile_max_z).abs() {
+                tile_min_z
+            } else {
+                tile_max_z
+            };
+            let max_dx = farthest_x - center_x;
+            let max_dz = farthest_z - center_z;
+            let tile_max_dist_sq = max_dx * max_dx + max_dz * max_dz;
+
+            if tile_min_dist_sq <= max_sq && (min_radius == 0 || tile_max_dist_sq > min_sq) {
                 out.push(ChunkRenderKey {
                     origin_chunk: (origin_x, origin_z),
                     lod_level,
@@ -1525,5 +1542,84 @@ fn push_circle(
                 color,
             },
         ]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lod_selection_covers_entire_render_circle() {
+        let center = (0_i64, 0_i64);
+        for render_distance in [8_i64, 16, 24, 32, 48, 64, 96, 128] {
+            let keys = collect_visible_keys_for_test(center, render_distance);
+            for z in (center.1 - render_distance)..=(center.1 + render_distance) {
+                for x in (center.0 - render_distance)..=(center.0 + render_distance) {
+                    let dx = x as f32 - center.0 as f32;
+                    let dz = z as f32 - center.1 as f32;
+                    if dx * dx + dz * dz > (render_distance * render_distance) as f32 {
+                        continue;
+                    }
+                    assert!(
+                        chunk_covered_by_any_key((x, z), &keys),
+                        "missing coverage at chunk ({x}, {z}) for render distance {render_distance}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn collect_visible_keys_for_test(
+        center: (i64, i64),
+        render_distance: i64,
+    ) -> Vec<ChunkRenderKey> {
+        let mut desired = Vec::new();
+        collect_lod_ring(
+            &mut desired,
+            center,
+            0,
+            render_distance.min(FULL_DETAIL_RADIUS_CHUNKS),
+            0,
+        );
+        if render_distance > FULL_DETAIL_RADIUS_CHUNKS {
+            collect_lod_ring(
+                &mut desired,
+                center,
+                FULL_DETAIL_RADIUS_CHUNKS,
+                render_distance.min(MID_DETAIL_RADIUS_CHUNKS),
+                1,
+            );
+        }
+        if render_distance > MID_DETAIL_RADIUS_CHUNKS {
+            collect_lod_ring(
+                &mut desired,
+                center,
+                MID_DETAIL_RADIUS_CHUNKS,
+                render_distance.min(LOW_DETAIL_RADIUS_CHUNKS),
+                2,
+            );
+        }
+        if render_distance > LOW_DETAIL_RADIUS_CHUNKS {
+            collect_lod_ring(
+                &mut desired,
+                center,
+                LOW_DETAIL_RADIUS_CHUNKS,
+                render_distance,
+                3,
+            );
+        }
+        desired
+    }
+
+    fn chunk_covered_by_any_key(chunk: (i64, i64), keys: &[ChunkRenderKey]) -> bool {
+        keys.iter().any(|key| {
+            let span = 1_i64 << key.lod_level;
+            let min_x = key.origin_chunk.0;
+            let min_z = key.origin_chunk.1;
+            let max_x = min_x + span - 1;
+            let max_z = min_z + span - 1;
+            (min_x..=max_x).contains(&chunk.0) && (min_z..=max_z).contains(&chunk.1)
+        })
     }
 }
