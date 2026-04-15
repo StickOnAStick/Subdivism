@@ -1,0 +1,10 @@
+# Subdivism asset registry
+version=1
+
+texture,grass_top,textures/grass_top.png,1.0000,1.0000,1.0000
+texture,dirt,textures/dirt.png,1.0000,1.0000,1.0000
+texture,stone,textures/stone.png,1.0000,1.0000,1.0000
+
+biome,meadow,balanced,grass_top,dirt,dirt
+biome,rocky,alpine,stone,stone,stone
+biome,dry,canyon,dirt,dirt,stone

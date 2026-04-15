@@ -1,0 +1,2 @@
+run_epoch,mode,peak_chunks_per_sec,peak_vertices_per_sec,theoretical_chunks_per_sec,theoretical_vertices_per_sec,rd128_elapsed_ms,rd128_chunks,query_qps,hw_threads
+1776155826,quick,4057.5088,4081826.0996,40575.0878,40818260.9958,10671.2049,1908,611634.5429,10
