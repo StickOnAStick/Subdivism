@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 bytemuck = { version = "1.25", features = ["derive"] }
+crossbeam-channel = "0.5"
 glam = "0.30"
 pollster = "0.4"
 wgpu = "29"

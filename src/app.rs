@@ -1,15 +1,16 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::{Arc, Mutex, mpsc},
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use glam::Vec3;
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
-    event::{DeviceEvent, ElementState, MouseButton, WindowEvent},
+    event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
     window::{CursorGrabMode, Window, WindowAttributes, WindowId},
@@ -17,7 +18,7 @@ use winit::{
 
 use crate::{
     camera::{Camera, CameraLens},
-    debug_overlay::{DebugOverlay, OverlayVertex},
+    debug_overlay::{DebugOverlay, MenuLayout, OverlayVertex},
     game::{
         actor::{ActorRoster, PLAYER_EYE_HEIGHT},
         inventory::{BACKPACK_SIZE, HOTBAR_SIZE, Inventory},
@@ -26,7 +27,7 @@ use crate::{
         world::{Block, CHUNK_SIZE, DEFAULT_WORLD_SEED, TerrainConfig, World},
     },
     mesh::Vertex,
-    render::{ChunkRenderKey, GpuState, RenderOutcome, celestial_state_for_time},
+    render::{ChunkRenderKey, GpuState, GraphicsSettings, RenderOutcome, celestial_state_for_time},
 };
 
 const FREE_CAMERA_SPEED: f32 = 10.0;
@@ -49,11 +50,20 @@ pub fn run() {
     event_loop.run_app(&mut app).expect("event loop error");
 }
 
+pub fn run_terrain_lab() {
+    let mut options = AppLaunchOptions::from_env();
+    options.terrain_lab = true;
+    let event_loop = EventLoop::new().expect("failed to create event loop");
+    let mut app = App::new(options);
+    event_loop.run_app(&mut app).expect("event loop error");
+}
+
 #[derive(Clone, Debug)]
 struct AppLaunchOptions {
     seed_override: Option<i64>,
     terrain_file: Option<PathBuf>,
     dev_mode: bool,
+    terrain_lab: bool,
 }
 
 impl AppLaunchOptions {
@@ -61,6 +71,9 @@ impl AppLaunchOptions {
         let mut seed_override = None;
         let mut terrain_file = None;
         let mut dev_mode = false;
+        let mut terrain_lab = std::env::var("SUBDIVISM_TERRAIN_LAB")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -81,6 +94,9 @@ impl AppLaunchOptions {
                 "--dev" | "--dev-mode" => {
                     dev_mode = true;
                 }
+                "--terrain-lab" => {
+                    terrain_lab = true;
+                }
                 _ => {}
             }
         }
@@ -88,6 +104,7 @@ impl AppLaunchOptions {
             seed_override,
             terrain_file,
             dev_mode,
+            terrain_lab,
         }
     }
 }
@@ -136,6 +153,7 @@ struct InventoryCursor {
 struct InputState {
     pressed: HashSet<KeyCode>,
     mouse_captured: bool,
+    cursor_position: Option<(f32, f32)>,
 }
 
 impl InputState {
@@ -143,6 +161,7 @@ impl InputState {
         Self {
             pressed: HashSet::new(),
             mouse_captured: false,
+            cursor_position: None,
         }
     }
 
@@ -164,8 +183,8 @@ struct ChunkBuildResult {
 }
 
 struct ChunkBuildPipeline {
-    request_tx: mpsc::Sender<ChunkBuildRequest>,
-    result_rx: mpsc::Receiver<ChunkBuildResult>,
+    request_tx: Sender<ChunkBuildRequest>,
+    result_rx: Receiver<ChunkBuildResult>,
 }
 
 impl ChunkBuildPipeline {
@@ -173,12 +192,11 @@ impl ChunkBuildPipeline {
         let worker_count = std::thread::available_parallelism()
             .map(|n| n.get().saturating_sub(1).clamp(1, 6))
             .unwrap_or(2);
-        let (request_tx, request_rx) = mpsc::channel::<ChunkBuildRequest>();
-        let (result_tx, result_rx) = mpsc::channel::<ChunkBuildResult>();
-        let shared_rx = Arc::new(Mutex::new(request_rx));
+        let (request_tx, request_rx) = unbounded::<ChunkBuildRequest>();
+        let (result_tx, result_rx) = unbounded::<ChunkBuildResult>();
 
         for worker_index in 0..worker_count {
-            let rx = shared_rx.clone();
+            let rx = request_rx.clone();
             let tx = result_tx.clone();
             let worker_world = world.clone();
             let thread_name = format!("chunk-mesh-worker-{worker_index}");
@@ -186,11 +204,7 @@ impl ChunkBuildPipeline {
                 .name(thread_name)
                 .spawn(move || {
                     loop {
-                        let request = {
-                            let guard = rx.lock().expect("chunk request lock poisoned");
-                            guard.recv()
-                        };
-                        let request = match request {
+                        let request = match rx.recv() {
                             Ok(request) => request,
                             Err(_) => break,
                         };
@@ -230,6 +244,7 @@ struct App {
     ui_mode: UiMode,
     menu_page: MenuPage,
     menu_index: usize,
+    menu_hover_index: Option<usize>,
     inventory_cursor: InventoryCursor,
     input: InputState,
     debug_overlay: DebugOverlay,
@@ -248,7 +263,11 @@ struct App {
     terrain_profile: String,
     terrain_recipe_path: Option<PathBuf>,
     dev_mode: bool,
+    terrain_lab_mode: bool,
+    terrain_lab_panel_visible: bool,
+    terrain_lab_selected: usize,
     world_time_seconds: f32,
+    graphics_settings: GraphicsSettings,
     last_chunk_center: (i64, i64),
     last_frame: Instant,
     next_frame_at: Instant,
@@ -279,11 +298,20 @@ impl App {
         let lens = CameraLens::default();
         let actors = ActorRoster::new(world.spawn_point());
         let free_camera = actors.local_player().camera(lens);
+        let camera_mode = if options.terrain_lab {
+            CameraMode::Free
+        } else {
+            CameraMode::Player
+        };
         let seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_nanos() as u64)
             .unwrap_or(0x9E3779B97F4A7C15);
         let pipeline = ChunkBuildPipeline::new(world.clone());
+        let mut debug_overlay = DebugOverlay::new();
+        if options.terrain_lab {
+            debug_overlay.visible = true;
+        }
 
         Self {
             window: None,
@@ -292,16 +320,17 @@ impl App {
             world,
             actors,
             free_camera,
-            camera_mode: CameraMode::Player,
+            camera_mode,
             ui_mode: UiMode::Playing,
             menu_page: MenuPage::Main,
             menu_index: 0,
+            menu_hover_index: None,
             inventory_cursor: InventoryCursor {
                 section: InventorySection::Hotbar,
                 index: 0,
             },
             input: InputState::new(),
-            debug_overlay: DebugOverlay::new(),
+            debug_overlay,
             physics: PhysicsConfig::default(),
             lens,
             frame_cap_index: DEFAULT_FRAME_CAP_INDEX,
@@ -317,7 +346,11 @@ impl App {
             terrain_profile,
             terrain_recipe_path,
             dev_mode: options.dev_mode,
+            terrain_lab_mode: options.terrain_lab,
+            terrain_lab_panel_visible: options.terrain_lab,
+            terrain_lab_selected: 0,
             world_time_seconds: 0.0,
+            graphics_settings: GraphicsSettings::default(),
             last_chunk_center: (0, 0),
             last_frame: Instant::now(),
             next_frame_at: Instant::now(),
@@ -358,6 +391,35 @@ impl App {
         terrain_profile: String,
         terrain_recipe_path: Option<PathBuf>,
     ) {
+        self.replace_world_internal(
+            world,
+            world_seed,
+            terrain_profile,
+            terrain_recipe_path,
+            false,
+        );
+    }
+
+    fn replace_world_internal(
+        &mut self,
+        world: World,
+        world_seed: i64,
+        terrain_profile: String,
+        terrain_recipe_path: Option<PathBuf>,
+        preserve_view: bool,
+    ) {
+        let saved_actor = if preserve_view {
+            Some(*self.actors.local_player())
+        } else {
+            None
+        };
+        let saved_free_camera = if preserve_view {
+            Some(self.free_camera)
+        } else {
+            None
+        };
+        let saved_camera_mode = self.camera_mode;
+
         let mut existing_keys = self.visible_chunks.clone();
         existing_keys.extend(self.resident_chunks.iter().copied());
         if let Some(gpu) = self.gpu.as_mut() {
@@ -377,12 +439,37 @@ impl App {
         self.dirty_chunks.clear();
         self.chunk_versions.clear();
 
-        self.actors.respawn_local_player(self.world.spawn_point());
-        self.free_camera = self.actors.local_player().camera(self.lens);
+        if preserve_view {
+            if let Some(actor) = saved_actor {
+                *self.actors.local_player_mut() = actor;
+            }
+            if let Some(camera) = saved_free_camera {
+                self.free_camera = camera;
+            }
+            self.camera_mode = saved_camera_mode;
+        } else {
+            self.actors.respawn_local_player(self.world.spawn_point());
+            self.free_camera = self.actors.local_player().camera(self.lens);
+        }
         self.last_chunk_center = self.current_chunk_center();
         self.schedule_visible_chunks();
         self.sync_active_camera();
         self.refresh_window_title();
+    }
+
+    fn rebuild_world_from_terrain(&mut self, terrain: TerrainConfig, preserve_view: bool) {
+        let world = World::generate_with_terrain_and_seed(terrain, self.world_seed);
+        let profile = if self.terrain_lab_mode {
+            "terrain_lab".to_string()
+        } else {
+            self.terrain_profile.clone()
+        };
+        let path = if self.terrain_lab_mode {
+            self.terrain_recipe_path.clone()
+        } else {
+            self.terrain_recipe_path.clone()
+        };
+        self.replace_world_internal(world, self.world_seed, profile, path, preserve_view);
     }
 
     fn reload_dev_world(&mut self) {
@@ -426,13 +513,15 @@ impl App {
     fn refresh_window_title(&self) {
         if let Some(window) = &self.window {
             let dev_flag = if self.dev_mode { " DEV" } else { "" };
+            let lab_flag = if self.terrain_lab_mode { " LAB" } else { "" };
             window.set_title(&format!(
-                "Voxel Starter [{} | {} | RD {} | SEED {}{}]",
+                "Voxel Starter [{} | {} | RD {} | SEED {}{}{}]",
                 self.frame_cap_label(),
                 self.camera_mode.label(),
                 self.render_distance_chunks,
                 self.world_seed,
-                dev_flag
+                dev_flag,
+                lab_flag
             ));
         }
     }
@@ -477,6 +566,7 @@ impl App {
         self.ui_mode = UiMode::Paused;
         self.menu_page = MenuPage::Main;
         self.menu_index = 0;
+        self.menu_hover_index = None;
         self.release_mouse();
     }
 
@@ -646,8 +736,8 @@ impl App {
         while uploads_remaining > 0 {
             let result = match self.chunk_pipeline.result_rx.try_recv() {
                 Ok(result) => result,
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
             };
 
             self.requested_chunks.remove(&result.key);
@@ -751,19 +841,17 @@ impl App {
                 } else {
                     self.menu_index - 1
                 };
+                self.menu_hover_index = None;
             }
             KeyCode::ArrowDown => {
                 self.menu_index = (self.menu_index + 1) % item_count;
+                self.menu_hover_index = None;
             }
             KeyCode::ArrowLeft => {
-                if self.menu_page == MenuPage::Graphics && self.menu_index == 0 {
-                    self.adjust_render_distance(-1);
-                }
+                self.adjust_menu_value(-1);
             }
             KeyCode::ArrowRight => {
-                if self.menu_page == MenuPage::Graphics && self.menu_index == 0 {
-                    self.adjust_render_distance(1);
-                }
+                self.adjust_menu_value(1);
             }
             KeyCode::Enter => {
                 self.activate_menu_item();
@@ -834,11 +922,7 @@ impl App {
     }
 
     fn menu_item_count(&self) -> usize {
-        match self.menu_page {
-            MenuPage::Main => 4,
-            MenuPage::Settings => 2,
-            MenuPage::Graphics => 2,
-        }
+        self.menu_overlay().1.len()
     }
 
     fn activate_menu_item(&mut self) {
@@ -873,16 +957,30 @@ impl App {
                 _ => {}
             },
             MenuPage::Graphics => match self.menu_index {
-                0 => {
-                    self.adjust_render_distance(1);
+                0 => self.adjust_render_distance(1),
+                1 => self.adjust_graphics_setting_by(1, 0.05),
+                2 => self.adjust_graphics_setting_by(2, 0.03),
+                3 => self.adjust_graphics_setting_by(3, 0.05),
+                4 => self.adjust_graphics_setting_by(4, 0.05),
+                5 => self.adjust_graphics_setting_by(5, 0.02),
+                6 => self.adjust_graphics_setting_by(6, 0.04),
+                7 => self.adjust_graphics_setting_by(7, 8.0),
+                8 => self.adjust_graphics_setting_by(8, 16.0),
+                9 => self.adjust_graphics_setting_by(9, 0.03),
+                10 => self.adjust_graphics_setting_by(10, 0.03),
+                11 => {
+                    self.graphics_settings = GraphicsSettings::default();
                 }
-                1 => {
+                12 => {
                     self.menu_page = MenuPage::Settings;
                     self.menu_index = 0;
                 }
                 _ => {}
             },
         }
+        let item_count = self.menu_item_count().max(1);
+        self.menu_index = self.menu_index.min(item_count - 1);
+        self.menu_hover_index = None;
     }
 
     fn menu_back_or_resume(&mut self) {
@@ -897,6 +995,7 @@ impl App {
                 self.menu_index = 0;
             }
         }
+        self.menu_hover_index = None;
     }
 
     fn adjust_render_distance(&mut self, delta: i32) {
@@ -930,11 +1029,133 @@ impl App {
             MenuPage::Graphics => (
                 "GRAPHICS".to_string(),
                 vec![
-                    format!("RENDER DISTANCE {}", self.render_distance_chunks),
+                    format!(
+                        "RENDER DISTANCE {}",
+                        slider_u32(
+                            self.render_distance_chunks,
+                            MIN_RENDER_DISTANCE_CHUNKS,
+                            MAX_RENDER_DISTANCE_CHUNKS,
+                            14
+                        )
+                    ),
+                    format!(
+                        "SHADER QUALITY {}",
+                        slider_f32(self.graphics_settings.shader_quality, 0.0, 1.0, 14)
+                    ),
+                    format!(
+                        "AMBIENT BOOST {}",
+                        slider_f32(self.graphics_settings.ambient_boost, 0.0, 0.70, 14)
+                    ),
+                    format!(
+                        "SHADOW SOFTNESS {}",
+                        slider_f32(self.graphics_settings.shadow_softness, 0.1, 1.5, 14)
+                    ),
+                    format!(
+                        "SHADOW CONTRAST {}",
+                        slider_f32(self.graphics_settings.shadow_contrast, 0.2, 2.2, 14)
+                    ),
+                    format!(
+                        "FAR SHADOW LIFT {}",
+                        slider_f32(self.graphics_settings.far_shadow_lift, 0.0, 0.6, 14)
+                    ),
+                    format!(
+                        "FOG STRENGTH {}",
+                        slider_f32(self.graphics_settings.fog_strength, 0.0, 1.2, 14)
+                    ),
+                    format!(
+                        "FOG START {}",
+                        slider_f32(self.graphics_settings.fog_start, 16.0, 1200.0, 14)
+                    ),
+                    format!(
+                        "FOG END {}",
+                        slider_f32(self.graphics_settings.fog_end, 24.0, 2000.0, 14)
+                    ),
+                    format!(
+                        "ATMOSPHERE {}",
+                        slider_f32(self.graphics_settings.atmosphere_strength, 0.0, 1.0, 14)
+                    ),
+                    format!(
+                        "VIBRANCE {}",
+                        slider_f32(self.graphics_settings.color_vibrance, 0.5, 1.8, 14)
+                    ),
+                    "RESET TO DEFAULTS".to_string(),
                     "BACK".to_string(),
                 ],
                 self.menu_index,
             ),
+        }
+    }
+
+    fn adjust_menu_value(&mut self, delta: i32) {
+        if self.menu_page != MenuPage::Graphics {
+            return;
+        }
+        match self.menu_index {
+            0 => self.adjust_render_distance(delta),
+            1 => self.adjust_graphics_setting_by(1, 0.05 * delta as f32),
+            2 => self.adjust_graphics_setting_by(2, 0.03 * delta as f32),
+            3 => self.adjust_graphics_setting_by(3, 0.05 * delta as f32),
+            4 => self.adjust_graphics_setting_by(4, 0.05 * delta as f32),
+            5 => self.adjust_graphics_setting_by(5, 0.02 * delta as f32),
+            6 => self.adjust_graphics_setting_by(6, 0.04 * delta as f32),
+            7 => self.adjust_graphics_setting_by(7, 8.0 * delta as f32),
+            8 => self.adjust_graphics_setting_by(8, 16.0 * delta as f32),
+            9 => self.adjust_graphics_setting_by(9, 0.03 * delta as f32),
+            10 => self.adjust_graphics_setting_by(10, 0.03 * delta as f32),
+            _ => {}
+        }
+    }
+
+    fn adjust_graphics_setting_by(&mut self, index: usize, delta: f32) {
+        match index {
+            1 => {
+                self.graphics_settings.shader_quality =
+                    (self.graphics_settings.shader_quality + delta).clamp(0.0, 1.0);
+            }
+            2 => {
+                self.graphics_settings.ambient_boost =
+                    (self.graphics_settings.ambient_boost + delta).clamp(0.0, 0.70);
+            }
+            3 => {
+                self.graphics_settings.shadow_softness =
+                    (self.graphics_settings.shadow_softness + delta).clamp(0.1, 1.5);
+            }
+            4 => {
+                self.graphics_settings.shadow_contrast =
+                    (self.graphics_settings.shadow_contrast + delta).clamp(0.2, 2.2);
+            }
+            5 => {
+                self.graphics_settings.far_shadow_lift =
+                    (self.graphics_settings.far_shadow_lift + delta).clamp(0.0, 0.6);
+            }
+            6 => {
+                self.graphics_settings.fog_strength =
+                    (self.graphics_settings.fog_strength + delta).clamp(0.0, 1.2);
+            }
+            7 => {
+                self.graphics_settings.fog_start =
+                    (self.graphics_settings.fog_start + delta).clamp(16.0, 1200.0);
+                if self.graphics_settings.fog_end <= self.graphics_settings.fog_start + 1.0 {
+                    self.graphics_settings.fog_end = self.graphics_settings.fog_start + 1.0;
+                }
+            }
+            8 => {
+                self.graphics_settings.fog_end =
+                    (self.graphics_settings.fog_end + delta).clamp(24.0, 2000.0);
+                if self.graphics_settings.fog_end <= self.graphics_settings.fog_start + 1.0 {
+                    self.graphics_settings.fog_start =
+                        (self.graphics_settings.fog_end - 1.0).max(16.0);
+                }
+            }
+            9 => {
+                self.graphics_settings.atmosphere_strength =
+                    (self.graphics_settings.atmosphere_strength + delta).clamp(0.0, 1.0);
+            }
+            10 => {
+                self.graphics_settings.color_vibrance =
+                    (self.graphics_settings.color_vibrance + delta).clamp(0.5, 1.8);
+            }
+            _ => {}
         }
     }
 
@@ -974,6 +1195,198 @@ impl App {
         )
     }
 
+    fn terrain_lab_overlay(&self) -> Option<(String, Vec<String>, usize)> {
+        if !self.terrain_lab_mode || !self.terrain_lab_panel_visible {
+            return None;
+        }
+        let keys = TerrainConfig::parameter_keys();
+        let max_rows = 12_usize;
+        let selected = self.terrain_lab_selected.min(keys.len().saturating_sub(1));
+        let page_start = selected.saturating_sub(max_rows / 2);
+        let page_end = (page_start + max_rows).min(keys.len());
+        let shown = &keys[page_start..page_end];
+        let mut lines = Vec::with_capacity(shown.len() + 3);
+        lines.push("ARROWS SELECT+TUNE PGUP/PGDN COARSE".to_string());
+        lines.push("F8 TOGGLE PANEL F9 SAVE PRESET".to_string());
+        let cfg = self.world.terrain_config();
+        for key in shown {
+            let value = terrain_param_value(&cfg, key);
+            lines.push(format!(
+                "{} {}",
+                terrain_param_label(key),
+                slider_f32(value, terrain_param_min(key), terrain_param_max(key), 12)
+            ));
+        }
+        Some((
+            "TERRAIN LAB".to_string(),
+            lines,
+            (selected - page_start) + 2,
+        ))
+    }
+
+    fn terrain_lab_adjust_selected(&mut self, delta: f32) {
+        if !self.terrain_lab_mode {
+            return;
+        }
+        let keys = TerrainConfig::parameter_keys();
+        if keys.is_empty() {
+            return;
+        }
+        let index = self.terrain_lab_selected.min(keys.len() - 1);
+        let key = keys[index];
+        let mut cfg = self.world.terrain_config();
+        let current = terrain_param_value(&cfg, key);
+        if cfg.set_named_param(key, current + delta).is_err() {
+            return;
+        }
+        self.rebuild_world_from_terrain(cfg, true);
+    }
+
+    fn terrain_lab_save_preset(&mut self) {
+        if !self.terrain_lab_mode {
+            return;
+        }
+        let mut recipe = TerrainRecipe::balanced(self.world_seed);
+        recipe.name = format!("terrain_lab_seed_{}", self.world_seed);
+        recipe.description = "Saved from in-game Terrain Lab".to_string();
+        recipe.profile = "terrain_lab".to_string();
+        recipe.seed = self.world_seed;
+        recipe.terrain = self.world.terrain_config();
+        let path = PathBuf::from(format!("terrain/lab_seed_{}.terrain", self.world_seed));
+        match recipe.write_to_file(&path) {
+            Ok(_) => {
+                eprintln!("terrain lab preset saved to {}", path.display());
+                self.terrain_recipe_path = Some(path);
+            }
+            Err(err) => {
+                eprintln!("failed to save terrain lab preset: {err}");
+            }
+        }
+    }
+
+    fn handle_terrain_lab_input(&mut self, code: KeyCode, repeat: bool) -> bool {
+        if !self.terrain_lab_mode {
+            return false;
+        }
+        if code == KeyCode::F8 && !repeat {
+            self.terrain_lab_panel_visible = !self.terrain_lab_panel_visible;
+            return true;
+        }
+        if code == KeyCode::F9 && !repeat {
+            self.terrain_lab_save_preset();
+            return true;
+        }
+        if !self.terrain_lab_panel_visible {
+            return false;
+        }
+        let keys = TerrainConfig::parameter_keys();
+        if keys.is_empty() {
+            return false;
+        }
+        match code {
+            KeyCode::ArrowUp if !repeat => {
+                self.terrain_lab_selected = self.terrain_lab_selected.saturating_sub(1);
+                true
+            }
+            KeyCode::ArrowDown if !repeat => {
+                self.terrain_lab_selected = (self.terrain_lab_selected + 1).min(keys.len() - 1);
+                true
+            }
+            KeyCode::ArrowLeft => {
+                self.terrain_lab_adjust_selected(-terrain_param_step(
+                    keys[self.terrain_lab_selected],
+                ));
+                true
+            }
+            KeyCode::ArrowRight => {
+                self.terrain_lab_adjust_selected(terrain_param_step(
+                    keys[self.terrain_lab_selected],
+                ));
+                true
+            }
+            KeyCode::PageDown => {
+                self.terrain_lab_adjust_selected(
+                    -terrain_param_step(keys[self.terrain_lab_selected]) * 5.0,
+                );
+                true
+            }
+            KeyCode::PageUp => {
+                self.terrain_lab_adjust_selected(
+                    terrain_param_step(keys[self.terrain_lab_selected]) * 5.0,
+                );
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn current_menu_layout(&self) -> Option<MenuLayout> {
+        if self.ui_mode != UiMode::Paused {
+            return None;
+        }
+        let window = self.window.as_ref()?;
+        let size = window.inner_size();
+        let screen_size = [size.width as f32, size.height as f32];
+        let (title, lines, _) = self.menu_overlay();
+        Some(self.debug_overlay.menu_layout(&title, &lines, screen_size))
+    }
+
+    fn update_menu_hover_from_cursor(&mut self) {
+        if self.ui_mode != UiMode::Paused {
+            self.menu_hover_index = None;
+            return;
+        }
+        let Some((cursor_x, cursor_y)) = self.input.cursor_position else {
+            self.menu_hover_index = None;
+            return;
+        };
+        let Some(layout) = self.current_menu_layout() else {
+            self.menu_hover_index = None;
+            return;
+        };
+        self.menu_hover_index = layout
+            .item_rects
+            .iter()
+            .position(|rect| rect.contains(cursor_x, cursor_y));
+    }
+
+    fn handle_menu_wheel(&mut self, delta_y: f32) {
+        if self.ui_mode != UiMode::Paused || delta_y.abs() <= f32::EPSILON {
+            return;
+        }
+        let direction = if delta_y > 0.0 { 1 } else { -1 };
+        self.update_menu_hover_from_cursor();
+        if let Some(index) = self.menu_hover_index {
+            self.menu_index = index;
+            if self.menu_page == MenuPage::Graphics && self.menu_index <= 10 {
+                self.adjust_menu_value(direction);
+                return;
+            }
+        }
+        let count = self.menu_item_count().max(1);
+        self.menu_index = if direction > 0 {
+            self.menu_index.saturating_sub(1)
+        } else {
+            (self.menu_index + 1) % count
+        };
+    }
+
+    fn handle_terrain_lab_wheel(&mut self, delta_y: f32) {
+        if !self.terrain_lab_mode
+            || !self.terrain_lab_panel_visible
+            || self.ui_mode != UiMode::Playing
+            || delta_y.abs() <= f32::EPSILON
+        {
+            return;
+        }
+        let keys = TerrainConfig::parameter_keys();
+        if keys.is_empty() {
+            return;
+        }
+        let step = terrain_param_step(keys[self.terrain_lab_selected.min(keys.len() - 1)]);
+        self.terrain_lab_adjust_selected(if delta_y > 0.0 { step } else { -step });
+    }
+
     fn hud_lines(&self) -> Vec<String> {
         let slot = self.inventory.selected_slot();
         let hotbar = self.inventory.hotbar();
@@ -1005,6 +1418,9 @@ impl App {
                 lines.push("DEV FILE ON".to_string());
                 lines.push("F6 RELOAD".to_string());
             }
+        }
+        if self.terrain_lab_mode {
+            lines.push("LAB F8 PANEL F9 SAVE".to_string());
         }
         lines
     }
@@ -1163,22 +1579,49 @@ impl ApplicationHandler for App {
                 self.sync_lens_to_cameras();
             }
             WindowEvent::RedrawRequested => {
+                let screen_size = if let Some(window) = &self.window {
+                    let size = window.inner_size();
+                    [size.width as f32, size.height as f32]
+                } else {
+                    [1280.0, 720.0]
+                };
                 let menu_overlay = match self.ui_mode {
                     UiMode::Paused => {
                         let (title, lines, selected) = self.menu_overlay();
-                        Some(
-                            self.debug_overlay
-                                .build_menu_vertices(&title, &lines, selected),
-                        )
+                        Some(self.debug_overlay.build_menu_vertices(
+                            &title,
+                            &lines,
+                            selected,
+                            self.menu_hover_index,
+                            screen_size,
+                        ))
                     }
                     UiMode::Inventory => {
                         let (title, lines, selected) = self.inventory_overlay();
-                        Some(
-                            self.debug_overlay
-                                .build_menu_vertices(&title, &lines, selected),
-                        )
+                        Some(self.debug_overlay.build_menu_vertices(
+                            &title,
+                            &lines,
+                            selected,
+                            None,
+                            screen_size,
+                        ))
                     }
                     UiMode::Playing => None,
+                };
+                let terrain_lab_overlay = if self.ui_mode == UiMode::Playing {
+                    if let Some((title, lines, selected)) = self.terrain_lab_overlay() {
+                        Some(self.debug_overlay.build_menu_vertices(
+                            &title,
+                            &lines,
+                            selected,
+                            None,
+                            screen_size,
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
                 };
                 let hud_lines = self.hud_lines();
                 let sky_overlay = self.sky_body_overlay();
@@ -1190,6 +1633,9 @@ impl ApplicationHandler for App {
                     );
                     if let Some(menu_vertices) = menu_overlay {
                         overlay_vertices.extend(menu_vertices);
+                    }
+                    if let Some(lab_vertices) = terrain_lab_overlay {
+                        overlay_vertices.extend(lab_vertices);
                     }
                     match gpu.render(&overlay_vertices) {
                         RenderOutcome::Success | RenderOutcome::SkipFrame => {}
@@ -1214,6 +1660,9 @@ impl ApplicationHandler for App {
                             }
                             if self.ui_mode == UiMode::Inventory {
                                 self.handle_inventory_navigation(code);
+                                return;
+                            }
+                            if self.handle_terrain_lab_input(code, event.repeat) {
                                 return;
                             }
 
@@ -1247,11 +1696,37 @@ impl ApplicationHandler for App {
                     }
                 }
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.input.cursor_position = Some((position.x as f32, position.y as f32));
+                self.update_menu_hover_from_cursor();
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let delta_y = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(pos) => pos.y as f32 / 40.0,
+                };
+                self.handle_menu_wheel(delta_y);
+                self.handle_terrain_lab_wheel(delta_y);
+            }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button,
                 ..
             } => {
+                if self.ui_mode == UiMode::Paused
+                    && (button == MouseButton::Left || button == MouseButton::Right)
+                {
+                    self.update_menu_hover_from_cursor();
+                    if let Some(index) = self.menu_hover_index {
+                        self.menu_index = index;
+                        if button == MouseButton::Left {
+                            self.activate_menu_item();
+                        } else {
+                            self.adjust_menu_value(-1);
+                        }
+                    }
+                    return;
+                }
                 if self.ui_mode != UiMode::Playing {
                     return;
                 }
@@ -1330,6 +1805,7 @@ impl ApplicationHandler for App {
                 self.world_time_seconds,
                 camera.position,
                 self.world.terrain_seed(),
+                self.graphics_settings,
             );
         }
 
@@ -1434,6 +1910,164 @@ fn block_label(block: Block) -> &'static str {
         Block::Dirt => "DIRT",
         Block::Stone => "STONE",
     }
+}
+
+fn terrain_param_value(cfg: &TerrainConfig, key: &str) -> f32 {
+    match key {
+        "base_height" => cfg.base_height,
+        "macro_scale" => cfg.macro_scale,
+        "macro_amplitude" => cfg.macro_amplitude,
+        "detail_scale" => cfg.detail_scale,
+        "detail_amplitude" => cfg.detail_amplitude,
+        "mountain_scale" => cfg.mountain_scale,
+        "mountain_amplitude" => cfg.mountain_amplitude,
+        "valley_scale" => cfg.valley_scale,
+        "valley_depth" => cfg.valley_depth,
+        "cliff_scale" => cfg.cliff_scale,
+        "cliff_strength" => cfg.cliff_strength,
+        "terrace_step" => cfg.terrace_step,
+        "biome_scale" => cfg.biome_scale,
+        "biome_blend" => cfg.biome_blend,
+        "mountain_base_lift" => cfg.mountain_base_lift,
+        "desert_base_drop" => cfg.desert_base_drop,
+        "desert_dune_scale" => cfg.desert_dune_scale,
+        "desert_dune_amplitude" => cfg.desert_dune_amplitude,
+        "ravine_scale" => cfg.ravine_scale,
+        "ravine_strength" => cfg.ravine_strength,
+        "ravine_width" => cfg.ravine_width,
+        "ravine_offset_x" => cfg.ravine_offset_x,
+        "ravine_offset_z" => cfg.ravine_offset_z,
+        _ => 0.0,
+    }
+}
+
+fn terrain_param_step(key: &str) -> f32 {
+    match key {
+        "base_height" => 0.5,
+        "macro_scale" => 0.0005,
+        "macro_amplitude" => 0.4,
+        "detail_scale" => 0.001,
+        "detail_amplitude" => 0.2,
+        "mountain_scale" => 0.0005,
+        "mountain_amplitude" => 0.5,
+        "valley_scale" => 0.0005,
+        "valley_depth" => 0.4,
+        "cliff_scale" => 0.0005,
+        "cliff_strength" => 0.02,
+        "terrace_step" => 0.1,
+        "biome_scale" => 0.0002,
+        "biome_blend" => 0.01,
+        "mountain_base_lift" => 0.3,
+        "desert_base_drop" => 0.3,
+        "desert_dune_scale" => 0.001,
+        "desert_dune_amplitude" => 0.2,
+        "ravine_scale" => 0.0005,
+        "ravine_strength" => 0.2,
+        "ravine_width" => 0.1,
+        "ravine_offset_x" => 1.0,
+        "ravine_offset_z" => 1.0,
+        _ => 0.1,
+    }
+}
+
+fn terrain_param_min(key: &str) -> f32 {
+    match key {
+        "base_height" => 8.0,
+        "macro_scale" => 0.0015,
+        "macro_amplitude" => 0.0,
+        "detail_scale" => 0.005,
+        "detail_amplitude" => 0.0,
+        "mountain_scale" => 0.0015,
+        "mountain_amplitude" => 0.0,
+        "valley_scale" => 0.0015,
+        "valley_depth" => 0.0,
+        "cliff_scale" => 0.004,
+        "cliff_strength" => 0.0,
+        "terrace_step" => 0.4,
+        "biome_scale" => 0.0008,
+        "biome_blend" => 0.02,
+        "mountain_base_lift" => -8.0,
+        "desert_base_drop" => 0.0,
+        "desert_dune_scale" => 0.005,
+        "desert_dune_amplitude" => 0.0,
+        "ravine_scale" => 0.001,
+        "ravine_strength" => 0.0,
+        "ravine_width" => 1.0,
+        "ravine_offset_x" => -4096.0,
+        "ravine_offset_z" => -4096.0,
+        _ => -1.0,
+    }
+}
+
+fn terrain_param_max(key: &str) -> f32 {
+    match key {
+        "base_height" => 56.0,
+        "macro_scale" => 0.08,
+        "macro_amplitude" => 30.0,
+        "detail_scale" => 0.30,
+        "detail_amplitude" => 12.0,
+        "mountain_scale" => 0.08,
+        "mountain_amplitude" => 40.0,
+        "valley_scale" => 0.08,
+        "valley_depth" => 24.0,
+        "cliff_scale" => 0.16,
+        "cliff_strength" => 1.0,
+        "terrace_step" => 10.0,
+        "biome_scale" => 0.03,
+        "biome_blend" => 0.45,
+        "mountain_base_lift" => 20.0,
+        "desert_base_drop" => 20.0,
+        "desert_dune_scale" => 0.20,
+        "desert_dune_amplitude" => 12.0,
+        "ravine_scale" => 0.08,
+        "ravine_strength" => 16.0,
+        "ravine_width" => 16.0,
+        "ravine_offset_x" => 4096.0,
+        "ravine_offset_z" => 4096.0,
+        _ => 1.0,
+    }
+}
+
+fn terrain_param_label(key: &str) -> String {
+    key.chars()
+        .map(|ch| {
+            if ch == '_' {
+                ' '
+            } else {
+                ch.to_ascii_uppercase()
+            }
+        })
+        .collect::<String>()
+}
+
+fn slider_f32(value: f32, min: f32, max: f32, width: usize) -> String {
+    let norm = if (max - min).abs() <= f32::EPSILON {
+        0.0
+    } else {
+        ((value - min) / (max - min)).clamp(0.0, 1.0)
+    };
+    let filled = (norm * width as f32).round() as usize;
+    let bar = format!(
+        "{}{}",
+        "_".repeat(filled.min(width)),
+        "-".repeat(width.saturating_sub(filled.min(width)))
+    );
+    format!("{} {:.3}", bar, value)
+}
+
+fn slider_u32(value: u32, min: u32, max: u32, width: usize) -> String {
+    let norm = if max <= min {
+        0.0
+    } else {
+        (value.saturating_sub(min)) as f32 / (max - min) as f32
+    };
+    let filled = (norm * width as f32).round() as usize;
+    let bar = format!(
+        "{}{}",
+        "_".repeat(filled.min(width)),
+        "-".repeat(width.saturating_sub(filled.min(width)))
+    );
+    format!("{} {}", bar, value)
 }
 
 fn random_i32_inclusive(state: &mut u64, min: i32, max: i32) -> i32 {

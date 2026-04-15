@@ -4,6 +4,7 @@ use std::{
 };
 
 use subdivism::game::{
+    asset_registry::{AssetRegistry, BiomeEntry, TextureEntry},
     terrain_recipe::TerrainRecipe,
     world::{TerrainConfig, WORLD_HEIGHT},
 };
@@ -12,6 +13,11 @@ fn main() {
     let options = ToolOptions::from_env();
     if options.help {
         print_help();
+        return;
+    }
+
+    if options.has_asset_command() {
+        run_asset_command(&options);
         return;
     }
 
@@ -67,12 +73,22 @@ struct ToolOptions {
     seed: Option<i64>,
     out: Option<PathBuf>,
     name: Option<String>,
+    assets_file: Option<PathBuf>,
+    assets_list: bool,
+    assets_add_texture: Option<(String, String)>,
+    assets_remove_texture: Option<String>,
+    assets_add_biome: Option<(String, String, String, String, String)>,
+    assets_remove_biome: Option<String>,
+    texture_tint: [f32; 3],
     help: bool,
 }
 
 impl ToolOptions {
     fn from_env() -> Self {
-        let mut options = Self::default();
+        let mut options = Self {
+            texture_tint: [1.0, 1.0, 1.0],
+            ..Self::default()
+        };
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -101,6 +117,47 @@ impl ToolOptions {
                         options.name = Some(value);
                     }
                 }
+                "--assets-file" => {
+                    if let Some(value) = args.next() {
+                        options.assets_file = Some(PathBuf::from(value));
+                    }
+                }
+                "--assets-list" => {
+                    options.assets_list = true;
+                }
+                "--assets-add-texture" => {
+                    if let (Some(id), Some(path)) = (args.next(), args.next()) {
+                        options.assets_add_texture = Some((id, path));
+                    }
+                }
+                "--assets-remove-texture" => {
+                    if let Some(id) = args.next() {
+                        options.assets_remove_texture = Some(id);
+                    }
+                }
+                "--assets-add-biome" => {
+                    if let (Some(id), Some(profile), Some(top), Some(side), Some(bottom)) = (
+                        args.next(),
+                        args.next(),
+                        args.next(),
+                        args.next(),
+                        args.next(),
+                    ) {
+                        options.assets_add_biome = Some((id, profile, top, side, bottom));
+                    }
+                }
+                "--assets-remove-biome" => {
+                    if let Some(id) = args.next() {
+                        options.assets_remove_biome = Some(id);
+                    }
+                }
+                "--tint" => {
+                    if let Some(value) = args.next() {
+                        if let Some(parsed) = parse_tint(&value) {
+                            options.texture_tint = parsed;
+                        }
+                    }
+                }
                 "--help" | "-h" => {
                     options.help = true;
                 }
@@ -108,6 +165,72 @@ impl ToolOptions {
             }
         }
         options
+    }
+
+    fn has_asset_command(&self) -> bool {
+        self.assets_list
+            || self.assets_add_texture.is_some()
+            || self.assets_remove_texture.is_some()
+            || self.assets_add_biome.is_some()
+            || self.assets_remove_biome.is_some()
+    }
+}
+
+fn run_asset_command(options: &ToolOptions) {
+    let path = options
+        .assets_file
+        .clone()
+        .unwrap_or_else(AssetRegistry::default_path);
+    let mut registry = AssetRegistry::load_or_default(&path)
+        .unwrap_or_else(|err| panic!("failed to load {}: {err}", path.display()));
+
+    if let Some((id, tex_path)) = options.assets_add_texture.as_ref() {
+        registry.upsert_texture(TextureEntry {
+            id: id.clone(),
+            path: tex_path.clone(),
+            tint: options.texture_tint,
+        });
+    }
+    if let Some(id) = options.assets_remove_texture.as_ref() {
+        registry.remove_texture(id);
+    }
+    if let Some((id, profile, top, side, bottom)) = options.assets_add_biome.as_ref() {
+        registry.upsert_biome(BiomeEntry {
+            id: id.clone(),
+            terrain_profile: profile.clone(),
+            top_texture: top.clone(),
+            side_texture: side.clone(),
+            bottom_texture: bottom.clone(),
+        });
+    }
+    if let Some(id) = options.assets_remove_biome.as_ref() {
+        registry.remove_biome(id);
+    }
+
+    if !options.assets_list {
+        registry
+            .write_to_file(&path)
+            .unwrap_or_else(|err| panic!("failed to write {}: {err}", path.display()));
+        println!("WROTE {}", path.display());
+    }
+
+    println!("TEXTURES {}", registry.textures.len());
+    for texture in &registry.textures {
+        println!(
+            "  {} -> {} tint {:.2},{:.2},{:.2}",
+            texture.id, texture.path, texture.tint[0], texture.tint[1], texture.tint[2]
+        );
+    }
+    println!("BIOMES {}", registry.biomes.len());
+    for biome in &registry.biomes {
+        println!(
+            "  {} profile {} textures [{}, {}, {}]",
+            biome.id,
+            biome.terrain_profile,
+            biome.top_texture,
+            biome.side_texture,
+            biome.bottom_texture
+        );
     }
 }
 
@@ -141,6 +264,15 @@ fn apply_description(cfg: &mut TerrainConfig, description: &str) {
         cfg.cliff_strength += 0.24;
         cfg.terrace_step += 0.8;
         cfg.valley_depth += 3.0;
+        cfg.ravine_strength += 1.2;
+    }
+    if any(&["desert", "dune", "arid", "dry"]) {
+        cfg.desert_base_drop += 3.0;
+        cfg.desert_dune_amplitude += 2.0;
+        cfg.biome_blend += 0.04;
+    }
+    if any(&["blend", "blended", "smooth", "transition"]) {
+        cfg.biome_blend += 0.06;
     }
     if any(&["flat", "plain", "plains", "meadow", "gentle"]) {
         cfg.macro_amplitude *= 0.55;
@@ -163,18 +295,7 @@ fn apply_description(cfg: &mut TerrainConfig, description: &str) {
     }
 
     cfg.base_height = cfg.base_height.clamp(8.0, (WORLD_HEIGHT - 8) as f32);
-    cfg.macro_scale = cfg.macro_scale.clamp(0.003, 0.08);
-    cfg.detail_scale = cfg.detail_scale.clamp(0.01, 0.25);
-    cfg.mountain_scale = cfg.mountain_scale.clamp(0.0025, 0.08);
-    cfg.valley_scale = cfg.valley_scale.clamp(0.0025, 0.08);
-    cfg.cliff_scale = cfg.cliff_scale.clamp(0.005, 0.12);
-
-    cfg.macro_amplitude = cfg.macro_amplitude.clamp(0.0, 24.0);
-    cfg.detail_amplitude = cfg.detail_amplitude.clamp(0.0, 10.0);
-    cfg.mountain_amplitude = cfg.mountain_amplitude.clamp(0.0, 28.0);
-    cfg.valley_depth = cfg.valley_depth.clamp(0.0, 20.0);
-    cfg.cliff_strength = cfg.cliff_strength.clamp(0.0, 1.0);
-    cfg.terrace_step = cfg.terrace_step.clamp(0.5, 8.0);
+    cfg.clamp_reasonable();
 }
 
 fn slugify(text: &str, fallback: &str) -> String {
@@ -211,5 +332,23 @@ fn print_help() {
     println!("  --seed <int>        deterministic world seed");
     println!("  --out <path>        output recipe file");
     println!("  --name <id>         recipe name");
+    println!("  --assets-file <p>   asset registry path default terrain/assets.registry");
+    println!("  --assets-list       print texture and biome registry");
+    println!("  --assets-add-texture <id> <path>   add or replace texture");
+    println!("  --assets-remove-texture <id>       remove texture entry");
+    println!("  --assets-add-biome <id> <profile> <top> <side> <bottom>");
+    println!("  --assets-remove-biome <id>");
+    println!("  --tint <r,g,b>      tint used with --assets-add-texture");
     println!("  --help              show this help");
+}
+
+fn parse_tint(raw: &str) -> Option<[f32; 3]> {
+    let pieces = raw.split(',').map(str::trim).collect::<Vec<_>>();
+    if pieces.len() != 3 {
+        return None;
+    }
+    let r = pieces[0].parse::<f32>().ok()?;
+    let g = pieces[1].parse::<f32>().ok()?;
+    let b = pieces[2].parse::<f32>().ok()?;
+    Some([r.clamp(0.0, 2.0), g.clamp(0.0, 2.0), b.clamp(0.0, 2.0)])
 }

@@ -29,6 +29,8 @@ struct LightingUniform {
     sky_bottom: [f32; 4],
     camera_position: [f32; 4],
     params: [f32; 4],
+    style: [f32; 4],
+    fog: [f32; 4],
 }
 
 #[derive(Clone, Copy)]
@@ -40,6 +42,37 @@ pub struct CelestialState {
     pub sun_intensity: f32,
     pub moon_intensity: f32,
     pub ambient: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct GraphicsSettings {
+    pub shader_quality: f32,
+    pub ambient_boost: f32,
+    pub shadow_softness: f32,
+    pub shadow_contrast: f32,
+    pub far_shadow_lift: f32,
+    pub fog_strength: f32,
+    pub fog_start: f32,
+    pub fog_end: f32,
+    pub atmosphere_strength: f32,
+    pub color_vibrance: f32,
+}
+
+impl Default for GraphicsSettings {
+    fn default() -> Self {
+        Self {
+            shader_quality: 0.72,
+            ambient_boost: 0.24,
+            shadow_softness: 0.70,
+            shadow_contrast: 0.95,
+            far_shadow_lift: 0.22,
+            fog_strength: 0.32,
+            fog_start: 96.0,
+            fog_end: 520.0,
+            atmosphere_strength: 0.30,
+            color_vibrance: 1.08,
+        }
+    }
 }
 
 struct DepthTexture {
@@ -190,6 +223,8 @@ impl GpuState {
                 celestial.ambient,
                 0.0,
             ],
+            style: [0.24, 0.70, 0.95, 0.22],
+            fog: [0.32, 96.0, 520.0, 0.30],
         };
         let screen_uniform = ScreenUniform {
             screen_size: [config.width as f32, config.height as f32],
@@ -465,6 +500,7 @@ impl GpuState {
         time_seconds: f32,
         camera_position: Vec3,
         terrain_seed: i64,
+        settings: GraphicsSettings,
     ) -> CelestialState {
         let celestial = celestial_state_for_time(time_seconds);
         self.lighting_uniform.sun_direction = [
@@ -496,8 +532,20 @@ impl GpuState {
         self.lighting_uniform.params = [
             celestial.sun_intensity,
             celestial.moon_intensity,
-            celestial.ambient,
-            terrain_seed as f32,
+            (celestial.ambient + settings.ambient_boost).clamp(0.03, 0.95),
+            settings.shader_quality.clamp(0.0, 1.0) + (terrain_seed as f32 * 0.0),
+        ];
+        self.lighting_uniform.style = [
+            settings.shadow_softness,
+            settings.shadow_contrast,
+            settings.far_shadow_lift,
+            settings.color_vibrance,
+        ];
+        self.lighting_uniform.fog = [
+            settings.fog_strength,
+            settings.fog_start.max(1.0),
+            settings.fog_end.max(settings.fog_start + 1.0),
+            settings.atmosphere_strength,
         ];
         self.clear_color = wgpu::Color {
             r: celestial.sky_bottom[0] as f64,

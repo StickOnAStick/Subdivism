@@ -3,6 +3,11 @@ use bytemuck::{Pod, Zeroable};
 const OVERLAY_MARGIN: f32 = 16.0;
 const OVERLAY_LINE_HEIGHT: f32 = 28.0;
 const OVERLAY_GLYPH_SCALE: f32 = 3.0;
+const MENU_PANEL_MIN_WIDTH: f32 = 480.0;
+const MENU_PANEL_HORIZONTAL_PADDING: f32 = 40.0;
+const MENU_PANEL_TOP_PADDING: f32 = 24.0;
+const MENU_PANEL_BOTTOM_PADDING: f32 = 20.0;
+const MENU_ENTRY_HEIGHT: f32 = 32.0;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -37,6 +42,29 @@ pub struct DebugOverlay {
     fps: f32,
     frame_count: u32,
     elapsed: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Rect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl Rect {
+    pub fn contains(&self, point_x: f32, point_y: f32) -> bool {
+        point_x >= self.x
+            && point_x <= self.x + self.width
+            && point_y >= self.y
+            && point_y <= self.y + self.height
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MenuLayout {
+    pub panel: Rect,
+    pub item_rects: Vec<Rect>,
 }
 
 impl DebugOverlay {
@@ -126,53 +154,81 @@ impl DebugOverlay {
         title: &str,
         lines: &[String],
         selected_index: usize,
+        hovered_index: Option<usize>,
+        screen_size: [f32; 2],
     ) -> Vec<OverlayVertex> {
         let mut vertices = Vec::new();
-        let mut all_lines = Vec::with_capacity(lines.len() + 1);
-        all_lines.push(title.to_string());
-        all_lines.extend(lines.iter().cloned());
-
+        let layout = self.menu_layout(title, lines, screen_size);
+        let panel = layout.panel;
         let glyph_h = 7.0 * OVERLAY_GLYPH_SCALE;
         let advance = 6.0 * OVERLAY_GLYPH_SCALE;
-        let panel_width = all_lines
-            .iter()
-            .map(|line| line.chars().count() as f32 * advance)
-            .fold(0.0, f32::max)
-            + 32.0;
-        let panel_height =
-            20.0 + all_lines.len() as f32 * OVERLAY_LINE_HEIGHT + glyph_h - OVERLAY_GLYPH_SCALE;
-        let panel_x = OVERLAY_MARGIN;
-        let panel_y = 120.0;
 
         push_overlay_quad(
             &mut vertices,
-            panel_x,
-            panel_y,
-            panel_width,
-            panel_height,
-            [0.02, 0.03, 0.05, 0.88],
+            panel.x,
+            panel.y,
+            panel.width,
+            panel.height,
+            [0.04, 0.06, 0.07, 0.90],
         );
         push_overlay_quad(
             &mut vertices,
-            panel_x + 3.0,
-            panel_y + 3.0,
-            panel_width - 6.0,
-            panel_height - 6.0,
-            [0.10, 0.13, 0.18, 0.60],
+            panel.x + 4.0,
+            panel.y + 4.0,
+            panel.width - 8.0,
+            panel.height - 8.0,
+            [0.10, 0.15, 0.12, 0.54],
         );
 
-        for (line_index, line) in all_lines.iter().enumerate() {
-            let y = panel_y + 16.0 + line_index as f32 * OVERLAY_LINE_HEIGHT;
+        let title_width = title.chars().count() as f32 * advance;
+        let title_x = panel.x + (panel.width - title_width) * 0.5;
+        let title_y = panel.y + MENU_PANEL_TOP_PADDING;
+        push_text(
+            &mut vertices,
+            title_x + 1.0,
+            title_y + 1.0,
+            title,
+            OVERLAY_GLYPH_SCALE,
+            [0.06, 0.08, 0.09, 0.9],
+        );
+        push_text(
+            &mut vertices,
+            title_x,
+            title_y,
+            title,
+            OVERLAY_GLYPH_SCALE,
+            [0.94, 0.86, 0.62, 1.0],
+        );
+
+        for (line_index, line) in lines.iter().enumerate() {
+            let item_rect = layout.item_rects[line_index];
+            let is_selected = line_index == selected_index;
+            let is_hovered = hovered_index == Some(line_index);
+            if is_selected || is_hovered {
+                let highlight = if is_selected {
+                    [0.28, 0.46, 0.44, 0.58]
+                } else {
+                    [0.18, 0.30, 0.28, 0.45]
+                };
+                push_overlay_quad(
+                    &mut vertices,
+                    item_rect.x,
+                    item_rect.y,
+                    item_rect.width,
+                    item_rect.height,
+                    highlight,
+                );
+            }
+
+            let y = item_rect.y + (item_rect.height - glyph_h) * 0.5;
             let line_width = line.chars().count() as f32 * advance;
-            let x = panel_x + (panel_width - line_width) * 0.5;
-            let is_title = line_index == 0;
-            let is_selected = !is_title && (line_index - 1) == selected_index;
-            let foreground = if is_title {
-                [0.92, 0.82, 0.45, 1.0]
-            } else if is_selected {
-                [0.74, 0.90, 0.98, 1.0]
+            let x = panel.x + (panel.width - line_width) * 0.5;
+            let foreground = if is_selected {
+                [0.84, 0.96, 0.92, 1.0]
+            } else if is_hovered {
+                [0.78, 0.90, 0.86, 1.0]
             } else {
-                [0.91, 0.94, 0.98, 1.0]
+                [0.88, 0.92, 0.91, 1.0]
             };
             push_text(
                 &mut vertices,
@@ -180,12 +236,53 @@ impl DebugOverlay {
                 y + 1.0,
                 line,
                 OVERLAY_GLYPH_SCALE,
-                [0.05, 0.08, 0.10, 0.95],
+                [0.03, 0.05, 0.05, 0.95],
             );
             push_text(&mut vertices, x, y, line, OVERLAY_GLYPH_SCALE, foreground);
         }
 
         vertices
+    }
+
+    pub fn menu_layout(&self, title: &str, lines: &[String], screen_size: [f32; 2]) -> MenuLayout {
+        let advance = 6.0 * OVERLAY_GLYPH_SCALE;
+        let widest_text = std::iter::once(title)
+            .chain(lines.iter().map(String::as_str))
+            .map(|line| line.chars().count() as f32 * advance)
+            .fold(0.0, f32::max);
+        let panel_width = (widest_text + MENU_PANEL_HORIZONTAL_PADDING * 2.0)
+            .max(MENU_PANEL_MIN_WIDTH)
+            .min(screen_size[0] - OVERLAY_MARGIN * 2.0);
+        let panel_height = MENU_PANEL_TOP_PADDING
+            + OVERLAY_LINE_HEIGHT
+            + lines.len() as f32 * MENU_ENTRY_HEIGHT
+            + MENU_PANEL_BOTTOM_PADDING;
+        let panel_x = ((screen_size[0] - panel_width) * 0.5).max(OVERLAY_MARGIN);
+        let panel_y = ((screen_size[1] - panel_height) * 0.5).max(OVERLAY_MARGIN);
+
+        let mut item_rects = Vec::with_capacity(lines.len());
+        for index in 0..lines.len() {
+            let y = panel_y
+                + MENU_PANEL_TOP_PADDING
+                + OVERLAY_LINE_HEIGHT
+                + index as f32 * MENU_ENTRY_HEIGHT;
+            item_rects.push(Rect {
+                x: panel_x + 10.0,
+                y,
+                width: panel_width - 20.0,
+                height: MENU_ENTRY_HEIGHT - 2.0,
+            });
+        }
+
+        MenuLayout {
+            panel: Rect {
+                x: panel_x,
+                y: panel_y,
+                width: panel_width,
+                height: panel_height,
+            },
+            item_rects,
+        }
     }
 }
 

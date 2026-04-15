@@ -70,6 +70,17 @@ impl TerrainRecipe {
             &format!("cliff_scale={:.6}", terrain.cliff_scale),
             &format!("cliff_strength={:.6}", terrain.cliff_strength),
             &format!("terrace_step={:.6}", terrain.terrace_step),
+            &format!("biome_scale={:.6}", terrain.biome_scale),
+            &format!("biome_blend={:.6}", terrain.biome_blend),
+            &format!("mountain_base_lift={:.6}", terrain.mountain_base_lift),
+            &format!("desert_base_drop={:.6}", terrain.desert_base_drop),
+            &format!("desert_dune_scale={:.6}", terrain.desert_dune_scale),
+            &format!("desert_dune_amplitude={:.6}", terrain.desert_dune_amplitude),
+            &format!("ravine_scale={:.6}", terrain.ravine_scale),
+            &format!("ravine_strength={:.6}", terrain.ravine_strength),
+            &format!("ravine_width={:.6}", terrain.ravine_width),
+            &format!("ravine_offset_x={:.6}", terrain.ravine_offset_x),
+            &format!("ravine_offset_z={:.6}", terrain.ravine_offset_z),
         ]
         .join("\n")
             + "\n"
@@ -115,9 +126,27 @@ impl TerrainRecipe {
                 "cliff_scale" => parse_f32(value, &mut recipe.terrain.cliff_scale, key)?,
                 "cliff_strength" => parse_f32(value, &mut recipe.terrain.cliff_strength, key)?,
                 "terrace_step" => parse_f32(value, &mut recipe.terrain.terrace_step, key)?,
+                "biome_scale" => parse_f32(value, &mut recipe.terrain.biome_scale, key)?,
+                "biome_blend" => parse_f32(value, &mut recipe.terrain.biome_blend, key)?,
+                "mountain_base_lift" => {
+                    parse_f32(value, &mut recipe.terrain.mountain_base_lift, key)?
+                }
+                "desert_base_drop" => parse_f32(value, &mut recipe.terrain.desert_base_drop, key)?,
+                "desert_dune_scale" => {
+                    parse_f32(value, &mut recipe.terrain.desert_dune_scale, key)?
+                }
+                "desert_dune_amplitude" => {
+                    parse_f32(value, &mut recipe.terrain.desert_dune_amplitude, key)?
+                }
+                "ravine_scale" => parse_f32(value, &mut recipe.terrain.ravine_scale, key)?,
+                "ravine_strength" => parse_f32(value, &mut recipe.terrain.ravine_strength, key)?,
+                "ravine_width" => parse_f32(value, &mut recipe.terrain.ravine_width, key)?,
+                "ravine_offset_x" => parse_f32(value, &mut recipe.terrain.ravine_offset_x, key)?,
+                "ravine_offset_z" => parse_f32(value, &mut recipe.terrain.ravine_offset_z, key)?,
                 _ => {}
             }
         }
+        recipe.terrain.clamp_reasonable();
         Ok(recipe)
     }
 }

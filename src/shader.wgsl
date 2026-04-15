@@ -9,6 +9,8 @@ struct LightingUniform {
     sky_bottom: vec4<f32>,
     camera_position: vec4<f32>,
     params: vec4<f32>,
+    style: vec4<f32>,
+    fog: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -41,31 +43,26 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let n = normalize(in.normal);
-    let sun_dir = normalize(lighting.sun_direction.xyz);
-    let moon_dir = normalize(lighting.moon_direction.xyz);
     let sun_intensity = lighting.params.x;
     let moon_intensity = lighting.params.y;
     let ambient = lighting.params.z;
+    let vibrance = clamp(lighting.style.w, 0.5, 1.8);
+    let fog_strength = clamp(lighting.fog.x, 0.0, 1.2);
+    let fog_start = max(lighting.fog.y, 1.0);
+    let fog_end = max(lighting.fog.z, fog_start + 1.0);
+    let atmosphere_strength = clamp(lighting.fog.w, 0.0, 1.0);
 
-    let sun_ndotl = max(dot(n, sun_dir), 0.0);
-    let moon_ndotl = max(dot(n, moon_dir), 0.0);
-    let soft_sun = smoothstep(0.0, 0.85, sun_ndotl);
-    let soft_moon = smoothstep(0.0, 0.95, moon_ndotl);
+    let global_light = clamp(ambient + sun_intensity * 0.72 + moon_intensity * 0.48, 0.22, 1.20);
+    let lit_color = in.color * global_light;
 
-    let sky_visibility = smoothstep(-0.35, 0.90, dot(n, vec3<f32>(0.0, 1.0, 0.0)));
-    let ambient_light = ambient * mix(0.70, 1.0, sky_visibility);
-    let sun_light = soft_sun * sun_intensity;
-    let moon_light = soft_moon * moon_intensity * 0.82;
-    let underground = smoothstep(6.0, -6.0, in.world_position.y);
-    let depth_dim = mix(1.0, 0.88, underground);
-    let horizontal_distance = distance(in.world_position.xz, lighting.camera_position.xz);
-    let far_t = smoothstep(120.0, 420.0, horizontal_distance);
-    let side_facing = 1.0 - sky_visibility;
-    let far_shadow_lift = far_t * side_facing * 0.18;
-    let min_light = 0.06 + far_shadow_lift;
+    let delta_xz = in.world_position.xz - lighting.camera_position.xz;
+    let horizontal_distance = abs(delta_xz.x) + abs(delta_xz.y);
+    let fog_t = smoothstep(fog_start, fog_end, horizontal_distance) * fog_strength;
 
-    let total_light = clamp(ambient_light + sun_light + moon_light, min_light, 2.2) * depth_dim;
-    let base = in.color * total_light;
+    let sky_horizon = mix(lighting.sky_bottom.rgb, lighting.sky_top.rgb, 0.55);
+    let atmosphere_color = mix(sky_horizon, vec3<f32>(0.72, 0.82, 0.96), atmosphere_strength);
+    let fogged = mix(lit_color, atmosphere_color, clamp(fog_t, 0.0, 1.0));
+    let luma = dot(fogged, vec3<f32>(0.299, 0.587, 0.114));
+    let base = mix(vec3<f32>(luma), fogged, vibrance);
     return vec4<f32>(base, 1.0);
 }
