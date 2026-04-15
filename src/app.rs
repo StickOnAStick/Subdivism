@@ -21,12 +21,18 @@ use crate::{
     debug_overlay::{DebugOverlay, MenuLayout, OverlayVertex},
     game::{
         actor::{ActorRoster, PLAYER_EYE_HEIGHT},
+        hud::HudFormatter,
+        interact::{
+            RaycastHit, direction_to_screen, face_plane_points, find_sub_block_at_point,
+            push_screen_line, raycast_world_detailed, sub_slot_overlaps_existing,
+            sub_target_from_world_point, voxel_coords, world_to_screen,
+        },
         inventory::{BACKPACK_COLS, BACKPACK_ROWS, BACKPACK_SIZE, HOTBAR_SIZE, Inventory},
         physics::{self, MovementInput, PhysicsConfig},
+        terrain_params::TerrainParamRegistry,
         terrain_recipe::TerrainRecipe,
         world::{
-            Block, CHUNK_SIZE, DEFAULT_WORLD_SEED, TerrainConfig, WORLD_MAX_Y, WORLD_MIN_Y,
-            WORLD_OVERWORLD_FLOOR, World,
+            Block, CHUNK_SIZE, DEFAULT_WORLD_SEED, TerrainConfig, WORLD_MAX_Y, WORLD_MIN_Y, World,
         },
     },
     mesh::Vertex,
@@ -1234,17 +1240,21 @@ impl App {
         let mut lines = Vec::with_capacity(16);
         lines.push("ARROWS MOVE ENTER APPLY E CLOSE".to_string());
         lines.push("HOTBAR 1X8".to_string());
-        lines.push(format_inventory_row(self.inventory.hotbar(), 0, HOTBAR_SIZE));
+        lines.push(HudFormatter::format_inventory_row(
+            self.inventory.hotbar(),
+            0,
+            HOTBAR_SIZE,
+        ));
         lines.push(format!(
             "ACTIVE {} {} {}",
             selected_hotbar + 1,
-            block_label(hotbar_slot.block),
+            HudFormatter::block_label(hotbar_slot.block),
             hotbar_slot.count
         ));
         lines.push("BACKPACK 6X8".to_string());
         for row in 0..BACKPACK_ROWS {
             let start = row * BACKPACK_COLS;
-            lines.push(format_inventory_row(
+            lines.push(HudFormatter::format_inventory_row(
                 self.inventory.backpack(),
                 start,
                 BACKPACK_COLS,
@@ -1258,7 +1268,7 @@ impl App {
                 "BACKPACK"
             },
             backpack_index + 1,
-            block_label(backpack_slot.block)
+            HudFormatter::block_label(backpack_slot.block)
         ));
 
         let selected_line = match self.inventory_cursor.section {
@@ -1284,11 +1294,16 @@ impl App {
         lines.push("F8 TOGGLE PANEL F9 SAVE PRESET".to_string());
         let cfg = self.world.terrain_config();
         for key in shown {
-            let value = terrain_param_value(&cfg, key);
+            let value = TerrainParamRegistry::value(&cfg, key);
             lines.push(format!(
                 "{} {}",
-                terrain_param_label(key),
-                slider_f32(value, terrain_param_min(key), terrain_param_max(key), 12)
+                TerrainParamRegistry::label(key),
+                slider_f32(
+                    value,
+                    TerrainParamRegistry::min(key),
+                    TerrainParamRegistry::max(key),
+                    12
+                )
             ));
         }
         Some((
@@ -1309,7 +1324,7 @@ impl App {
         let index = self.terrain_lab_selected.min(keys.len() - 1);
         let key = keys[index];
         let mut cfg = self.world.terrain_config();
-        let current = terrain_param_value(&cfg, key);
+        let current = TerrainParamRegistry::value(&cfg, key);
         if cfg.set_named_param(key, current + delta).is_err() {
             return;
         }
@@ -1367,26 +1382,26 @@ impl App {
                 true
             }
             KeyCode::ArrowLeft => {
-                self.terrain_lab_adjust_selected(-terrain_param_step(
+                self.terrain_lab_adjust_selected(-TerrainParamRegistry::step(
                     keys[self.terrain_lab_selected],
                 ));
                 true
             }
             KeyCode::ArrowRight => {
-                self.terrain_lab_adjust_selected(terrain_param_step(
+                self.terrain_lab_adjust_selected(TerrainParamRegistry::step(
                     keys[self.terrain_lab_selected],
                 ));
                 true
             }
             KeyCode::PageDown => {
                 self.terrain_lab_adjust_selected(
-                    -terrain_param_step(keys[self.terrain_lab_selected]) * 5.0,
+                    -TerrainParamRegistry::step(keys[self.terrain_lab_selected]) * 5.0,
                 );
                 true
             }
             KeyCode::PageUp => {
                 self.terrain_lab_adjust_selected(
-                    terrain_param_step(keys[self.terrain_lab_selected]) * 5.0,
+                    TerrainParamRegistry::step(keys[self.terrain_lab_selected]) * 5.0,
                 );
                 true
             }
@@ -1457,7 +1472,7 @@ impl App {
         if keys.is_empty() {
             return;
         }
-        let step = terrain_param_step(keys[self.terrain_lab_selected.min(keys.len() - 1)]);
+        let step = TerrainParamRegistry::step(keys[self.terrain_lab_selected.min(keys.len() - 1)]);
         self.terrain_lab_adjust_selected(if delta_y > 0.0 { step } else { -step });
     }
 
@@ -1470,7 +1485,7 @@ impl App {
             format!(
                 "SLOT {} {} {}",
                 self.inventory.selected_hotbar_index() + 1,
-                block_label(slot.block),
+                HudFormatter::block_label(slot.block),
                 slot.count
             ),
             format!(
@@ -1576,12 +1591,16 @@ impl App {
             DebugOverlay::add_quad(vertices, x, y, slot_w, slot_h, border);
             DebugOverlay::add_quad(vertices, x + 2.0, y + 2.0, slot_w - 4.0, slot_h - 4.0, bg);
 
-            let swatch = block_tint_color(slot.block);
+            let swatch = HudFormatter::block_tint_color(slot.block);
             DebugOverlay::add_quad(vertices, x + 8.0, y + 9.0, 16.0, 16.0, swatch);
             let label = if slot.is_empty() {
                 "___".to_string()
             } else {
-                format!("{}{:02}", block_short_code(slot.block), slot.count.min(99))
+                format!(
+                    "{}{:02}",
+                    HudFormatter::block_short_code(slot.block),
+                    slot.count.min(99)
+                )
             };
             DebugOverlay::add_text(vertices, x + 28.0, y + 12.0, &label, 2.0, [0.90, 0.95, 0.93, 1.0]);
         }
@@ -1594,24 +1613,25 @@ impl App {
         }
         let x = screen_size[0] - 66.0;
         let y = screen_size[1] - 82.0;
-        let tint = block_tint_color(slot.block);
+        let tint = HudFormatter::block_tint_color(slot.block);
         DebugOverlay::add_quad(vertices, x, y, 22.0, 22.0, [0.02, 0.03, 0.04, 0.75]);
         DebugOverlay::add_quad(vertices, x + 3.0, y + 3.0, 16.0, 16.0, tint);
     }
 
     fn push_subdivision_overlay(&self, vertices: &mut Vec<OverlayVertex>, screen_size: [f32; 2]) {
         let camera = self.active_camera();
+        let divisions = self.current_divisions();
         let Some(hit) = raycast_world_detailed(
             &self.world,
             camera.position,
             camera.forward(),
             7.0,
             0.03,
+            Some(divisions),
         ) else {
             return;
         };
 
-        let divisions = self.current_divisions();
         let plane = face_plane_points(hit.cell, hit.normal, divisions);
         let color = [0.92, 0.97, 0.88, 0.88];
         for (a, b) in plane {
@@ -1629,16 +1649,25 @@ impl App {
             return;
         }
         let camera = self.active_camera();
-        let Some(hit) = raycast_world_detailed(&self.world, camera.position, camera.forward(), 7.0, 0.03)
+        let Some(hit) = raycast_world_detailed(
+            &self.world,
+            camera.position,
+            camera.forward(),
+            7.0,
+            0.03,
+            if self.subdivide_scale == SubdivideScale::Full {
+                None
+            } else {
+                Some(self.current_divisions())
+            },
+        )
         else {
             return;
         };
 
         if self.subdivide_scale != SubdivideScale::Full {
-            let did_sub_edit = self.edit_sub_block_from_click(remove, hit);
-            if did_sub_edit {
-                return;
-            }
+            let _ = self.edit_sub_block_from_click(remove, hit);
+            return;
         }
 
         if remove {
@@ -1744,19 +1773,19 @@ impl App {
             return false;
         }
         if remove {
-            let probe = hit.point - hit.normal.as_vec3() * 0.001;
-            let target = sub_target_from_world_point(hit.cell, probe, divisions);
-            if let Some(block) = self.world.clear_sub_block_i64(
-                target.base.0,
-                target.base.1,
-                target.base.2,
-                divisions,
-                target.sx,
-                target.sy,
-                target.sz,
-            ) {
+            if let Some((hit_sub, block)) = find_sub_block_at_point(&self.world, hit.cell, hit.point)
+            {
+                let _ = self.world.clear_sub_block_i64(
+                    hit_sub.x,
+                    hit_sub.y,
+                    hit_sub.z,
+                    hit_sub.divisions,
+                    hit_sub.sx,
+                    hit_sub.sy,
+                    hit_sub.sz,
+                );
                 self.refund_sub_units(block, self.sub_piece_cost_units());
-                self.mark_block_change_dirty(target.base.0, target.base.2);
+                self.mark_block_change_dirty(hit_sub.x, hit_sub.z);
                 return true;
             }
             return false;
@@ -1775,27 +1804,23 @@ impl App {
             return false;
         }
 
-        let place_point = hit.point + hit.normal.as_vec3() * 0.001;
-        let target = sub_target_from_world_point(hit.previous, place_point, divisions);
-        if !matches!(
-            self.world.block_at_i64(target.base.0, target.base.1, target.base.2),
-            Block::Air
-        ) {
-            return false;
-        }
+        let target_base = voxel_coords(hit.previous_point);
+        let target = sub_target_from_world_point(target_base, hit.previous_point, divisions);
         if self
             .world
-            .sub_block_i64(
-                target.base.0,
-                target.base.1,
-                target.base.2,
-                divisions,
-                target.sx,
-                target.sy,
-                target.sz,
-            )
-            .is_some()
+            .block_at_i64(target.base.0, target.base.1, target.base.2)
+            .is_solid()
         {
+            return false;
+        }
+        if sub_slot_overlaps_existing(
+            &self.world,
+            target.base,
+            divisions,
+            target.sx,
+            target.sy,
+            target.sz,
+        ) {
             return false;
         }
 
@@ -2014,6 +2039,7 @@ impl ApplicationHandler for App {
                         self.active_camera().forward(),
                         7.0,
                         0.03,
+                        None,
                     )
                     .is_some()
                     && delta_y.abs() > f32::EPSILON
@@ -2228,193 +2254,6 @@ fn collect_lod_ring(
     }
 }
 
-fn block_label(block: Block) -> &'static str {
-    match block {
-        Block::Air => "AIR",
-        Block::Grass => "GRASS",
-        Block::Dirt => "DIRT",
-        Block::Stone => "STONE",
-        Block::Deepslate => "DEEPSLATE",
-        Block::DeepDark => "DEEPDARK",
-    }
-}
-
-fn format_inventory_row(
-    slots: &[crate::game::inventory::InventorySlot],
-    start: usize,
-    width: usize,
-) -> String {
-    let mut out = String::new();
-    for i in 0..width {
-        let idx = start + i;
-        let slot = slots.get(idx).copied().unwrap_or_default();
-        let token = if slot.is_empty() {
-            "___".to_string()
-        } else {
-            format!(
-                "{}{:02}",
-                block_short_code(slot.block),
-                slot.count.min(99)
-            )
-        };
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(&token);
-    }
-    out
-}
-
-fn block_short_code(block: Block) -> &'static str {
-    match block {
-        Block::Air => "_",
-        Block::Grass => "G",
-        Block::Dirt => "D",
-        Block::Stone => "S",
-        Block::Deepslate => "L",
-        Block::DeepDark => "K",
-    }
-}
-
-fn block_tint_color(block: Block) -> [f32; 4] {
-    match block {
-        Block::Air => [0.15, 0.17, 0.18, 0.35],
-        Block::Grass => [0.34, 0.72, 0.36, 0.95],
-        Block::Dirt => [0.42, 0.29, 0.20, 0.95],
-        Block::Stone => [0.56, 0.58, 0.60, 0.95],
-        Block::Deepslate => [0.35, 0.37, 0.40, 0.95],
-        Block::DeepDark => [0.08, 0.10, 0.11, 0.95],
-    }
-}
-
-fn terrain_param_value(cfg: &TerrainConfig, key: &str) -> f32 {
-    match key {
-        "base_height" => cfg.base_height,
-        "macro_scale" => cfg.macro_scale,
-        "macro_amplitude" => cfg.macro_amplitude,
-        "detail_scale" => cfg.detail_scale,
-        "detail_amplitude" => cfg.detail_amplitude,
-        "mountain_scale" => cfg.mountain_scale,
-        "mountain_amplitude" => cfg.mountain_amplitude,
-        "valley_scale" => cfg.valley_scale,
-        "valley_depth" => cfg.valley_depth,
-        "cliff_scale" => cfg.cliff_scale,
-        "cliff_strength" => cfg.cliff_strength,
-        "terrace_step" => cfg.terrace_step,
-        "biome_scale" => cfg.biome_scale,
-        "biome_blend" => cfg.biome_blend,
-        "mountain_base_lift" => cfg.mountain_base_lift,
-        "desert_base_drop" => cfg.desert_base_drop,
-        "desert_dune_scale" => cfg.desert_dune_scale,
-        "desert_dune_amplitude" => cfg.desert_dune_amplitude,
-        "ravine_scale" => cfg.ravine_scale,
-        "ravine_strength" => cfg.ravine_strength,
-        "ravine_width" => cfg.ravine_width,
-        "ravine_offset_x" => cfg.ravine_offset_x,
-        "ravine_offset_z" => cfg.ravine_offset_z,
-        _ => 0.0,
-    }
-}
-
-fn terrain_param_step(key: &str) -> f32 {
-    match key {
-        "base_height" => 0.5,
-        "macro_scale" => 0.0005,
-        "macro_amplitude" => 0.4,
-        "detail_scale" => 0.001,
-        "detail_amplitude" => 0.2,
-        "mountain_scale" => 0.0005,
-        "mountain_amplitude" => 0.5,
-        "valley_scale" => 0.0005,
-        "valley_depth" => 0.4,
-        "cliff_scale" => 0.0005,
-        "cliff_strength" => 0.02,
-        "terrace_step" => 0.1,
-        "biome_scale" => 0.0002,
-        "biome_blend" => 0.01,
-        "mountain_base_lift" => 0.3,
-        "desert_base_drop" => 0.3,
-        "desert_dune_scale" => 0.001,
-        "desert_dune_amplitude" => 0.2,
-        "ravine_scale" => 0.0005,
-        "ravine_strength" => 0.2,
-        "ravine_width" => 0.1,
-        "ravine_offset_x" => 1.0,
-        "ravine_offset_z" => 1.0,
-        _ => 0.1,
-    }
-}
-
-fn terrain_param_min(key: &str) -> f32 {
-    match key {
-        "base_height" => (WORLD_OVERWORLD_FLOOR + 8) as f32,
-        "macro_scale" => 0.0015,
-        "macro_amplitude" => 0.0,
-        "detail_scale" => 0.005,
-        "detail_amplitude" => 0.0,
-        "mountain_scale" => 0.0015,
-        "mountain_amplitude" => 0.0,
-        "valley_scale" => 0.0015,
-        "valley_depth" => 0.0,
-        "cliff_scale" => 0.004,
-        "cliff_strength" => 0.0,
-        "terrace_step" => 0.4,
-        "biome_scale" => 0.0008,
-        "biome_blend" => 0.02,
-        "mountain_base_lift" => -8.0,
-        "desert_base_drop" => 0.0,
-        "desert_dune_scale" => 0.005,
-        "desert_dune_amplitude" => 0.0,
-        "ravine_scale" => 0.001,
-        "ravine_strength" => 0.0,
-        "ravine_width" => 1.0,
-        "ravine_offset_x" => -4096.0,
-        "ravine_offset_z" => -4096.0,
-        _ => -1.0,
-    }
-}
-
-fn terrain_param_max(key: &str) -> f32 {
-    match key {
-        "base_height" => (WORLD_MAX_Y - 8) as f32,
-        "macro_scale" => 0.08,
-        "macro_amplitude" => 30.0,
-        "detail_scale" => 0.30,
-        "detail_amplitude" => 12.0,
-        "mountain_scale" => 0.08,
-        "mountain_amplitude" => 40.0,
-        "valley_scale" => 0.08,
-        "valley_depth" => 24.0,
-        "cliff_scale" => 0.16,
-        "cliff_strength" => 1.0,
-        "terrace_step" => 10.0,
-        "biome_scale" => 0.03,
-        "biome_blend" => 0.45,
-        "mountain_base_lift" => 20.0,
-        "desert_base_drop" => 20.0,
-        "desert_dune_scale" => 0.20,
-        "desert_dune_amplitude" => 12.0,
-        "ravine_scale" => 0.08,
-        "ravine_strength" => 16.0,
-        "ravine_width" => 16.0,
-        "ravine_offset_x" => 4096.0,
-        "ravine_offset_z" => 4096.0,
-        _ => 1.0,
-    }
-}
-
-fn terrain_param_label(key: &str) -> String {
-    key.chars()
-        .map(|ch| {
-            if ch == '_' {
-                ' '
-            } else {
-                ch.to_ascii_uppercase()
-            }
-        })
-        .collect::<String>()
-}
-
 fn slider_f32(value: f32, min: f32, max: f32, width: usize) -> String {
     let norm = if (max - min).abs() <= f32::EPSILON {
         0.0
@@ -2457,228 +2296,6 @@ fn random_i32_inclusive(state: &mut u64, min: i32, max: i32) -> i32 {
 
     let span = (max - min + 1) as u32;
     min + (value as u32 % span) as i32
-}
-
-#[derive(Clone, Copy)]
-struct FaceNormal {
-    x: i32,
-    y: i32,
-    z: i32,
-}
-
-impl FaceNormal {
-    fn as_vec3(self) -> Vec3 {
-        Vec3::new(self.x as f32, self.y as f32, self.z as f32)
-    }
-}
-
-#[derive(Clone, Copy)]
-struct RaycastHit {
-    cell: (i64, i32, i64),
-    previous: (i64, i32, i64),
-    point: Vec3,
-    normal: FaceNormal,
-}
-
-#[derive(Clone, Copy)]
-struct SubTarget {
-    base: (i64, i32, i64),
-    sx: u8,
-    sy: u8,
-    sz: u8,
-}
-
-fn raycast_world_detailed(
-    world: &World,
-    origin: Vec3,
-    direction: Vec3,
-    max_distance: f32,
-    step: f32,
-) -> Option<RaycastHit> {
-    let dir = direction.normalize_or_zero();
-    if dir.length_squared() <= f32::EPSILON {
-        return None;
-    }
-
-    let mut previous = voxel_coords(origin);
-    let mut distance = 0.0;
-    while distance <= max_distance {
-        let point = origin + dir * distance;
-        let cell = voxel_coords(point);
-        if cell != previous {
-            if world.is_solid_i64(cell.0, cell.1, cell.2) {
-                let normal = FaceNormal {
-                    x: (previous.0 - cell.0).clamp(-1, 1) as i32,
-                    y: (previous.1 - cell.1).clamp(-1, 1),
-                    z: (previous.2 - cell.2).clamp(-1, 1) as i32,
-                };
-                return Some(RaycastHit {
-                    cell,
-                    previous,
-                    point,
-                    normal,
-                });
-            }
-            previous = cell;
-        }
-        distance += step;
-    }
-
-    None
-}
-
-fn voxel_coords(point: Vec3) -> (i64, i32, i64) {
-    (
-        point.x.floor() as i64,
-        point.y.floor() as i32,
-        point.z.floor() as i64,
-    )
-}
-
-fn sub_target_from_world_point(base: (i64, i32, i64), point: Vec3, divisions: u8) -> SubTarget {
-    let d = divisions.max(1) as f32;
-    let local = point - Vec3::new(base.0 as f32, base.1 as f32, base.2 as f32);
-    let to_index = |value: f32| -> u8 {
-        (value.clamp(0.0, 0.9999) * d).floor() as u8
-    };
-    SubTarget {
-        base,
-        sx: to_index(local.x),
-        sy: to_index(local.y),
-        sz: to_index(local.z),
-    }
-}
-
-fn direction_to_screen(
-    camera: Camera,
-    direction: Vec3,
-    width: f32,
-    height: f32,
-) -> Option<(f32, f32)> {
-    let world_point = camera.position + direction.normalize_or_zero() * 1000.0;
-    let clip = camera.view_proj() * world_point.extend(1.0);
-    if clip.w <= 0.0 {
-        return None;
-    }
-    let ndc = clip.truncate() / clip.w;
-    if ndc.z < 0.0 || ndc.z > 1.0 {
-        return None;
-    }
-    if ndc.x.abs() > 1.2 || ndc.y.abs() > 1.2 {
-        return None;
-    }
-
-    let x = (ndc.x * 0.5 + 0.5) * width;
-    let y = (1.0 - (ndc.y * 0.5 + 0.5)) * height;
-    Some((x, y))
-}
-
-fn world_to_screen(camera: Camera, point: Vec3, width: f32, height: f32) -> Option<(f32, f32)> {
-    let clip = camera.view_proj() * point.extend(1.0);
-    if clip.w <= 0.0 {
-        return None;
-    }
-    let ndc = clip.truncate() / clip.w;
-    if ndc.z < 0.0 || ndc.z > 1.0 {
-        return None;
-    }
-    let x = (ndc.x * 0.5 + 0.5) * width;
-    let y = (1.0 - (ndc.y * 0.5 + 0.5)) * height;
-    Some((x, y))
-}
-
-fn face_plane_points(
-    cell: (i64, i32, i64),
-    normal: FaceNormal,
-    divisions: u8,
-) -> Vec<(Vec3, Vec3)> {
-    let d = divisions.max(1) as f32;
-    let mut lines = Vec::with_capacity((divisions as usize + 1) * 2);
-    let eps = 0.002_f32;
-    let bx = cell.0 as f32;
-    let by = cell.1 as f32;
-    let bz = cell.2 as f32;
-    let normal_vec = normal.as_vec3() * eps;
-
-    for i in 0..=divisions {
-        let t = i as f32 / d;
-        let (a0, a1, b0, b1) = if normal.x != 0 {
-            let fx = bx + if normal.x > 0 { 1.0 } else { 0.0 };
-            (
-                Vec3::new(fx, by + t, bz),
-                Vec3::new(fx, by + t, bz + 1.0),
-                Vec3::new(fx, by, bz + t),
-                Vec3::new(fx, by + 1.0, bz + t),
-            )
-        } else if normal.y != 0 {
-            let fy = by + if normal.y > 0 { 1.0 } else { 0.0 };
-            (
-                Vec3::new(bx + t, fy, bz),
-                Vec3::new(bx + t, fy, bz + 1.0),
-                Vec3::new(bx, fy, bz + t),
-                Vec3::new(bx + 1.0, fy, bz + t),
-            )
-        } else {
-            let fz = bz + if normal.z > 0 { 1.0 } else { 0.0 };
-            (
-                Vec3::new(bx + t, by, fz),
-                Vec3::new(bx + t, by + 1.0, fz),
-                Vec3::new(bx, by + t, fz),
-                Vec3::new(bx + 1.0, by + t, fz),
-            )
-        };
-        lines.push((a0 + normal_vec, a1 + normal_vec));
-        lines.push((b0 + normal_vec, b1 + normal_vec));
-    }
-
-    lines
-}
-
-fn push_screen_line(
-    vertices: &mut Vec<OverlayVertex>,
-    a: (f32, f32),
-    b: (f32, f32),
-    thickness: f32,
-    color: [f32; 4],
-) {
-    let dx = b.0 - a.0;
-    let dy = b.1 - a.1;
-    let len = (dx * dx + dy * dy).sqrt();
-    if len <= f32::EPSILON {
-        return;
-    }
-    let nx = -dy / len * (thickness * 0.5);
-    let ny = dx / len * (thickness * 0.5);
-    let p0 = [a.0 + nx, a.1 + ny];
-    let p1 = [b.0 + nx, b.1 + ny];
-    let p2 = [b.0 - nx, b.1 - ny];
-    let p3 = [a.0 - nx, a.1 - ny];
-    vertices.extend_from_slice(&[
-        OverlayVertex {
-            position: p0,
-            color,
-        },
-        OverlayVertex {
-            position: p1,
-            color,
-        },
-        OverlayVertex {
-            position: p2,
-            color,
-        },
-        OverlayVertex {
-            position: p0,
-            color,
-        },
-        OverlayVertex {
-            position: p2,
-            color,
-        },
-        OverlayVertex {
-            position: p3,
-            color,
-        },
-    ]);
 }
 
 fn push_circle(

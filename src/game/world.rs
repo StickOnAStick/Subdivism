@@ -627,6 +627,10 @@ impl World {
             .write()
             .expect("overrides write lock poisoned")
             .insert(BlockPos { x, y, z }, block);
+        self.sub_overrides
+            .write()
+            .expect("sub overrides write lock poisoned")
+            .retain(|pos, _| !(pos.x == x && pos.y == y && pos.z == z));
     }
 
     pub fn set_sub_block_i64(
@@ -714,6 +718,24 @@ impl World {
             .expect("sub overrides read lock poisoned")
             .get(&pos)
             .copied()
+    }
+
+    pub fn sub_blocks_in_cell(&self, x: i64, y: i32, z: i64) -> Vec<(SubBlockPos, Block)> {
+        if !contains_world_y(y) {
+            return Vec::new();
+        }
+        self.sub_overrides
+            .read()
+            .expect("sub overrides read lock poisoned")
+            .iter()
+            .filter_map(|(pos, block)| {
+                if pos.x == x && pos.y == y && pos.z == z {
+                    Some((*pos, *block))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     pub fn spawn_point_for_column(&self, x: i32, z: i32) -> Option<Vec3> {
@@ -1221,6 +1243,7 @@ impl World {
 
         let mut scores = [0.05_f32; 5];
         scores[biome_index(primary)] += 1.0;
+        let mut any_edge_blend = false;
 
         let neighbors = [
             (
@@ -1260,8 +1283,13 @@ impl World {
             if t <= 0.001 {
                 continue;
             }
+            any_edge_blend = true;
             scores[biome_index(neighbor)] += t * 0.95;
             scores[biome_index(primary)] += (1.0 - t) * 0.10;
+        }
+
+        if !any_edge_blend {
+            return primary;
         }
 
         let total = scores.iter().sum::<f32>().max(f32::EPSILON);

@@ -156,6 +156,27 @@ fn actor_collides(world: &World, position: Vec3) -> bool {
                 if world.is_solid(x, y, z) {
                     return true;
                 }
+                for (sub, block) in world.sub_blocks_in_cell(x as i64, y, z as i64) {
+                    if !block.is_solid() {
+                        continue;
+                    }
+                    let step = 1.0 / sub.divisions as f32;
+                    let sub_min = Vec3::new(
+                        sub.x as f32 + sub.sx as f32 * step,
+                        sub.y as f32 + sub.sy as f32 * step,
+                        sub.z as f32 + sub.sz as f32 * step,
+                    );
+                    let sub_max = sub_min + Vec3::splat(step);
+                    if sub_min.x < max.x
+                        && sub_max.x > min.x
+                        && sub_min.y < max.y
+                        && sub_max.y > min.y
+                        && sub_min.z < max.z
+                        && sub_max.z > min.z
+                    {
+                        return true;
+                    }
+                }
             }
         }
     }
