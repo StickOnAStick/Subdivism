@@ -8,16 +8,21 @@ use glam::Vec3;
 use crate::mesh::{Vertex, push_quad};
 
 pub const CHUNK_SIZE: i64 = 16;
-pub const WORLD_HEIGHT: i32 = 64;
+pub const WORLD_MIN_Y: i32 = -256;
+pub const WORLD_MAX_Y: i32 = 1024;
+pub const WORLD_HEIGHT: i32 = WORLD_MAX_Y - WORLD_MIN_Y + 1;
+pub const WORLD_OVERWORLD_FLOOR: i32 = 255;
 pub const DEFAULT_WORLD_SEED: i64 = 0x5EED_BA5E_u64 as i64;
 
 #[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Block {
     Air,
     Grass,
     Dirt,
     Stone,
+    Deepslate,
+    DeepDark,
 }
 
 impl Block {
@@ -34,6 +39,8 @@ impl Block {
             1 => Self::Grass,
             2 => Self::Dirt,
             3 => Self::Stone,
+            4 => Self::Deepslate,
+            5 => Self::DeepDark,
             _ => Self::Air,
         }
     }
@@ -44,6 +51,17 @@ pub struct BlockPos {
     pub x: i64,
     pub y: i32,
     pub z: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SubBlockPos {
+    pub x: i64,
+    pub y: i32,
+    pub z: i64,
+    pub divisions: u8,
+    pub sx: u8,
+    pub sy: u8,
+    pub sz: u8,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -104,7 +122,7 @@ impl TerrainConfig {
 
     pub fn balanced() -> Self {
         Self {
-            base_height: (WORLD_HEIGHT as f32) * 0.50,
+            base_height: 340.0,
             macro_scale: 0.012,
             macro_amplitude: 8.0,
             detail_scale: 0.045,
@@ -144,7 +162,7 @@ impl TerrainConfig {
 
     pub fn canyon() -> Self {
         Self {
-            base_height: (WORLD_HEIGHT as f32) * 0.44,
+            base_height: 316.0,
             macro_amplitude: 6.0,
             mountain_amplitude: 5.0,
             valley_depth: 12.0,
@@ -212,7 +230,9 @@ impl TerrainConfig {
     }
 
     pub fn clamp_reasonable(&mut self) {
-        self.base_height = self.base_height.clamp(8.0, (WORLD_HEIGHT - 8) as f32);
+        self.base_height = self
+            .base_height
+            .clamp((WORLD_OVERWORLD_FLOOR + 8) as f32, (WORLD_MAX_Y - 8) as f32);
         self.macro_scale = self.macro_scale.clamp(0.0015, 0.08);
         self.macro_amplitude = self.macro_amplitude.clamp(0.0, 30.0);
         self.detail_scale = self.detail_scale.clamp(0.005, 0.30);
@@ -241,6 +261,7 @@ impl TerrainConfig {
 #[derive(Clone)]
 pub struct World {
     overrides: Arc<RwLock<HashMap<BlockPos, Block>>>,
+    sub_overrides: Arc<RwLock<HashMap<SubBlockPos, Block>>>,
     spawn_point: Vec3,
     seed: i64,
     terrain: TerrainConfig,
@@ -267,13 +288,14 @@ impl World {
     pub fn generate_with_terrain_and_seed(terrain: TerrainConfig, seed: i64) -> Self {
         let mut world = Self {
             overrides: Arc::new(RwLock::new(HashMap::new())),
+            sub_overrides: Arc::new(RwLock::new(HashMap::new())),
             spawn_point: Vec3::ZERO,
             seed,
             terrain,
         };
         world.spawn_point = world
             .spawn_point_for_column(0, 0)
-            .unwrap_or(Vec3::new(0.5, 12.0, 0.5));
+            .unwrap_or(Vec3::new(0.5, (WORLD_OVERWORLD_FLOOR + 3) as f32, 0.5));
         world
     }
 
@@ -282,7 +304,7 @@ impl World {
     }
 
     pub fn is_out_of_bounds(&self, position: Vec3, margin: f32) -> bool {
-        position.y < -margin
+        position.y < WORLD_MIN_Y as f32 - margin
     }
 
     pub fn world_to_chunk(x: i64, z: i64) -> (i64, i64) {
@@ -598,7 +620,7 @@ impl World {
     }
 
     pub fn set_block_i64(&mut self, x: i64, y: i32, z: i64, block: Block) {
-        if !(0..WORLD_HEIGHT).contains(&y) {
+        if !contains_world_y(y) {
             return;
         }
         self.overrides
@@ -607,15 +629,106 @@ impl World {
             .insert(BlockPos { x, y, z }, block);
     }
 
+    pub fn set_sub_block_i64(
+        &mut self,
+        x: i64,
+        y: i32,
+        z: i64,
+        divisions: u8,
+        sx: u8,
+        sy: u8,
+        sz: u8,
+        block: Block,
+    ) -> bool {
+        if !contains_world_y(y) || !valid_sub_coords(divisions, sx, sy, sz) {
+            return false;
+        }
+        let pos = SubBlockPos {
+            x,
+            y,
+            z,
+            divisions,
+            sx,
+            sy,
+            sz,
+        };
+        self.sub_overrides
+            .write()
+            .expect("sub overrides write lock poisoned")
+            .insert(pos, block);
+        true
+    }
+
+    pub fn clear_sub_block_i64(
+        &mut self,
+        x: i64,
+        y: i32,
+        z: i64,
+        divisions: u8,
+        sx: u8,
+        sy: u8,
+        sz: u8,
+    ) -> Option<Block> {
+        if !contains_world_y(y) || !valid_sub_coords(divisions, sx, sy, sz) {
+            return None;
+        }
+        let pos = SubBlockPos {
+            x,
+            y,
+            z,
+            divisions,
+            sx,
+            sy,
+            sz,
+        };
+        self.sub_overrides
+            .write()
+            .expect("sub overrides write lock poisoned")
+            .remove(&pos)
+    }
+
+    pub fn sub_block_i64(
+        &self,
+        x: i64,
+        y: i32,
+        z: i64,
+        divisions: u8,
+        sx: u8,
+        sy: u8,
+        sz: u8,
+    ) -> Option<Block> {
+        if !contains_world_y(y) || !valid_sub_coords(divisions, sx, sy, sz) {
+            return None;
+        }
+        let pos = SubBlockPos {
+            x,
+            y,
+            z,
+            divisions,
+            sx,
+            sy,
+            sz,
+        };
+        self.sub_overrides
+            .read()
+            .expect("sub overrides read lock poisoned")
+            .get(&pos)
+            .copied()
+    }
+
     pub fn spawn_point_for_column(&self, x: i32, z: i32) -> Option<Vec3> {
         let x = x as i64;
         let z = z as i64;
-        for y in (0..WORLD_HEIGHT).rev() {
+        for y in (WORLD_MIN_Y..=WORLD_MAX_Y).rev() {
             if self.block_at(x, y, z).is_solid() {
                 return Some(Vec3::new(x as f32 + 0.5, y as f32 + 1.0, z as f32 + 0.5));
             }
         }
-        Some(Vec3::new(x as f32 + 0.5, 1.0, z as f32 + 0.5))
+        Some(Vec3::new(
+            x as f32 + 0.5,
+            (WORLD_OVERWORLD_FLOOR + 2) as f32,
+            z as f32 + 0.5,
+        ))
     }
 
     fn build_chunk_mesh_with_overrides(
@@ -629,7 +742,26 @@ impl World {
         let y_extent = WORLD_HEIGHT as usize;
         let layer_stride = xz_extent * xz_extent;
         let mut block_ids = vec![Block::Air.to_id(); layer_stride * y_extent];
-        let mut column_top = vec![0_usize; xz_extent * xz_extent];
+        let mut column_top = vec![WORLD_MIN_Y; xz_extent * xz_extent];
+        let min_x = base_x - 1;
+        let max_x = base_x + CHUNK_SIZE;
+        let min_z = base_z - 1;
+        let max_z = base_z + CHUNK_SIZE;
+        let mut min_fill_y = WORLD_OVERWORLD_FLOOR - 32;
+
+        if !overrides.is_empty() {
+            for (pos, _) in overrides {
+                if !contains_world_y(pos.y) {
+                    continue;
+                }
+                if pos.x < min_x || pos.x > max_x || pos.z < min_z || pos.z > max_z {
+                    continue;
+                }
+                if pos.y < min_fill_y {
+                    min_fill_y = (pos.y - 1).max(WORLD_MIN_Y);
+                }
+            }
+        }
 
         let grid_index = |x: usize, y: usize, z: usize| y * layer_stride + z * xz_extent + x;
         let column_index = |x: usize, z: usize| z * xz_extent + x;
@@ -640,22 +772,21 @@ impl World {
             for local_x in 0..xz_extent {
                 let world_x = base_x + local_x as i64 - 1;
                 let surface_y = self.surface_height(world_x, world_z);
-                let clamped_top = surface_y.clamp(0, WORLD_HEIGHT - 1) as usize;
+                let clamped_top = surface_y.clamp(WORLD_MIN_Y, WORLD_MAX_Y);
                 column_top[column_index(local_x, local_z)] = clamped_top;
-                for y in 0..=clamped_top {
-                    let block = procedural_block_for_height(surface_y, y as i32);
-                    block_ids[grid_index(local_x, y, local_z)] = block.to_id();
+                for y in min_fill_y..=clamped_top {
+                    let Some(yi) = world_y_to_index(y) else {
+                        continue;
+                    };
+                    let block = self.procedural_block_with_surface(world_x, y, world_z, surface_y);
+                    block_ids[grid_index(local_x, yi, local_z)] = block.to_id();
                 }
             }
         }
 
         if !overrides.is_empty() {
-            let min_x = base_x - 1;
-            let max_x = base_x + CHUNK_SIZE;
-            let min_z = base_z - 1;
-            let max_z = base_z + CHUNK_SIZE;
             for (pos, block) in overrides {
-                if !(0..WORLD_HEIGHT).contains(&pos.y) {
+                if !contains_world_y(pos.y) {
                     continue;
                 }
                 if pos.x < min_x || pos.x > max_x || pos.z < min_z || pos.z > max_z {
@@ -663,12 +794,14 @@ impl World {
                 }
                 let local_x = (pos.x - base_x + 1) as usize;
                 let local_z = (pos.z - base_z + 1) as usize;
-                let y = pos.y as usize;
+                let Some(y) = world_y_to_index(pos.y) else {
+                    continue;
+                };
                 block_ids[grid_index(local_x, y, local_z)] = block.to_id();
                 if block.is_solid() {
                     let top = &mut column_top[column_index(local_x, local_z)];
-                    if y > *top {
-                        *top = y;
+                    if pos.y > *top {
+                        *top = pos.y;
                     }
                 }
             }
@@ -681,10 +814,12 @@ impl World {
             let world_z = base_z + local_z as i64 - 1;
             for local_x in 1..=CHUNK_SIZE as usize {
                 let world_x = base_x + local_x as i64 - 1;
-                let top =
-                    column_top[column_index(local_x, local_z)].min(y_extent.saturating_sub(1));
-                for y in 0..=top {
-                    let block_id = block_ids[grid_index(local_x, y, local_z)];
+                let top = column_top[column_index(local_x, local_z)];
+                for y in min_fill_y..=top {
+                    let Some(yi) = world_y_to_index(y) else {
+                        continue;
+                    };
+                    let block_id = block_ids[grid_index(local_x, yi, local_z)];
                     if block_id == Block::Air.to_id() {
                         continue;
                     }
@@ -693,8 +828,8 @@ impl World {
                     let (top_color, side_color, bottom_color) =
                         self.palette_at(block, world_x, world_z);
 
-                    if y + 1 >= y_extent
-                        || block_ids[grid_index(local_x, y + 1, local_z)] == Block::Air.to_id()
+                    if yi + 1 >= y_extent
+                        || block_ids[grid_index(local_x, yi + 1, local_z)] == Block::Air.to_id()
                     {
                         let light = sample_light(
                             &light_levels,
@@ -702,7 +837,7 @@ impl World {
                             xz_extent,
                             y_extent,
                             local_x,
-                            y + 1,
+                            yi + 1,
                             local_z,
                         );
                         push_quad(
@@ -717,7 +852,8 @@ impl World {
                             Vec3::Y,
                         );
                     }
-                    if y > 0 && block_ids[grid_index(local_x, y - 1, local_z)] == Block::Air.to_id()
+                    if yi > 0
+                        && block_ids[grid_index(local_x, yi - 1, local_z)] == Block::Air.to_id()
                     {
                         let light = sample_light(
                             &light_levels,
@@ -725,7 +861,7 @@ impl World {
                             xz_extent,
                             y_extent,
                             local_x,
-                            y - 1,
+                            yi - 1,
                             local_z,
                         );
                         push_quad(
@@ -740,14 +876,14 @@ impl World {
                             -Vec3::Y,
                         );
                     }
-                    if block_ids[grid_index(local_x - 1, y, local_z)] == Block::Air.to_id() {
+                    if block_ids[grid_index(local_x - 1, yi, local_z)] == Block::Air.to_id() {
                         let light = sample_light(
                             &light_levels,
                             &grid_index,
                             xz_extent,
                             y_extent,
                             local_x - 1,
-                            y,
+                            yi,
                             local_z,
                         );
                         push_quad(
@@ -762,14 +898,14 @@ impl World {
                             -Vec3::X,
                         );
                     }
-                    if block_ids[grid_index(local_x + 1, y, local_z)] == Block::Air.to_id() {
+                    if block_ids[grid_index(local_x + 1, yi, local_z)] == Block::Air.to_id() {
                         let light = sample_light(
                             &light_levels,
                             &grid_index,
                             xz_extent,
                             y_extent,
                             local_x + 1,
-                            y,
+                            yi,
                             local_z,
                         );
                         push_quad(
@@ -784,14 +920,14 @@ impl World {
                             Vec3::X,
                         );
                     }
-                    if block_ids[grid_index(local_x, y, local_z - 1)] == Block::Air.to_id() {
+                    if block_ids[grid_index(local_x, yi, local_z - 1)] == Block::Air.to_id() {
                         let light = sample_light(
                             &light_levels,
                             &grid_index,
                             xz_extent,
                             y_extent,
                             local_x,
-                            y,
+                            yi,
                             local_z - 1,
                         );
                         push_quad(
@@ -806,14 +942,14 @@ impl World {
                             -Vec3::Z,
                         );
                     }
-                    if block_ids[grid_index(local_x, y, local_z + 1)] == Block::Air.to_id() {
+                    if block_ids[grid_index(local_x, yi, local_z + 1)] == Block::Air.to_id() {
                         let light = sample_light(
                             &light_levels,
                             &grid_index,
                             xz_extent,
                             y_extent,
                             local_x,
-                            y,
+                            yi,
                             local_z + 1,
                         );
                         push_quad(
@@ -832,6 +968,25 @@ impl World {
             }
         }
 
+        let sub_overrides = self
+            .sub_overrides
+            .read()
+            .expect("sub overrides read lock poisoned");
+        let chunk_max_x = base_x + CHUNK_SIZE - 1;
+        let chunk_max_z = base_z + CHUNK_SIZE - 1;
+        for (pos, block) in sub_overrides.iter() {
+            if !contains_world_y(pos.y)
+                || pos.x < base_x
+                || pos.x > chunk_max_x
+                || pos.z < base_z
+                || pos.z > chunk_max_z
+                || !block.is_solid()
+            {
+                continue;
+            }
+            add_sub_block_cube(&mut vertices, *pos, *block, self);
+        }
+
         vertices
     }
 
@@ -847,7 +1002,7 @@ impl World {
         y: i32,
         z: i64,
     ) -> Block {
-        if !(0..WORLD_HEIGHT).contains(&y) {
+        if !contains_world_y(y) {
             return Block::Air;
         }
         let key = BlockPos { x, y, z };
@@ -859,10 +1014,29 @@ impl World {
 
     fn procedural_block(&self, x: i64, y: i32, z: i64) -> Block {
         let surface_y = self.surface_height(x, z);
+        self.procedural_block_with_surface(x, y, z, surface_y)
+    }
+
+    fn procedural_block_with_surface(&self, x: i64, y: i32, z: i64, surface_y: i32) -> Block {
         if y > surface_y {
             return Block::Air;
         }
-        procedural_block_for_height(surface_y, y)
+
+        // Carve cave pockets mostly through stone layers beneath the overworld.
+        if y < surface_y - 4
+            && ((WORLD_OVERWORLD_FLOOR - 32)..=WORLD_OVERWORLD_FLOOR).contains(&y)
+            && should_carve_cave(self.seed, x, y, z)
+        {
+            return Block::Air;
+        }
+
+        if y == surface_y && y >= WORLD_OVERWORLD_FLOOR {
+            return Block::Grass;
+        }
+        if y >= surface_y - 2 && y >= WORLD_OVERWORLD_FLOOR - 16 {
+            return Block::Dirt;
+        }
+        crust_block_for_y(y)
     }
 
     fn surface_height(&self, x: i64, z: i64) -> i32 {
@@ -1025,7 +1199,7 @@ impl World {
             height = height * (1.0 - blend) + terraced * blend;
         }
 
-        (height.round() as i32).clamp(2, WORLD_HEIGHT - 4)
+        (height.round() as i32).clamp(WORLD_OVERWORLD_FLOOR, WORLD_MAX_Y - 4)
     }
 
     pub fn surface_height_at(&self, x: i64, z: i64) -> i32 {
@@ -1102,27 +1276,31 @@ impl World {
     }
 
     fn biome_kind_for_chunk(&self, chunk_x: i64, chunk_z: i64) -> BiomeKind {
-        let continent = hash2_to_unit(
+        let fx = chunk_x as f32;
+        let fz = chunk_z as f32;
+        let region = value_noise_2d(
             self.seed ^ 0x6A09E667F3BCC909_u64 as i64,
-            chunk_x.div_euclid(6),
-            chunk_z.div_euclid(6),
+            fx * 0.095,
+            fz * 0.095,
         );
-        let climate =
-            hash2_to_unit(self.seed ^ 0xBB67AE8584CAA73B_u64 as i64, chunk_x, chunk_z) * 0.34;
-        let valley = hash2_to_unit(
+        let moisture = value_noise_2d(
+            self.seed ^ 0xBB67AE8584CAA73B_u64 as i64,
+            fx * 0.11 + 21.3,
+            fz * 0.11 - 37.8,
+        );
+        let relief = value_noise_2d(
             self.seed ^ 0x3C6EF372FE94F82B_u64 as i64,
-            chunk_x.div_euclid(2),
-            chunk_z.div_euclid(2),
-        )
-        .abs();
-        let continentality = continent + climate * 0.55;
-        if continentality < -0.34 {
+            fx * 0.13 - 17.0,
+            fz * 0.13 + 9.0,
+        );
+        let continentality = region * 0.72 + relief * 0.28;
+        if continentality < -0.36 {
             BiomeKind::Ocean
-        } else if continentality > 0.30 {
+        } else if relief > 0.34 || continentality > 0.36 {
             BiomeKind::Mountain
-        } else if climate > 0.20 {
+        } else if moisture < -0.24 {
             BiomeKind::Desert
-        } else if valley > 0.44 {
+        } else if region < -0.06 && moisture > 0.08 {
             BiomeKind::Valley
         } else {
             BiomeKind::Meadow
@@ -1273,8 +1451,95 @@ fn apply_light(color: [f32; 3], light_level: u8, face_shade: f32) -> [f32; 3] {
 
 fn block_light_emission(block: Block) -> u8 {
     match block {
-        Block::Air | Block::Grass | Block::Dirt | Block::Stone => 0,
+        Block::Air | Block::Grass | Block::Dirt | Block::Stone | Block::Deepslate | Block::DeepDark => 0,
     }
+}
+
+fn valid_sub_coords(divisions: u8, sx: u8, sy: u8, sz: u8) -> bool {
+    (divisions == 3 || divisions == 6)
+        && sx < divisions
+        && sy < divisions
+        && sz < divisions
+}
+
+fn add_sub_block_cube(vertices: &mut Vec<Vertex>, pos: SubBlockPos, block: Block, world: &World) {
+    if !valid_sub_coords(pos.divisions, pos.sx, pos.sy, pos.sz) {
+        return;
+    }
+    let step = 1.0 / pos.divisions as f32;
+    let bx = pos.x as f32 + pos.sx as f32 * step;
+    let by = pos.y as f32 + pos.sy as f32 * step;
+    let bz = pos.z as f32 + pos.sz as f32 * step;
+    let min = Vec3::new(bx, by, bz);
+    let max = min + Vec3::splat(step);
+    let (top_color, side_color, bottom_color) = world.palette_at(block, pos.x, pos.z);
+
+    push_quad(
+        vertices,
+        [
+            Vec3::new(min.x, max.y, min.z),
+            Vec3::new(min.x, max.y, max.z),
+            Vec3::new(max.x, max.y, max.z),
+            Vec3::new(max.x, max.y, min.z),
+        ],
+        top_color,
+        Vec3::Y,
+    );
+    push_quad(
+        vertices,
+        [
+            Vec3::new(min.x, min.y, max.z),
+            Vec3::new(min.x, min.y, min.z),
+            Vec3::new(max.x, min.y, min.z),
+            Vec3::new(max.x, min.y, max.z),
+        ],
+        bottom_color,
+        -Vec3::Y,
+    );
+    push_quad(
+        vertices,
+        [
+            Vec3::new(min.x, min.y, min.z),
+            Vec3::new(min.x, min.y, max.z),
+            Vec3::new(min.x, max.y, max.z),
+            Vec3::new(min.x, max.y, min.z),
+        ],
+        side_color,
+        -Vec3::X,
+    );
+    push_quad(
+        vertices,
+        [
+            Vec3::new(max.x, min.y, max.z),
+            Vec3::new(max.x, min.y, min.z),
+            Vec3::new(max.x, max.y, min.z),
+            Vec3::new(max.x, max.y, max.z),
+        ],
+        side_color,
+        Vec3::X,
+    );
+    push_quad(
+        vertices,
+        [
+            Vec3::new(max.x, min.y, min.z),
+            Vec3::new(min.x, min.y, min.z),
+            Vec3::new(min.x, max.y, min.z),
+            Vec3::new(max.x, max.y, min.z),
+        ],
+        side_color,
+        -Vec3::Z,
+    );
+    push_quad(
+        vertices,
+        [
+            Vec3::new(min.x, min.y, max.z),
+            Vec3::new(max.x, min.y, max.z),
+            Vec3::new(max.x, max.y, max.z),
+            Vec3::new(min.x, max.y, max.z),
+        ],
+        side_color,
+        Vec3::Z,
+    );
 }
 
 fn wave_curve(seed: i64, along_axis: f32, x: f32, z: f32) -> f32 {
@@ -1391,23 +1656,149 @@ fn div_floor(value: i64, divisor: i64) -> i64 {
     result
 }
 
-fn procedural_block_for_height(surface_y: i32, y: i32) -> Block {
-    if y == surface_y {
-        return Block::Grass;
+fn contains_world_y(y: i32) -> bool {
+    (WORLD_MIN_Y..=WORLD_MAX_Y).contains(&y)
+}
+
+fn world_y_to_index(y: i32) -> Option<usize> {
+    if contains_world_y(y) {
+        Some((y - WORLD_MIN_Y) as usize)
+    } else {
+        None
     }
-    if y >= surface_y - 2 {
-        return Block::Dirt;
+}
+
+fn crust_block_for_y(y: i32) -> Block {
+    if y < -128 {
+        Block::DeepDark
+    } else if y < 0 {
+        Block::Deepslate
+    } else {
+        Block::Stone
     }
-    Block::Stone
+}
+
+fn should_carve_cave(seed: i64, x: i64, y: i32, z: i64) -> bool {
+    if !((WORLD_OVERWORLD_FLOOR - 96)..=(WORLD_OVERWORLD_FLOOR - 4)).contains(&y) {
+        return false;
+    }
+
+    let xf = x as f32;
+    let yf = y as f32;
+    let zf = z as f32;
+
+    let coarse_gate = value_noise_3d(
+        seed.wrapping_add(0xD131_0BA6),
+        xf * 0.018,
+        yf * 0.022,
+        zf * 0.018,
+    );
+    if coarse_gate < 0.18 {
+        return false;
+    }
+
+    // Domain warp gives tunnels organic bends instead of grid-aligned blobs.
+    let warp_x = value_noise_3d(
+        seed.wrapping_add(0x9E37_79B9),
+        xf * 0.012,
+        yf * 0.016,
+        zf * 0.012,
+    ) * 9.0;
+    let warp_z = value_noise_3d(
+        seed.wrapping_add(0x243F_6A88),
+        xf * 0.012 + 81.0,
+        yf * 0.016 - 53.0,
+        zf * 0.012 + 29.0,
+    ) * 9.0;
+
+    let wx = xf + warp_x;
+    let wz = zf + warp_z;
+
+    // Worm-like tunnels (ridged field around curving center-lines).
+    let tunnel_path = value_noise_3d(
+        seed.wrapping_add(0xB7E1_5163),
+        wx * 0.030,
+        yf * 0.028,
+        wz * 0.030,
+    );
+    let tunnel_cross = value_noise_3d(
+        seed.wrapping_add(0x94D0_49BB),
+        wx * 0.060 + 117.0,
+        yf * 0.040 - 41.0,
+        wz * 0.060 - 73.0,
+    );
+    let worm_tunnel = (1.0 - (tunnel_path - tunnel_cross * 0.35).abs()).powf(2.2);
+
+    // Chamber pockets to create larger caverns linked by tunnels.
+    let chamber_field = value_noise_3d(
+        seed.wrapping_add(0xA54F_F53A),
+        wx * 0.016,
+        yf * 0.020,
+        wz * 0.016,
+    );
+    let chamber_detail = value_noise_3d(
+        seed.wrapping_add(0x510E_527F),
+        wx * 0.035 + 9.0,
+        yf * 0.030 + 13.0,
+        wz * 0.035 - 5.0,
+    );
+    let chambers = (chamber_field * 0.78 + chamber_detail * 0.22) > 0.58;
+
+    let depth_boost = if y < 0 { 0.04 } else { 0.0 };
+    worm_tunnel > 0.71 - depth_boost || chambers
+}
+
+fn value_noise_3d(seed: i64, x: f32, y: f32, z: f32) -> f32 {
+    let x0 = x.floor() as i64;
+    let y0 = y.floor() as i64;
+    let z0 = z.floor() as i64;
+    let x1 = x0 + 1;
+    let y1 = y0 + 1;
+    let z1 = z0 + 1;
+
+    let tx = smoothstep(x - x.floor());
+    let ty = smoothstep(y - y.floor());
+    let tz = smoothstep(z - z.floor());
+
+    let c000 = hash3_to_unit(seed, x0, y0, z0);
+    let c100 = hash3_to_unit(seed, x1, y0, z0);
+    let c010 = hash3_to_unit(seed, x0, y1, z0);
+    let c110 = hash3_to_unit(seed, x1, y1, z0);
+    let c001 = hash3_to_unit(seed, x0, y0, z1);
+    let c101 = hash3_to_unit(seed, x1, y0, z1);
+    let c011 = hash3_to_unit(seed, x0, y1, z1);
+    let c111 = hash3_to_unit(seed, x1, y1, z1);
+
+    let x00 = lerp(c000, c100, tx);
+    let x10 = lerp(c010, c110, tx);
+    let x01 = lerp(c001, c101, tx);
+    let x11 = lerp(c011, c111, tx);
+    let y0 = lerp(x00, x10, ty);
+    let y1 = lerp(x01, x11, ty);
+    lerp(y0, y1, tz)
+}
+
+fn hash3_to_unit(seed: i64, x: i64, y: i64, z: i64) -> f32 {
+    let mut h = seed as u64;
+    h ^= (x as u64).wrapping_mul(0x9E37_79B1_85EB_CA87);
+    h ^= (y as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    h ^= (z as u64).wrapping_mul(0x1656_67B1_9E37_79F9);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xC4CE_B9FE_1A85_EC53);
+    h ^= h >> 33;
+    let u = (h as f64) / (u64::MAX as f64);
+    (u as f32) * 2.0 - 1.0
 }
 
 fn palette(block: Block, x: i64, z: i64, biome: BiomeKind) -> ([f32; 3], [f32; 3], [f32; 3]) {
     let biome_tint = match biome {
-        BiomeKind::Ocean => [0.72, 0.90, 1.08],
+        BiomeKind::Ocean => [0.62, 0.82, 1.14],
         BiomeKind::Meadow => [1.00, 1.00, 1.00],
-        BiomeKind::Valley => [0.92, 1.04, 0.92],
-        BiomeKind::Mountain => [0.86, 0.90, 0.95],
-        BiomeKind::Desert => [1.10, 1.02, 0.82],
+        BiomeKind::Valley => [0.84, 1.08, 0.84],
+        BiomeKind::Mountain => [0.78, 0.84, 0.92],
+        BiomeKind::Desert => [1.22, 1.06, 0.70],
     };
     let tint = |color: [f32; 3]| -> [f32; 3] {
         [
@@ -1439,6 +1830,16 @@ fn palette(block: Block, x: i64, z: i64, biome: BiomeKind) -> ([f32; 3], [f32; 3
             tint([0.48, 0.50, 0.53]),
             tint([0.35, 0.36, 0.39]),
         ),
+        Block::Deepslate => (
+            tint([0.34, 0.36, 0.39]),
+            tint([0.28, 0.30, 0.33]),
+            tint([0.22, 0.24, 0.27]),
+        ),
+        Block::DeepDark => (
+            tint([0.06, 0.08, 0.09]),
+            tint([0.04, 0.06, 0.07]),
+            tint([0.02, 0.03, 0.04]),
+        ),
         Block::Air => ([0.0; 3], [0.0; 3], [0.0; 3]),
     }
 }
@@ -1454,7 +1855,7 @@ mod tests {
         for z in -128..=128 {
             for x in -128..=128 {
                 let y = world.surface_height(x, z);
-                assert!((2..=(WORLD_HEIGHT - 4)).contains(&y));
+                assert!((WORLD_OVERWORLD_FLOOR..=(WORLD_MAX_Y - 4)).contains(&y));
             }
         }
     }
@@ -1641,6 +2042,31 @@ mod tests {
         assert!(
             min_luma > 0.01,
             "mesh contains near-black vertices, minimum luma was {min_luma}"
+        );
+    }
+
+    #[test]
+    fn depth_strata_follow_requested_y_bands() {
+        let world = World::generate_with_terrain(TerrainConfig::balanced());
+        assert_eq!(world.block_at_i64(0, -200, 0), Block::DeepDark);
+        assert_eq!(world.block_at_i64(0, -64, 0), Block::Deepslate);
+        assert_eq!(world.block_at_i64(0, 64, 0), Block::Stone);
+    }
+
+    #[test]
+    fn biome_layout_has_diversity_across_medium_region() {
+        let world = World::generate_with_terrain(TerrainConfig::balanced());
+        let mut seen = [false; 5];
+        for cz in -20..=20 {
+            for cx in -20..=20 {
+                let biome = world.biome_kind_for_chunk(cx, cz);
+                seen[biome_index(biome)] = true;
+            }
+        }
+        let unique = seen.into_iter().filter(|v| *v).count();
+        assert!(
+            unique >= 3,
+            "expected at least 3 biome kinds over sample area, found {unique}"
         );
     }
 

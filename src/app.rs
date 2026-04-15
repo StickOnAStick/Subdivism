@@ -21,10 +21,13 @@ use crate::{
     debug_overlay::{DebugOverlay, MenuLayout, OverlayVertex},
     game::{
         actor::{ActorRoster, PLAYER_EYE_HEIGHT},
-        inventory::{BACKPACK_SIZE, HOTBAR_SIZE, Inventory},
+        inventory::{BACKPACK_COLS, BACKPACK_ROWS, BACKPACK_SIZE, HOTBAR_SIZE, Inventory},
         physics::{self, MovementInput, PhysicsConfig},
         terrain_recipe::TerrainRecipe,
-        world::{Block, CHUNK_SIZE, DEFAULT_WORLD_SEED, TerrainConfig, World},
+        world::{
+            Block, CHUNK_SIZE, DEFAULT_WORLD_SEED, TerrainConfig, WORLD_MAX_Y, WORLD_MIN_Y,
+            WORLD_OVERWORLD_FLOOR, World,
+        },
     },
     mesh::Vertex,
     render::{ChunkRenderKey, GpuState, GraphicsSettings, RenderOutcome, celestial_state_for_time},
@@ -142,6 +145,37 @@ enum MenuPage {
 enum InventorySection {
     Hotbar,
     Backpack,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SubdivideScale {
+    Full,
+    Thirds,
+    Sixths,
+}
+
+impl SubdivideScale {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Full => "1X1",
+            Self::Thirds => "3X3",
+            Self::Sixths => "6X6",
+        }
+    }
+
+    fn cycle(self, delta: i32) -> Self {
+        let mut idx = match self {
+            Self::Full => 0_i32,
+            Self::Thirds => 1,
+            Self::Sixths => 2,
+        };
+        idx = (idx + delta).rem_euclid(3);
+        match idx {
+            1 => Self::Thirds,
+            2 => Self::Sixths,
+            _ => Self::Full,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -268,6 +302,8 @@ struct App {
     terrain_lab_selected: usize,
     world_time_seconds: f32,
     graphics_settings: GraphicsSettings,
+    subdivide_scale: SubdivideScale,
+    sub_unit_wallet: HashMap<Block, u16>,
     last_chunk_center: (i64, i64),
     last_frame: Instant,
     next_frame_at: Instant,
@@ -351,6 +387,8 @@ impl App {
             terrain_lab_selected: 0,
             world_time_seconds: 0.0,
             graphics_settings: GraphicsSettings::default(),
+            subdivide_scale: SubdivideScale::Full,
+            sub_unit_wallet: HashMap::new(),
             last_chunk_center: (0, 0),
             last_frame: Instant::now(),
             next_frame_at: Instant::now(),
@@ -866,30 +904,63 @@ impl App {
     fn handle_inventory_navigation(&mut self, code: KeyCode) {
         match code {
             KeyCode::ArrowUp => {
-                self.inventory_cursor.section = InventorySection::Hotbar;
-                self.inventory_cursor.index = self
-                    .inventory_cursor
-                    .index
-                    .min(self.inventory_section_len(InventorySection::Hotbar) - 1);
+                match self.inventory_cursor.section {
+                    InventorySection::Hotbar => {}
+                    InventorySection::Backpack => {
+                        let row = self.inventory_cursor.index / BACKPACK_COLS;
+                        let col = self.inventory_cursor.index % BACKPACK_COLS;
+                        if row == 0 {
+                            self.inventory_cursor.section = InventorySection::Hotbar;
+                            self.inventory_cursor.index = col.min(HOTBAR_SIZE - 1);
+                        } else {
+                            self.inventory_cursor.index -= BACKPACK_COLS;
+                        }
+                    }
+                }
             }
             KeyCode::ArrowDown => {
-                self.inventory_cursor.section = InventorySection::Backpack;
-                self.inventory_cursor.index = self
-                    .inventory_cursor
-                    .index
-                    .min(self.inventory_section_len(InventorySection::Backpack) - 1);
+                match self.inventory_cursor.section {
+                    InventorySection::Hotbar => {
+                        self.inventory_cursor.section = InventorySection::Backpack;
+                        self.inventory_cursor.index = self.inventory_cursor.index.min(BACKPACK_COLS - 1);
+                    }
+                    InventorySection::Backpack => {
+                        let row = self.inventory_cursor.index / BACKPACK_COLS;
+                        if row + 1 < BACKPACK_ROWS {
+                            self.inventory_cursor.index += BACKPACK_COLS;
+                        }
+                    }
+                }
             }
             KeyCode::ArrowLeft => {
-                let len = self.inventory_section_len(self.inventory_cursor.section);
-                self.inventory_cursor.index = if self.inventory_cursor.index == 0 {
-                    len - 1
-                } else {
-                    self.inventory_cursor.index - 1
-                };
+                match self.inventory_cursor.section {
+                    InventorySection::Hotbar => {
+                        self.inventory_cursor.index = if self.inventory_cursor.index == 0 {
+                            HOTBAR_SIZE - 1
+                        } else {
+                            self.inventory_cursor.index - 1
+                        };
+                    }
+                    InventorySection::Backpack => {
+                        let row = self.inventory_cursor.index / BACKPACK_COLS;
+                        let col = self.inventory_cursor.index % BACKPACK_COLS;
+                        let next_col = if col == 0 { BACKPACK_COLS - 1 } else { col - 1 };
+                        self.inventory_cursor.index = row * BACKPACK_COLS + next_col;
+                    }
+                }
             }
             KeyCode::ArrowRight => {
-                let len = self.inventory_section_len(self.inventory_cursor.section);
-                self.inventory_cursor.index = (self.inventory_cursor.index + 1) % len;
+                match self.inventory_cursor.section {
+                    InventorySection::Hotbar => {
+                        self.inventory_cursor.index = (self.inventory_cursor.index + 1) % HOTBAR_SIZE;
+                    }
+                    InventorySection::Backpack => {
+                        let row = self.inventory_cursor.index / BACKPACK_COLS;
+                        let col = self.inventory_cursor.index % BACKPACK_COLS;
+                        let next_col = (col + 1) % BACKPACK_COLS;
+                        self.inventory_cursor.index = row * BACKPACK_COLS + next_col;
+                    }
+                }
             }
             KeyCode::Enter | KeyCode::Space => {
                 self.activate_inventory_selection();
@@ -898,13 +969,6 @@ impl App {
                 self.close_inventory();
             }
             _ => {}
-        }
-    }
-
-    fn inventory_section_len(&self, section: InventorySection) -> usize {
-        match section {
-            InventorySection::Hotbar => HOTBAR_SIZE,
-            InventorySection::Backpack => BACKPACK_SIZE,
         }
     }
 
@@ -1167,32 +1231,42 @@ impl App {
             .inventory
             .backpack_slot(backpack_index)
             .unwrap_or_default();
+        let mut lines = Vec::with_capacity(16);
+        lines.push("ARROWS MOVE ENTER APPLY E CLOSE".to_string());
+        lines.push("HOTBAR 1X8".to_string());
+        lines.push(format_inventory_row(self.inventory.hotbar(), 0, HOTBAR_SIZE));
+        lines.push(format!(
+            "ACTIVE {} {} {}",
+            selected_hotbar + 1,
+            block_label(hotbar_slot.block),
+            hotbar_slot.count
+        ));
+        lines.push("BACKPACK 6X8".to_string());
+        for row in 0..BACKPACK_ROWS {
+            let start = row * BACKPACK_COLS;
+            lines.push(format_inventory_row(
+                self.inventory.backpack(),
+                start,
+                BACKPACK_COLS,
+            ));
+        }
+        lines.push(format!(
+            "CURSOR {} {} {}",
+            if matches!(self.inventory_cursor.section, InventorySection::Hotbar) {
+                "HOTBAR"
+            } else {
+                "BACKPACK"
+            },
+            backpack_index + 1,
+            block_label(backpack_slot.block)
+        ));
+
         let selected_line = match self.inventory_cursor.section {
-            InventorySection::Hotbar => 1,
-            InventorySection::Backpack => 2,
+            InventorySection::Hotbar => 2,
+            InventorySection::Backpack => 5 + self.inventory_cursor.index / BACKPACK_COLS,
         };
 
-        (
-            "INVENTORY".to_string(),
-            vec![
-                "ARROWS MOVE ENTER APPLY".to_string(),
-                format!(
-                    "HOTBAR SLOT {} {} {}",
-                    selected_hotbar + 1,
-                    block_label(hotbar_slot.block),
-                    hotbar_slot.count
-                ),
-                format!(
-                    "BACKPACK SLOT {} {} {}",
-                    backpack_index + 1,
-                    block_label(backpack_slot.block),
-                    backpack_slot.count
-                ),
-                format!("ACTIVE HOTBAR {}", selected_hotbar + 1),
-                "E OR ESC CLOSE".to_string(),
-            ],
-            selected_line,
-        )
+        ("INVENTORY".to_string(), lines, selected_line)
     }
 
     fn terrain_lab_overlay(&self) -> Option<(String, Vec<String>, usize)> {
@@ -1400,14 +1474,18 @@ impl App {
                 slot.count
             ),
             format!(
-                "HB1 {} HB2 {} HB3 {}",
-                hotbar[0].count, hotbar[1].count, hotbar[2].count
+                "HOTBAR {} {} {} {}",
+                hotbar.first().map(|slot| slot.count).unwrap_or(0),
+                hotbar.get(1).map(|slot| slot.count).unwrap_or(0),
+                hotbar.get(2).map(|slot| slot.count).unwrap_or(0),
+                hotbar.get(3).map(|slot| slot.count).unwrap_or(0)
             ),
             format!(
                 "INV {} OF {}",
                 self.inventory.filled_slots(),
                 self.inventory.slot_capacity()
             ),
+            format!("BUILD SCALE {}", self.subdivide_scale.label()),
         ];
         if self.dev_mode {
             lines.push(format!(
@@ -1463,32 +1541,122 @@ impl App {
         vertices
     }
 
+    fn gameplay_overlay_vertices(&self, screen_size: [f32; 2]) -> Vec<OverlayVertex> {
+        let mut vertices = Vec::new();
+        self.push_hotbar_overlay(&mut vertices, screen_size);
+        self.push_held_item_overlay(&mut vertices, screen_size);
+        if self.subdivide_scale != SubdivideScale::Full && self.input.mouse_captured {
+            self.push_subdivision_overlay(&mut vertices, screen_size);
+        }
+        vertices
+    }
+
+    fn push_hotbar_overlay(&self, vertices: &mut Vec<OverlayVertex>, screen_size: [f32; 2]) {
+        let slot_w = 56.0_f32;
+        let slot_h = 42.0_f32;
+        let gap = 8.0_f32;
+        let total_w = HOTBAR_SIZE as f32 * slot_w + (HOTBAR_SIZE.saturating_sub(1)) as f32 * gap;
+        let start_x = (screen_size[0] - total_w) * 0.5;
+        let y = screen_size[1] - slot_h - 18.0;
+        let hotbar = self.inventory.hotbar();
+
+        for (i, slot) in hotbar.iter().enumerate() {
+            let x = start_x + i as f32 * (slot_w + gap);
+            let selected = i == self.inventory.selected_hotbar_index();
+            let bg = if selected {
+                [0.18, 0.30, 0.28, 0.88]
+            } else {
+                [0.05, 0.07, 0.08, 0.76]
+            };
+            let border = if selected {
+                [0.82, 0.95, 0.90, 0.90]
+            } else {
+                [0.24, 0.30, 0.33, 0.72]
+            };
+            DebugOverlay::add_quad(vertices, x, y, slot_w, slot_h, border);
+            DebugOverlay::add_quad(vertices, x + 2.0, y + 2.0, slot_w - 4.0, slot_h - 4.0, bg);
+
+            let swatch = block_tint_color(slot.block);
+            DebugOverlay::add_quad(vertices, x + 8.0, y + 9.0, 16.0, 16.0, swatch);
+            let label = if slot.is_empty() {
+                "___".to_string()
+            } else {
+                format!("{}{:02}", block_short_code(slot.block), slot.count.min(99))
+            };
+            DebugOverlay::add_text(vertices, x + 28.0, y + 12.0, &label, 2.0, [0.90, 0.95, 0.93, 1.0]);
+        }
+    }
+
+    fn push_held_item_overlay(&self, vertices: &mut Vec<OverlayVertex>, screen_size: [f32; 2]) {
+        let slot = self.inventory.selected_slot();
+        if slot.is_empty() {
+            return;
+        }
+        let x = screen_size[0] - 66.0;
+        let y = screen_size[1] - 82.0;
+        let tint = block_tint_color(slot.block);
+        DebugOverlay::add_quad(vertices, x, y, 22.0, 22.0, [0.02, 0.03, 0.04, 0.75]);
+        DebugOverlay::add_quad(vertices, x + 3.0, y + 3.0, 16.0, 16.0, tint);
+    }
+
+    fn push_subdivision_overlay(&self, vertices: &mut Vec<OverlayVertex>, screen_size: [f32; 2]) {
+        let camera = self.active_camera();
+        let Some(hit) = raycast_world_detailed(
+            &self.world,
+            camera.position,
+            camera.forward(),
+            7.0,
+            0.03,
+        ) else {
+            return;
+        };
+
+        let divisions = self.current_divisions();
+        let plane = face_plane_points(hit.cell, hit.normal, divisions);
+        let color = [0.92, 0.97, 0.88, 0.88];
+        for (a, b) in plane {
+            if let (Some(pa), Some(pb)) = (
+                world_to_screen(camera, a, screen_size[0], screen_size[1]),
+                world_to_screen(camera, b, screen_size[0], screen_size[1]),
+            ) {
+                push_screen_line(vertices, pa, pb, 1.5, color);
+            }
+        }
+    }
+
     fn edit_block_from_click(&mut self, remove: bool) {
         if self.ui_mode != UiMode::Playing {
             return;
         }
         let camera = self.active_camera();
-        let Some((hit, previous)) =
-            raycast_world(&self.world, camera.position, camera.forward(), 7.0, 0.05)
+        let Some(hit) = raycast_world_detailed(&self.world, camera.position, camera.forward(), 7.0, 0.03)
         else {
             return;
         };
 
+        if self.subdivide_scale != SubdivideScale::Full {
+            let did_sub_edit = self.edit_sub_block_from_click(remove, hit);
+            if did_sub_edit {
+                return;
+            }
+        }
+
         if remove {
-            let block = self.world.block_at_i64(hit.0, hit.1, hit.2);
+            let block = self.world.block_at_i64(hit.cell.0, hit.cell.1, hit.cell.2);
             if matches!(block, Block::Air) {
                 return;
             }
             if !self.inventory.add_block(block) {
                 return;
             }
-            self.world.set_block_i64(hit.0, hit.1, hit.2, Block::Air);
-            self.mark_block_change_dirty(hit.0, hit.2);
+            self.world
+                .set_block_i64(hit.cell.0, hit.cell.1, hit.cell.2, Block::Air);
+            self.mark_block_change_dirty(hit.cell.0, hit.cell.2);
             return;
         }
 
-        let place = previous;
-        if place.1 <= 0 || place.1 >= 63 {
+        let place = hit.previous;
+        if place.1 <= WORLD_MIN_Y || place.1 >= WORLD_MAX_Y {
             return;
         }
 
@@ -1521,6 +1689,133 @@ impl App {
         self.world
             .set_block_i64(place.0, place.1, place.2, block_to_place);
         self.mark_block_change_dirty(place.0, place.2);
+    }
+
+    fn cycle_subdivide_scale(&mut self, delta: i32) {
+        self.subdivide_scale = self.subdivide_scale.cycle(delta);
+    }
+
+    fn current_divisions(&self) -> u8 {
+        match self.subdivide_scale {
+            SubdivideScale::Full => 1,
+            SubdivideScale::Thirds => 3,
+            SubdivideScale::Sixths => 6,
+        }
+    }
+
+    fn sub_piece_cost_units(&self) -> u16 {
+        match self.subdivide_scale {
+            SubdivideScale::Thirds => 2,
+            SubdivideScale::Sixths => 1,
+            SubdivideScale::Full => 6,
+        }
+    }
+
+    fn spend_sub_units(&mut self, block: Block, units: u16) -> bool {
+        let wallet = self.sub_unit_wallet.entry(block).or_insert(0);
+        while *wallet < units {
+            if !self.inventory.try_take_selected_matching(block) {
+                return false;
+            }
+            *wallet += 6;
+        }
+        *wallet -= units;
+        true
+    }
+
+    fn refund_sub_units(&mut self, block: Block, units: u16) {
+        if !block.is_solid() {
+            return;
+        }
+        let wallet = self.sub_unit_wallet.entry(block).or_insert(0);
+        *wallet += units;
+        while *wallet >= 6 {
+            if self.inventory.add_block(block) {
+                *wallet -= 6;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn edit_sub_block_from_click(&mut self, remove: bool, hit: RaycastHit) -> bool {
+        let divisions = self.current_divisions();
+        if divisions <= 1 {
+            return false;
+        }
+        if remove {
+            let probe = hit.point - hit.normal.as_vec3() * 0.001;
+            let target = sub_target_from_world_point(hit.cell, probe, divisions);
+            if let Some(block) = self.world.clear_sub_block_i64(
+                target.base.0,
+                target.base.1,
+                target.base.2,
+                divisions,
+                target.sx,
+                target.sy,
+                target.sz,
+            ) {
+                self.refund_sub_units(block, self.sub_piece_cost_units());
+                self.mark_block_change_dirty(target.base.0, target.base.2);
+                return true;
+            }
+            return false;
+        }
+
+        let Some(slot_block) = self
+            .inventory
+            .hotbar()
+            .get(self.inventory.selected_hotbar_index())
+            .copied()
+            .map(|slot| slot.block)
+        else {
+            return false;
+        };
+        if !slot_block.is_solid() {
+            return false;
+        }
+
+        let place_point = hit.point + hit.normal.as_vec3() * 0.001;
+        let target = sub_target_from_world_point(hit.previous, place_point, divisions);
+        if !matches!(
+            self.world.block_at_i64(target.base.0, target.base.1, target.base.2),
+            Block::Air
+        ) {
+            return false;
+        }
+        if self
+            .world
+            .sub_block_i64(
+                target.base.0,
+                target.base.1,
+                target.base.2,
+                divisions,
+                target.sx,
+                target.sy,
+                target.sz,
+            )
+            .is_some()
+        {
+            return false;
+        }
+
+        if !self.spend_sub_units(slot_block, self.sub_piece_cost_units()) {
+            return false;
+        }
+        if !self.world.set_sub_block_i64(
+            target.base.0,
+            target.base.1,
+            target.base.2,
+            divisions,
+            target.sx,
+            target.sy,
+            target.sz,
+            slot_block,
+        ) {
+            return false;
+        }
+        self.mark_block_change_dirty(target.base.0, target.base.2);
+        true
     }
 }
 
@@ -1623,10 +1918,16 @@ impl ApplicationHandler for App {
                 } else {
                     None
                 };
+                let gameplay_overlay = if self.ui_mode == UiMode::Playing {
+                    self.gameplay_overlay_vertices(screen_size)
+                } else {
+                    Vec::new()
+                };
                 let hud_lines = self.hud_lines();
                 let sky_overlay = self.sky_body_overlay();
                 if let Some(gpu) = self.gpu.as_mut() {
                     let mut overlay_vertices = sky_overlay;
+                    overlay_vertices.extend(gameplay_overlay);
                     overlay_vertices.extend(
                         self.debug_overlay
                             .build_vertices(gpu.estimated_gpu_memory_bytes(), &hud_lines),
@@ -1705,6 +2006,21 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(pos) => pos.y as f32 / 40.0,
                 };
+                if self.ui_mode == UiMode::Playing
+                    && self.input.mouse_captured
+                    && raycast_world_detailed(
+                        &self.world,
+                        self.active_camera().position,
+                        self.active_camera().forward(),
+                        7.0,
+                        0.03,
+                    )
+                    .is_some()
+                    && delta_y.abs() > f32::EPSILON
+                {
+                    self.cycle_subdivide_scale(if delta_y > 0.0 { 1 } else { -1 });
+                    return;
+                }
                 self.handle_menu_wheel(delta_y);
                 self.handle_terrain_lab_wheel(delta_y);
             }
@@ -1735,6 +2051,16 @@ impl ApplicationHandler for App {
                     return;
                 }
                 if self.input.mouse_captured {
+                    let ctrl_held =
+                        self.input.key(KeyCode::ControlLeft) || self.input.key(KeyCode::ControlRight);
+                    if ctrl_held {
+                        match button {
+                            MouseButton::Left => self.cycle_subdivide_scale(-1),
+                            MouseButton::Right => self.cycle_subdivide_scale(1),
+                            _ => {}
+                        }
+                        return;
+                    }
                     match button {
                         MouseButton::Left => self.edit_block_from_click(true),
                         MouseButton::Right => self.edit_block_from_click(false),
@@ -1829,7 +2155,6 @@ fn digit_to_hotbar_index(code: KeyCode) -> Option<usize> {
         KeyCode::Digit6 => Some(5),
         KeyCode::Digit7 => Some(6),
         KeyCode::Digit8 => Some(7),
-        KeyCode::Digit9 => Some(8),
         _ => None,
     }
 }
@@ -1909,6 +2234,56 @@ fn block_label(block: Block) -> &'static str {
         Block::Grass => "GRASS",
         Block::Dirt => "DIRT",
         Block::Stone => "STONE",
+        Block::Deepslate => "DEEPSLATE",
+        Block::DeepDark => "DEEPDARK",
+    }
+}
+
+fn format_inventory_row(
+    slots: &[crate::game::inventory::InventorySlot],
+    start: usize,
+    width: usize,
+) -> String {
+    let mut out = String::new();
+    for i in 0..width {
+        let idx = start + i;
+        let slot = slots.get(idx).copied().unwrap_or_default();
+        let token = if slot.is_empty() {
+            "___".to_string()
+        } else {
+            format!(
+                "{}{:02}",
+                block_short_code(slot.block),
+                slot.count.min(99)
+            )
+        };
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&token);
+    }
+    out
+}
+
+fn block_short_code(block: Block) -> &'static str {
+    match block {
+        Block::Air => "_",
+        Block::Grass => "G",
+        Block::Dirt => "D",
+        Block::Stone => "S",
+        Block::Deepslate => "L",
+        Block::DeepDark => "K",
+    }
+}
+
+fn block_tint_color(block: Block) -> [f32; 4] {
+    match block {
+        Block::Air => [0.15, 0.17, 0.18, 0.35],
+        Block::Grass => [0.34, 0.72, 0.36, 0.95],
+        Block::Dirt => [0.42, 0.29, 0.20, 0.95],
+        Block::Stone => [0.56, 0.58, 0.60, 0.95],
+        Block::Deepslate => [0.35, 0.37, 0.40, 0.95],
+        Block::DeepDark => [0.08, 0.10, 0.11, 0.95],
     }
 }
 
@@ -1972,7 +2347,7 @@ fn terrain_param_step(key: &str) -> f32 {
 
 fn terrain_param_min(key: &str) -> f32 {
     match key {
-        "base_height" => 8.0,
+        "base_height" => (WORLD_OVERWORLD_FLOOR + 8) as f32,
         "macro_scale" => 0.0015,
         "macro_amplitude" => 0.0,
         "detail_scale" => 0.005,
@@ -2001,7 +2376,7 @@ fn terrain_param_min(key: &str) -> f32 {
 
 fn terrain_param_max(key: &str) -> f32 {
     match key {
-        "base_height" => 56.0,
+        "base_height" => (WORLD_MAX_Y - 8) as f32,
         "macro_scale" => 0.08,
         "macro_amplitude" => 30.0,
         "detail_scale" => 0.30,
@@ -2084,13 +2459,42 @@ fn random_i32_inclusive(state: &mut u64, min: i32, max: i32) -> i32 {
     min + (value as u32 % span) as i32
 }
 
-fn raycast_world(
+#[derive(Clone, Copy)]
+struct FaceNormal {
+    x: i32,
+    y: i32,
+    z: i32,
+}
+
+impl FaceNormal {
+    fn as_vec3(self) -> Vec3 {
+        Vec3::new(self.x as f32, self.y as f32, self.z as f32)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RaycastHit {
+    cell: (i64, i32, i64),
+    previous: (i64, i32, i64),
+    point: Vec3,
+    normal: FaceNormal,
+}
+
+#[derive(Clone, Copy)]
+struct SubTarget {
+    base: (i64, i32, i64),
+    sx: u8,
+    sy: u8,
+    sz: u8,
+}
+
+fn raycast_world_detailed(
     world: &World,
     origin: Vec3,
     direction: Vec3,
     max_distance: f32,
     step: f32,
-) -> Option<((i64, i32, i64), (i64, i32, i64))> {
+) -> Option<RaycastHit> {
     let dir = direction.normalize_or_zero();
     if dir.length_squared() <= f32::EPSILON {
         return None;
@@ -2103,7 +2507,17 @@ fn raycast_world(
         let cell = voxel_coords(point);
         if cell != previous {
             if world.is_solid_i64(cell.0, cell.1, cell.2) {
-                return Some((cell, previous));
+                let normal = FaceNormal {
+                    x: (previous.0 - cell.0).clamp(-1, 1) as i32,
+                    y: (previous.1 - cell.1).clamp(-1, 1),
+                    z: (previous.2 - cell.2).clamp(-1, 1) as i32,
+                };
+                return Some(RaycastHit {
+                    cell,
+                    previous,
+                    point,
+                    normal,
+                });
             }
             previous = cell;
         }
@@ -2119,6 +2533,20 @@ fn voxel_coords(point: Vec3) -> (i64, i32, i64) {
         point.y.floor() as i32,
         point.z.floor() as i64,
     )
+}
+
+fn sub_target_from_world_point(base: (i64, i32, i64), point: Vec3, divisions: u8) -> SubTarget {
+    let d = divisions.max(1) as f32;
+    let local = point - Vec3::new(base.0 as f32, base.1 as f32, base.2 as f32);
+    let to_index = |value: f32| -> u8 {
+        (value.clamp(0.0, 0.9999) * d).floor() as u8
+    };
+    SubTarget {
+        base,
+        sx: to_index(local.x),
+        sy: to_index(local.y),
+        sz: to_index(local.z),
+    }
 }
 
 fn direction_to_screen(
@@ -2143,6 +2571,114 @@ fn direction_to_screen(
     let x = (ndc.x * 0.5 + 0.5) * width;
     let y = (1.0 - (ndc.y * 0.5 + 0.5)) * height;
     Some((x, y))
+}
+
+fn world_to_screen(camera: Camera, point: Vec3, width: f32, height: f32) -> Option<(f32, f32)> {
+    let clip = camera.view_proj() * point.extend(1.0);
+    if clip.w <= 0.0 {
+        return None;
+    }
+    let ndc = clip.truncate() / clip.w;
+    if ndc.z < 0.0 || ndc.z > 1.0 {
+        return None;
+    }
+    let x = (ndc.x * 0.5 + 0.5) * width;
+    let y = (1.0 - (ndc.y * 0.5 + 0.5)) * height;
+    Some((x, y))
+}
+
+fn face_plane_points(
+    cell: (i64, i32, i64),
+    normal: FaceNormal,
+    divisions: u8,
+) -> Vec<(Vec3, Vec3)> {
+    let d = divisions.max(1) as f32;
+    let mut lines = Vec::with_capacity((divisions as usize + 1) * 2);
+    let eps = 0.002_f32;
+    let bx = cell.0 as f32;
+    let by = cell.1 as f32;
+    let bz = cell.2 as f32;
+    let normal_vec = normal.as_vec3() * eps;
+
+    for i in 0..=divisions {
+        let t = i as f32 / d;
+        let (a0, a1, b0, b1) = if normal.x != 0 {
+            let fx = bx + if normal.x > 0 { 1.0 } else { 0.0 };
+            (
+                Vec3::new(fx, by + t, bz),
+                Vec3::new(fx, by + t, bz + 1.0),
+                Vec3::new(fx, by, bz + t),
+                Vec3::new(fx, by + 1.0, bz + t),
+            )
+        } else if normal.y != 0 {
+            let fy = by + if normal.y > 0 { 1.0 } else { 0.0 };
+            (
+                Vec3::new(bx + t, fy, bz),
+                Vec3::new(bx + t, fy, bz + 1.0),
+                Vec3::new(bx, fy, bz + t),
+                Vec3::new(bx + 1.0, fy, bz + t),
+            )
+        } else {
+            let fz = bz + if normal.z > 0 { 1.0 } else { 0.0 };
+            (
+                Vec3::new(bx + t, by, fz),
+                Vec3::new(bx + t, by + 1.0, fz),
+                Vec3::new(bx, by + t, fz),
+                Vec3::new(bx + 1.0, by + t, fz),
+            )
+        };
+        lines.push((a0 + normal_vec, a1 + normal_vec));
+        lines.push((b0 + normal_vec, b1 + normal_vec));
+    }
+
+    lines
+}
+
+fn push_screen_line(
+    vertices: &mut Vec<OverlayVertex>,
+    a: (f32, f32),
+    b: (f32, f32),
+    thickness: f32,
+    color: [f32; 4],
+) {
+    let dx = b.0 - a.0;
+    let dy = b.1 - a.1;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len <= f32::EPSILON {
+        return;
+    }
+    let nx = -dy / len * (thickness * 0.5);
+    let ny = dx / len * (thickness * 0.5);
+    let p0 = [a.0 + nx, a.1 + ny];
+    let p1 = [b.0 + nx, b.1 + ny];
+    let p2 = [b.0 - nx, b.1 - ny];
+    let p3 = [a.0 - nx, a.1 - ny];
+    vertices.extend_from_slice(&[
+        OverlayVertex {
+            position: p0,
+            color,
+        },
+        OverlayVertex {
+            position: p1,
+            color,
+        },
+        OverlayVertex {
+            position: p2,
+            color,
+        },
+        OverlayVertex {
+            position: p0,
+            color,
+        },
+        OverlayVertex {
+            position: p2,
+            color,
+        },
+        OverlayVertex {
+            position: p3,
+            color,
+        },
+    ]);
 }
 
 fn push_circle(

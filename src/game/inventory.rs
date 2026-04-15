@@ -1,7 +1,9 @@
 use super::world::Block;
 
-pub const HOTBAR_SIZE: usize = 9;
-pub const BACKPACK_SIZE: usize = 27;
+pub const HOTBAR_SIZE: usize = 8;
+pub const BACKPACK_ROWS: usize = 6;
+pub const BACKPACK_COLS: usize = 8;
+pub const BACKPACK_SIZE: usize = BACKPACK_ROWS * BACKPACK_COLS;
 const STACK_LIMIT: u32 = 99;
 
 #[derive(Clone, Copy)]
@@ -118,6 +120,18 @@ impl Inventory {
             slot.block = Block::Air;
         }
         Some(block)
+    }
+
+    pub fn try_take_selected_matching(&mut self, expected: Block) -> bool {
+        let slot = &mut self.hotbar[self.selected_hotbar];
+        if slot.is_empty() || slot.block != expected {
+            return false;
+        }
+        slot.count -= 1;
+        if slot.count == 0 {
+            slot.block = Block::Air;
+        }
+        true
     }
 
     pub fn move_backpack_slot_to_hotbar(

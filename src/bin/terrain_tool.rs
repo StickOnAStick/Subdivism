@@ -6,7 +6,7 @@ use std::{
 use subdivism::game::{
     asset_registry::{AssetRegistry, BiomeEntry, TextureEntry},
     terrain_recipe::TerrainRecipe,
-    world::{TerrainConfig, WORLD_HEIGHT},
+    world::{TerrainConfig, WORLD_MAX_Y, WORLD_OVERWORLD_FLOOR},
 };
 
 fn main() {
@@ -294,7 +294,9 @@ fn apply_description(cfg: &mut TerrainConfig, description: &str) {
         cfg.detail_amplitude *= 0.72;
     }
 
-    cfg.base_height = cfg.base_height.clamp(8.0, (WORLD_HEIGHT - 8) as f32);
+    cfg.base_height = cfg
+        .base_height
+        .clamp((WORLD_OVERWORLD_FLOOR + 8) as f32, (WORLD_MAX_Y - 8) as f32);
     cfg.clamp_reasonable();
 }
 

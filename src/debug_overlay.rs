@@ -284,6 +284,28 @@ impl DebugOverlay {
             item_rects,
         }
     }
+
+    pub fn add_quad(
+        vertices: &mut Vec<OverlayVertex>,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        color: [f32; 4],
+    ) {
+        push_overlay_quad(vertices, x, y, width, height, color);
+    }
+
+    pub fn add_text(
+        vertices: &mut Vec<OverlayVertex>,
+        x: f32,
+        y: f32,
+        text: &str,
+        scale: f32,
+        color: [f32; 4],
+    ) {
+        push_text(vertices, x, y, text, scale, color);
+    }
 }
 
 fn push_overlay_quad(

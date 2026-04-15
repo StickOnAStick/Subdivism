@@ -8,7 +8,7 @@ use std::{
 };
 
 use subdivism::{
-    game::world::{WORLD_HEIGHT, World},
+    game::world::{WORLD_HEIGHT, WORLD_MIN_Y, World},
     render::ChunkRenderKey,
 };
 
@@ -201,7 +201,7 @@ fn run_world_query_probe(world: &World, sample_count: usize) -> f64 {
 
     for _ in 0..sample_count {
         let x = (rand_u64(&mut rng) % 8192) as i64 - 4096;
-        let y = (rand_u64(&mut rng) % WORLD_HEIGHT as u64) as i32;
+        let y = WORLD_MIN_Y + (rand_u64(&mut rng) % WORLD_HEIGHT as u64) as i32;
         let z = (rand_u64(&mut rng) % 8192) as i64 - 4096;
         if world.is_solid_i64(x, y, z) {
             solids += 1;
