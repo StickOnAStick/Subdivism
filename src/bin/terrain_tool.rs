@@ -10,15 +10,22 @@ use subdivism::game::{
 };
 
 fn main() {
+    if let Err(err) = try_main() {
+        eprintln!("{err}");
+        std::process::exit(1);
+    }
+}
+
+fn try_main() -> Result<(), String> {
     let options = ToolOptions::from_env();
     if options.help {
         print_help();
-        return;
+        return Ok(());
     }
 
     if options.has_asset_command() {
-        run_asset_command(&options);
-        return;
+        run_asset_command(&options)?;
+        return Ok(());
     }
 
     let seed = options.seed.unwrap_or_else(default_seed);
@@ -47,7 +54,7 @@ fn main() {
     if let Some(path) = options.out.as_ref() {
         recipe
             .write_to_file(path)
-            .unwrap_or_else(|err| panic!("failed to write recipe {}: {err}", path.display()));
+            .map_err(|err| format!("failed to write recipe {}: {err}", path.display()))?;
         println!("WROTE {}", path.display());
         println!(
             "RUN GAME WITH  cargo run -- --terrain-file {}",
@@ -64,6 +71,7 @@ fn main() {
     println!();
     println!("RECIPE PREVIEW");
     println!("{}", recipe.to_kv_text());
+    Ok(())
 }
 
 #[derive(Default)]
@@ -176,13 +184,13 @@ impl ToolOptions {
     }
 }
 
-fn run_asset_command(options: &ToolOptions) {
+fn run_asset_command(options: &ToolOptions) -> Result<(), String> {
     let path = options
         .assets_file
         .clone()
         .unwrap_or_else(AssetRegistry::default_path);
     let mut registry = AssetRegistry::load_or_default(&path)
-        .unwrap_or_else(|err| panic!("failed to load {}: {err}", path.display()));
+        .map_err(|err| format!("failed to load {}: {err}", path.display()))?;
 
     if let Some((id, tex_path)) = options.assets_add_texture.as_ref() {
         registry.upsert_texture(TextureEntry {
@@ -210,7 +218,7 @@ fn run_asset_command(options: &ToolOptions) {
     if !options.assets_list {
         registry
             .write_to_file(&path)
-            .unwrap_or_else(|err| panic!("failed to write {}: {err}", path.display()));
+            .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
         println!("WROTE {}", path.display());
     }
 
@@ -232,6 +240,7 @@ fn run_asset_command(options: &ToolOptions) {
             biome.bottom_texture
         );
     }
+    Ok(())
 }
 
 fn default_seed() -> i64 {

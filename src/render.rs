@@ -5,7 +5,7 @@ use glam::Vec3;
 use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, window::Window};
 
-use crate::{camera::Camera, debug_overlay::OverlayVertex, mesh::Vertex};
+use crate::{camera::Camera, debug_overlay::OverlayVertex, game::world::CHUNK_SIZE, mesh::Vertex};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -46,6 +46,9 @@ pub struct CelestialState {
 
 #[derive(Clone, Copy, Debug)]
 pub struct GraphicsSettings {
+    pub shadows_enabled: bool,
+    pub fog_enabled: bool,
+    pub atmosphere_enabled: bool,
     pub shader_quality: f32,
     pub ambient_boost: f32,
     pub shadow_softness: f32,
@@ -61,6 +64,9 @@ pub struct GraphicsSettings {
 impl Default for GraphicsSettings {
     fn default() -> Self {
         Self {
+            shadows_enabled: true,
+            fog_enabled: true,
+            atmosphere_enabled: true,
             shader_quality: 0.72,
             ambient_boost: 0.24,
             shadow_softness: 0.70,
@@ -535,17 +541,26 @@ impl GpuState {
             (celestial.ambient + settings.ambient_boost).clamp(0.03, 0.95),
             settings.shader_quality.clamp(0.0, 1.0) + (terrain_seed as f32 * 0.0),
         ];
+        let shadow_enable = if settings.shadows_enabled { 1.0 } else { 0.0 };
         self.lighting_uniform.style = [
-            settings.shadow_softness,
-            settings.shadow_contrast,
-            settings.far_shadow_lift,
+            settings.shadow_softness * shadow_enable,
+            settings.shadow_contrast * shadow_enable,
+            settings.far_shadow_lift * shadow_enable,
             settings.color_vibrance,
         ];
         self.lighting_uniform.fog = [
-            settings.fog_strength,
+            if settings.fog_enabled {
+                settings.fog_strength
+            } else {
+                0.0
+            },
             settings.fog_start.max(1.0),
             settings.fog_end.max(settings.fog_start + 1.0),
-            settings.atmosphere_strength,
+            if settings.atmosphere_enabled {
+                settings.atmosphere_strength
+            } else {
+                0.0
+            },
         ];
         self.clear_color = wgpu::Color {
             r: celestial.sky_bottom[0] as f64,
@@ -634,8 +649,11 @@ impl GpuState {
             });
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            for chunk in self.world_chunks.values() {
+            for (key, chunk) in &self.world_chunks {
                 if chunk.vertex_count == 0 {
+                    continue;
+                }
+                if !chunk_render_key_in_view(self.camera, *key) {
                     continue;
                 }
                 render_pass.set_vertex_buffer(0, chunk.vertex_buffer.slice(..));
@@ -693,6 +711,36 @@ impl GpuState {
             mapped_at_creation: false,
         });
     }
+}
+
+fn chunk_render_key_in_view(camera: Camera, key: ChunkRenderKey) -> bool {
+    let span_chunks = 1_i64 << key.lod_level;
+    let span_blocks = span_chunks as f32 * CHUNK_SIZE as f32;
+    let center_x = key.origin_chunk.0 as f32 * CHUNK_SIZE as f32 + span_blocks * 0.5;
+    let center_z = key.origin_chunk.1 as f32 * CHUNK_SIZE as f32 + span_blocks * 0.5;
+    let to_center = Vec3::new(center_x - camera.position.x, 0.0, center_z - camera.position.z);
+    let distance = to_center.length();
+    let radius = span_blocks * 0.75 + 64.0;
+    if distance > camera.lens.z_far + radius {
+        return false;
+    }
+    if distance <= radius {
+        return true;
+    }
+
+    let mut forward = camera.forward();
+    forward.y = 0.0;
+    forward = forward.normalize_or_zero();
+    if forward.length_squared() <= f32::EPSILON {
+        return true;
+    }
+
+    let dir = to_center.normalize_or_zero();
+    let horizontal_fov =
+        2.0 * ((camera.lens.fov_y_radians * 0.5).tan() * camera.lens.aspect.max(0.1)).atan();
+    let half_fov = (horizontal_fov.max(camera.lens.fov_y_radians) * 0.5 + 0.35).min(3.0);
+    let min_dot = half_fov.cos();
+    forward.dot(dir) >= min_dot
 }
 
 pub fn celestial_state_for_time(time_seconds: f32) -> CelestialState {

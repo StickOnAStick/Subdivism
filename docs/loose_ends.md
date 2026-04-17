@@ -1,116 +1,112 @@
-# Loose Ends and Cleanup Plan
+# Loose Ends and Maintainability Audit
 
-This is a concrete list of integration gaps, risky patterns, and cleanup targets found while iterating the repo.
+This document replaces the previous loose-ends list and reflects the current state after the latest cleanup pass.
 
-## High Priority
+## What Was Fixed Already
 
-1. Monolithic app orchestration (`src/app.rs`)
-- Symptom: one file handles event loop, UI navigation, chunk streaming, gameplay input, inventory actions, terrain lab controls, and world edit logic.
-- Risk: high change coupling, difficult testing, frequent regressions from unrelated edits.
-- Fix path:
-  - Split into modules: `app/input`, `app/ui`, `app/chunk_stream`, `app/editing`, `app/terrain_lab`.
-  - Keep `App` as thin coordinator over subsystem structs.
+1. Terrain parameter metadata is now centralized through `TerrainParamSpec` in `src/game/world.rs`.
+2. Sub-block storage now has a cell index (`SubOverrideState`) instead of full-map scans for cell lookups.
+3. Sub-block placement is now transactional in `src/app.rs` and avoids silent material loss.
+4. Pause-menu quit now exits via the event loop instead of direct hard process exit.
+5. `terrain_tool` and `terrain_lab` now use `Result`-style CLI error handling instead of panic-first flow.
 
-2. World API is too broad (`src/game/world.rs`)
-- Symptom: `World` owns procedural terrain, mutable overrides, meshing, lighting preprocessing, biome logic, and noise helpers.
-- Risk: hard to isolate performance work, mesh changes can accidentally alter gameplay semantics.
-- Fix path:
-  - Extract `terrain_gen`, `voxel_storage`, `meshing`, `lighting` modules.
-  - Keep `World` as facade with smaller internal components.
+## Current High-Risk Structure Debt
 
-3. Sub-block placement can spend inventory before final set succeeds (`src/app.rs`, `edit_sub_block_from_click`)
-- Symptom: `spend_sub_units(...)` happens before `set_sub_block_i64(...)`.
-- Risk: edge-case material loss if placement fails after spending.
-- Fix path:
-  - Pre-validate fully, then spend and place in one transactional method.
-  - If set fails, immediate refund fallback.
+1. `src/app.rs` remains a monolith
+- Symptoms: one file still owns input handling, UI routing, camera switching, chunk streaming, world edit rules, and overlay assembly.
+- Why this is risky: unrelated changes collide in the same module; hard to test in isolation; fragile for contributors.
+- Required fix: split into subsystem modules with explicit ownership boundaries.
+- Suggested split:
+`app/input.rs`, `app/ui.rs`, `app/editing.rs`, `app/chunk_streaming.rs`, `app/terrain_lab.rs`, `app/runtime.rs`.
 
-4. Hard process exit in pause menu (`std::process::exit(0)` in `src/app.rs`)
-- Symptom: bypasses graceful shutdown path.
-- Risk: future resources/telemetry/save hooks will not run.
-- Fix path:
-  - Route quit through event loop exit path (`event_loop.exit()` driven by app state flag).
+2. `src/game/world.rs` is still a god-object
+- Symptoms: terrain generation math, biome logic, mutable storage, mesh generation, and lighting prep remain mixed.
+- Why this is risky: perf work and gameplay work cannot evolve independently; model and rendering concerns are interleaved.
+- Required fix: isolate into separate components and keep `World` as facade.
+- Suggested split:
+`world/storage.rs`, `world/terrain_gen.rs`, `world/meshing.rs`, `world/lighting.rs`, `world/biomes.rs`.
 
-## Medium Priority
+3. Runtime systems are tightly coupled to immediate-mode UI text
+- Symptoms: `app.rs` builds gameplay and menu text inline and drives behavior from positional menu indices.
+- Why this is risky: high regression risk when changing menu layouts; poor readability; poor localization/extensibility.
+- Required fix: move to command-based menu definitions and dedicated view-model builders.
 
-1. Public API surface is wider than needed (`pub fn` across many internal helpers)
-- Symptom: many functions are publicly visible despite being crate-internal implementation details.
-- Risk: accidental coupling from tools/tests/bins, harder refactors.
-- Fix path:
-  - Narrow visibility to `pub(crate)` or private where cross-crate export is not required.
-  - Keep explicit stable API list in `src/lib.rs`.
+4. Render layer accepts raw gameplay-side geometry payloads
+- Symptoms: `GpuState::render` receives ad-hoc overlay vertex arrays assembled in app logic.
+- Why this is risky: rendering API contract is wide and unstable; app and renderer are tightly bound.
+- Required fix: define structured render commands or stable render packets per pass.
 
-2. Terrain parameter metadata is duplicated
-- Symptom: min/max/step/labels live in `terrain_params.rs`, while valid keys/clamping logic also exist in `TerrainConfig`.
-- Risk: drift between UI controls and runtime validation.
-- Fix path:
-  - Create one parameter descriptor table (`name, min, max, step, getter, setter`), shared by lab UI and clamping/validation.
+## Public API Surface Debt (Too Broad / Poorly Structured)
 
-3. `sub_blocks_in_cell` is linear over all sub-overrides (`src/game/world.rs`)
-- Symptom: per-cell lookup scans the entire `HashMap`.
-- Risk: collision/raycast performance degrades with many sub-block edits.
-- Fix path:
-  - Add secondary index keyed by `(x, y, z)` to list sub entries for that cell.
+The crate currently exposes a large number of `pub fn` APIs that are implementation detail rather than stable boundaries.
 
-4. Unused/disconnected systems
-- `PrefabCatalog` exists but is not used in runtime world generation/edit cycle.
-- `AssetRegistry` exists for textures/biomes but render path still uses procedural colors only.
-- Fix path:
-  - Decide: integrate into runtime (stream prefab spawns, texture material binding) or remove until needed.
+### Public APIs likely to demote to `pub(crate)` or private
 
-5. Legacy artifact in repo (`backup/main_old.rs`)
-- Symptom: old monolithic prototype remains in active tree.
-- Risk: confusion for contributors and docs drift.
-- Fix path:
-  - Move to a clearly marked `archive/` directory or remove after tagging history.
+1. `src/debug_overlay.rs`
+- Candidates: `add_quad`, `add_text`, `menu_layout`, `build_menu_vertices`, `build_vertices`.
+- Reason: these are internal rendering helpers consumed only by app/runtime internals.
 
-## Low Priority
+2. `src/mesh.rs`
+- Candidate: `push_quad`.
+- Reason: internal meshing primitive; not a stable external API.
 
-1. Error handling style in tooling binaries
-- Symptom: frequent `panic!`/`expect` in `src/bin/*`.
-- Risk: rough UX for CLI users; brittle automation.
-- Fix path:
-  - Return `Result` from command runners, print friendly errors, non-zero exit codes.
+3. `src/game/interact.rs`
+- Candidates: most free helper functions (`direction_to_screen`, `face_plane_points`, `push_screen_line`, etc).
+- Reason: currently app-internal interaction math; should be grouped behind a smaller service API.
 
-2. Stringly-typed UI/menu/keys
-- Symptom: menu labels and key handling logic are mostly inline literals.
-- Risk: translation/customization and consistency are hard.
-- Fix path:
-  - Use small command enum + label table for menu entries and keymaps.
+4. `src/game/hud.rs`
+- Candidates: formatter helpers.
+- Reason: UI formatting internals, not domain API.
 
-3. `World::generate(_size_x, _size_y, _size_z)` ignores size args
-- Symptom: API implies dimensioned worlds but implementation is infinite procedural surface.
-- Risk: misleading API contract.
-- Fix path:
-  - Rename or deprecate size args; replace with `generate_default()` and explicit seeded/profile constructors.
+5. `src/game/actor.rs`
+- Candidates: broad accessors/mutators on `ActorRoster` and `ActorState`.
+- Reason: direct mutation patterns make future authority/network models harder.
 
-4. `center_column()` currently always returns `(0, 0)`
-- Symptom: suggests dynamic world center but is fixed.
-- Risk: misleading semantics for spawn/randomization features.
-- Fix path:
-  - Either remove and inline `(0,0)`, or make center configurable.
+6. `src/game/terrain_params.rs`
+- All functions are wrappers around `TerrainConfig` descriptor access.
+- Reason: this module is now mostly pass-through and can be folded into one canonical API.
 
-## Integration/Removal Decision Matrix
+7. `src/game/world.rs`
+- Candidates for narrowing: many meshing/storage mutators and helpers that should be behind focused traits/components.
+- Reason: `World` is currently used as both high-level facade and low-level toolbox.
 
-1. Integrate now
-- `AssetRegistry` into rendering material pipeline
-- Prefab spawning into world/chunk generation loop
-- Parameter descriptor unification for terrain lab + runtime validation
+## Integration Gaps Still Open
 
-2. Keep but harden
-- Async chunk build pipeline
-- Sub-voxel editing wallet model
-- Performance suite history pipeline
+1. `AssetRegistry` is still disconnected from runtime rendering
+- Current state: tooling can edit registry; game render path still uses procedural color palette only.
+- Decision needed: integrate real material/texturing path or remove/defer registry from mainline workflow.
 
-3. Remove or archive
-- `backup/main_old.rs`
-- Empty `skills/VOXEL_GAME_ENGINE.md` (either populate or remove)
-- Any truly unused public helpers after visibility audit
+2. `PrefabCatalog` is still disconnected from world generation
+- Current state: archetypes and spawn logic exist but are not integrated into chunk/world generation.
+- Decision needed: wire spawn generation in runtime or archive until ready.
 
-## Suggested Execution Order
+3. Tooling error handling still inconsistent
+- `terrain_tool` and `terrain_lab` were cleaned up.
+- `perf_suite` still has extensive `expect` calls and panic-style failure behavior.
 
-1. Extract `app.rs` into subsystems without behavior change.
-2. Introduce parameter descriptor table and migrate terrain lab.
-3. Make sub-block placement transactional and index sub-block lookups.
-4. Decide and execute AssetRegistry/Prefab integration scope.
-5. Shrink public API and archive/remove legacy artifacts.
+4. Legacy/low-signal artifacts still present
+- `backup/main_old.rs` should be archived or removed.
+- `skills/VOXEL_GAME_ENGINE.md` is empty and should be populated or deleted.
+
+## Additional Maintainability Smells
+
+1. Duplicate slider/rendering constants and magic numbers spread through app and render paths.
+2. Behavior encoded by menu index position rather than explicit command enum.
+3. Mixed responsibilities in input event handlers (state transitions, simulation actions, and UI mutations in same blocks).
+4. Limited boundaries for deterministic testing around app-level behavior orchestration.
+
+## Refactor Plan (Updated)
+
+1. Extract `app.rs` into ownership-based subsystem modules with no behavior change.
+2. Split `world.rs` into storage, generation, meshing, and lighting submodules.
+3. Narrow public API to an intentional crate facade (`lib.rs`) and demote internal helpers.
+4. Resolve integration decision for `AssetRegistry` and `PrefabCatalog` (integrate or archive).
+5. Finish CLI/runtime error-handling hardening (`perf_suite`, selected `expect` chains).
+6. Remove or archive legacy artifacts.
+
+## Definition of Done for This Audit
+
+1. No monolithic orchestration files over mixed domains.
+2. Public APIs are intentional and documented by module purpose.
+3. Runtime-only helper APIs are not publicly exported by default.
+4. Feature-adjacent systems are either integrated end-to-end or clearly marked experimental/archived.

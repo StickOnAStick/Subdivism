@@ -250,6 +250,133 @@ pub fn face_plane_points(
     lines
 }
 
+pub fn sub_block_outline_points(pos: SubBlockPos) -> Vec<(Vec3, Vec3)> {
+    let step = 1.0 / pos.divisions.max(1) as f32;
+    let min = Vec3::new(
+        pos.x as f32 + pos.sx as f32 * step,
+        pos.y as f32 + pos.sy as f32 * step,
+        pos.z as f32 + pos.sz as f32 * step,
+    );
+    let max = min + Vec3::splat(step);
+    let nudge = 0.0025;
+    let c000 = Vec3::new(min.x - nudge, min.y - nudge, min.z - nudge);
+    let c001 = Vec3::new(min.x - nudge, min.y - nudge, max.z + nudge);
+    let c010 = Vec3::new(min.x - nudge, max.y + nudge, min.z - nudge);
+    let c011 = Vec3::new(min.x - nudge, max.y + nudge, max.z + nudge);
+    let c100 = Vec3::new(max.x + nudge, min.y - nudge, min.z - nudge);
+    let c101 = Vec3::new(max.x + nudge, min.y - nudge, max.z + nudge);
+    let c110 = Vec3::new(max.x + nudge, max.y + nudge, min.z - nudge);
+    let c111 = Vec3::new(max.x + nudge, max.y + nudge, max.z + nudge);
+
+    vec![
+        (c000, c001),
+        (c000, c010),
+        (c000, c100),
+        (c001, c011),
+        (c001, c101),
+        (c010, c011),
+        (c010, c110),
+        (c011, c111),
+        (c100, c101),
+        (c100, c110),
+        (c101, c111),
+        (c110, c111),
+    ]
+}
+
+pub fn sub_block_face_plane_points(
+    pos: SubBlockPos,
+    normal: FaceNormal,
+    divisions: u8,
+) -> Vec<(Vec3, Vec3)> {
+    let grid = divisions.max(1) as usize;
+    let step = 1.0 / pos.divisions.max(1) as f32;
+    let min = Vec3::new(
+        pos.x as f32 + pos.sx as f32 * step,
+        pos.y as f32 + pos.sy as f32 * step,
+        pos.z as f32 + pos.sz as f32 * step,
+    );
+    let max = min + Vec3::splat(step);
+    let eps = normal.as_vec3() * 0.0025;
+
+    let mut lines = Vec::with_capacity((grid + 1) * 2);
+    for i in 0..=grid {
+        let t = i as f32 / grid.max(1) as f32;
+        let (a0, a1, b0, b1) = if normal.x != 0 {
+            let fx = if normal.x > 0 { max.x } else { min.x };
+            (
+                Vec3::new(fx, min.y + (max.y - min.y) * t, min.z),
+                Vec3::new(fx, min.y + (max.y - min.y) * t, max.z),
+                Vec3::new(fx, min.y, min.z + (max.z - min.z) * t),
+                Vec3::new(fx, max.y, min.z + (max.z - min.z) * t),
+            )
+        } else if normal.y != 0 {
+            let fy = if normal.y > 0 { max.y } else { min.y };
+            (
+                Vec3::new(min.x + (max.x - min.x) * t, fy, min.z),
+                Vec3::new(min.x + (max.x - min.x) * t, fy, max.z),
+                Vec3::new(min.x, fy, min.z + (max.z - min.z) * t),
+                Vec3::new(max.x, fy, min.z + (max.z - min.z) * t),
+            )
+        } else {
+            let fz = if normal.z > 0 { max.z } else { min.z };
+            (
+                Vec3::new(min.x + (max.x - min.x) * t, min.y, fz),
+                Vec3::new(min.x + (max.x - min.x) * t, max.y, fz),
+                Vec3::new(min.x, min.y + (max.y - min.y) * t, fz),
+                Vec3::new(max.x, min.y + (max.y - min.y) * t, fz),
+            )
+        };
+        lines.push((a0 + eps, a1 + eps));
+        lines.push((b0 + eps, b1 + eps));
+    }
+    lines
+}
+
+pub fn sub_block_face_outline_points(pos: SubBlockPos, normal: FaceNormal) -> Vec<(Vec3, Vec3)> {
+    let step = 1.0 / pos.divisions.max(1) as f32;
+    let min = Vec3::new(
+        pos.x as f32 + pos.sx as f32 * step,
+        pos.y as f32 + pos.sy as f32 * step,
+        pos.z as f32 + pos.sz as f32 * step,
+    );
+    let max = min + Vec3::splat(step);
+    let eps = normal.as_vec3() * 0.0025;
+
+    let (a, b, c, d) = if normal.x != 0 {
+        let fx = if normal.x > 0 { max.x } else { min.x };
+        (
+            Vec3::new(fx, min.y, min.z),
+            Vec3::new(fx, min.y, max.z),
+            Vec3::new(fx, max.y, max.z),
+            Vec3::new(fx, max.y, min.z),
+        )
+    } else if normal.y != 0 {
+        let fy = if normal.y > 0 { max.y } else { min.y };
+        (
+            Vec3::new(min.x, fy, min.z),
+            Vec3::new(min.x, fy, max.z),
+            Vec3::new(max.x, fy, max.z),
+            Vec3::new(max.x, fy, min.z),
+        )
+    } else {
+        let fz = if normal.z > 0 { max.z } else { min.z };
+        (
+            Vec3::new(min.x, min.y, fz),
+            Vec3::new(min.x, max.y, fz),
+            Vec3::new(max.x, max.y, fz),
+            Vec3::new(max.x, min.y, fz),
+        )
+    };
+
+    vec![
+        (a + eps, b + eps),
+        (b + eps, c + eps),
+        (c + eps, d + eps),
+        (d + eps, a + eps),
+    ]
+}
+
 pub fn push_screen_line(
     vertices: &mut Vec<OverlayVertex>,
     a: (f32, f32),

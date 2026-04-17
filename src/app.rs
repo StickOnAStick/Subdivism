@@ -23,9 +23,9 @@ use crate::{
         actor::{ActorRoster, PLAYER_EYE_HEIGHT},
         hud::HudFormatter,
         interact::{
-            RaycastHit, direction_to_screen, face_plane_points, find_sub_block_at_point,
-            push_screen_line, raycast_world_detailed, sub_slot_overlaps_existing,
-            sub_target_from_world_point, voxel_coords, world_to_screen,
+            RaycastHit, SubTarget, direction_to_screen, face_plane_points, find_sub_block_at_point,
+            push_screen_line, raycast_world_detailed, sub_block_face_outline_points,
+            sub_slot_overlaps_existing, sub_target_from_world_point, voxel_coords, world_to_screen,
         },
         inventory::{BACKPACK_COLS, BACKPACK_ROWS, BACKPACK_SIZE, HOTBAR_SIZE, Inventory},
         physics::{self, MovementInput, PhysicsConfig},
@@ -38,6 +38,10 @@ use crate::{
     mesh::Vertex,
     render::{ChunkRenderKey, GpuState, GraphicsSettings, RenderOutcome, celestial_state_for_time},
 };
+
+#[path = "app/components.rs"]
+mod components;
+use components::{ChunkStreamingState, MenuState, TerrainLabState};
 
 const FREE_CAMERA_SPEED: f32 = 10.0;
 const LOOK_SENSITIVITY: f32 = 0.0025;
@@ -281,39 +285,28 @@ struct App {
     actors: ActorRoster,
     free_camera: Camera,
     camera_mode: CameraMode,
-    ui_mode: UiMode,
-    menu_page: MenuPage,
-    menu_index: usize,
-    menu_hover_index: Option<usize>,
+    menu: MenuState,
     inventory_cursor: InventoryCursor,
     input: InputState,
     debug_overlay: DebugOverlay,
     physics: PhysicsConfig,
     lens: CameraLens,
     frame_cap_index: usize,
-    render_distance_chunks: u32,
-    visible_chunks: HashSet<ChunkRenderKey>,
-    resident_chunks: HashSet<ChunkRenderKey>,
-    requested_chunks: HashSet<ChunkRenderKey>,
-    dirty_chunks: HashSet<ChunkRenderKey>,
-    chunk_versions: HashMap<ChunkRenderKey, u64>,
-    chunk_pipeline: ChunkBuildPipeline,
+    chunk_stream: ChunkStreamingState,
     inventory: Inventory,
     world_seed: i64,
     terrain_profile: String,
     terrain_recipe_path: Option<PathBuf>,
     dev_mode: bool,
-    terrain_lab_mode: bool,
-    terrain_lab_panel_visible: bool,
-    terrain_lab_selected: usize,
+    terrain_lab: TerrainLabState,
     world_time_seconds: f32,
     graphics_settings: GraphicsSettings,
     subdivide_scale: SubdivideScale,
     sub_unit_wallet: HashMap<Block, u16>,
-    last_chunk_center: (i64, i64),
     last_frame: Instant,
     next_frame_at: Instant,
     rng_state: u64,
+    should_exit: bool,
 }
 
 impl App {
@@ -349,7 +342,7 @@ impl App {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_nanos() as u64)
             .unwrap_or(0x9E3779B97F4A7C15);
-        let pipeline = ChunkBuildPipeline::new(world.clone());
+        let chunk_stream = ChunkStreamingState::new(world.clone());
         let mut debug_overlay = DebugOverlay::new();
         if options.terrain_lab {
             debug_overlay.visible = true;
@@ -363,10 +356,7 @@ impl App {
             actors,
             free_camera,
             camera_mode,
-            ui_mode: UiMode::Playing,
-            menu_page: MenuPage::Main,
-            menu_index: 0,
-            menu_hover_index: None,
+            menu: MenuState::new(),
             inventory_cursor: InventoryCursor {
                 section: InventorySection::Hotbar,
                 index: 0,
@@ -376,29 +366,21 @@ impl App {
             physics: PhysicsConfig::default(),
             lens,
             frame_cap_index: DEFAULT_FRAME_CAP_INDEX,
-            render_distance_chunks: DEFAULT_RENDER_DISTANCE_CHUNKS,
-            visible_chunks: HashSet::new(),
-            resident_chunks: HashSet::new(),
-            requested_chunks: HashSet::new(),
-            dirty_chunks: HashSet::new(),
-            chunk_versions: HashMap::new(),
-            chunk_pipeline: pipeline,
+            chunk_stream,
             inventory: Inventory::new(),
             world_seed,
             terrain_profile,
             terrain_recipe_path,
             dev_mode: options.dev_mode,
-            terrain_lab_mode: options.terrain_lab,
-            terrain_lab_panel_visible: options.terrain_lab,
-            terrain_lab_selected: 0,
+            terrain_lab: TerrainLabState::new(options.terrain_lab),
             world_time_seconds: 0.0,
             graphics_settings: GraphicsSettings::default(),
             subdivide_scale: SubdivideScale::Full,
             sub_unit_wallet: HashMap::new(),
-            last_chunk_center: (0, 0),
             last_frame: Instant::now(),
             next_frame_at: Instant::now(),
             rng_state: seed,
+            should_exit: false,
         }
     }
 
@@ -422,7 +404,7 @@ impl App {
     }
 
     fn update_far_plane_for_render_distance(&mut self) {
-        let target_far = ((self.render_distance_chunks as f32 + 2.0) * CHUNK_SIZE as f32 * 2.0)
+        let target_far = ((self.chunk_stream.render_distance_chunks as f32 + 2.0) * CHUNK_SIZE as f32 * 2.0)
             .clamp(500.0, 8192.0);
         self.lens.z_far = target_far;
         self.sync_lens_to_cameras();
@@ -464,8 +446,8 @@ impl App {
         };
         let saved_camera_mode = self.camera_mode;
 
-        let mut existing_keys = self.visible_chunks.clone();
-        existing_keys.extend(self.resident_chunks.iter().copied());
+        let mut existing_keys = self.chunk_stream.visible_chunks.clone();
+        existing_keys.extend(self.chunk_stream.resident_chunks.iter().copied());
         if let Some(gpu) = self.gpu.as_mut() {
             for key in existing_keys {
                 gpu.remove_chunk_mesh(key);
@@ -476,12 +458,12 @@ impl App {
         self.world_seed = world_seed;
         self.terrain_profile = terrain_profile;
         self.terrain_recipe_path = terrain_recipe_path;
-        self.chunk_pipeline = ChunkBuildPipeline::new(self.world.clone());
-        self.visible_chunks.clear();
-        self.resident_chunks.clear();
-        self.requested_chunks.clear();
-        self.dirty_chunks.clear();
-        self.chunk_versions.clear();
+        self.chunk_stream.pipeline = ChunkBuildPipeline::new(self.world.clone());
+        self.chunk_stream.visible_chunks.clear();
+        self.chunk_stream.resident_chunks.clear();
+        self.chunk_stream.requested_chunks.clear();
+        self.chunk_stream.dirty_chunks.clear();
+        self.chunk_stream.chunk_versions.clear();
 
         if preserve_view {
             if let Some(actor) = saved_actor {
@@ -495,7 +477,7 @@ impl App {
             self.actors.respawn_local_player(self.world.spawn_point());
             self.free_camera = self.actors.local_player().camera(self.lens);
         }
-        self.last_chunk_center = self.current_chunk_center();
+        self.chunk_stream.last_chunk_center = self.current_chunk_center();
         self.schedule_visible_chunks();
         self.sync_active_camera();
         self.refresh_window_title();
@@ -503,12 +485,12 @@ impl App {
 
     fn rebuild_world_from_terrain(&mut self, terrain: TerrainConfig, preserve_view: bool) {
         let world = World::generate_with_terrain_and_seed(terrain, self.world_seed);
-        let profile = if self.terrain_lab_mode {
+        let profile = if self.terrain_lab.enabled {
             "terrain_lab".to_string()
         } else {
             self.terrain_profile.clone()
         };
-        let path = if self.terrain_lab_mode {
+        let path = if self.terrain_lab.enabled {
             self.terrain_recipe_path.clone()
         } else {
             self.terrain_recipe_path.clone()
@@ -557,12 +539,12 @@ impl App {
     fn refresh_window_title(&self) {
         if let Some(window) = &self.window {
             let dev_flag = if self.dev_mode { " DEV" } else { "" };
-            let lab_flag = if self.terrain_lab_mode { " LAB" } else { "" };
+            let lab_flag = if self.terrain_lab.enabled { " LAB" } else { "" };
             window.set_title(&format!(
                 "Voxel Starter [{} | {} | RD {} | SEED {}{}{}]",
                 self.frame_cap_label(),
                 self.camera_mode.label(),
-                self.render_distance_chunks,
+                self.chunk_stream.render_distance_chunks,
                 self.world_seed,
                 dev_flag,
                 lab_flag
@@ -607,19 +589,19 @@ impl App {
     }
 
     fn open_pause_menu(&mut self) {
-        self.ui_mode = UiMode::Paused;
-        self.menu_page = MenuPage::Main;
-        self.menu_index = 0;
-        self.menu_hover_index = None;
+        self.menu.ui_mode = UiMode::Paused;
+        self.menu.page = MenuPage::Main;
+        self.menu.index = 0;
+        self.menu.hover_index = None;
         self.release_mouse();
     }
 
     fn close_pause_menu(&mut self) {
-        self.ui_mode = UiMode::Playing;
+        self.menu.ui_mode = UiMode::Playing;
     }
 
     fn open_inventory(&mut self) {
-        self.ui_mode = UiMode::Inventory;
+        self.menu.ui_mode = UiMode::Inventory;
         self.inventory_cursor = InventoryCursor {
             section: InventorySection::Hotbar,
             index: self.inventory.selected_hotbar_index(),
@@ -628,11 +610,11 @@ impl App {
     }
 
     fn close_inventory(&mut self) {
-        self.ui_mode = UiMode::Playing;
+        self.menu.ui_mode = UiMode::Playing;
     }
 
     fn update(&mut self, dt: f32) {
-        if self.ui_mode != UiMode::Playing {
+        if self.menu.ui_mode != UiMode::Playing {
             return;
         }
         match self.camera_mode {
@@ -705,7 +687,7 @@ impl App {
     fn schedule_visible_chunks(&mut self) {
         let center = self.current_chunk_center();
         let render_distance =
-            (self.render_distance_chunks as i64).clamp(1, MAX_RENDER_DISTANCE_CHUNKS as i64);
+            (self.chunk_stream.render_distance_chunks as i64).clamp(1, MAX_RENDER_DISTANCE_CHUNKS as i64);
         let mut desired = Vec::new();
         collect_lod_ring(
             &mut desired,
@@ -750,7 +732,7 @@ impl App {
         let desired_set: HashSet<ChunkRenderKey> = desired.iter().copied().collect();
 
         let chunks_to_remove: Vec<ChunkRenderKey> = self
-            .visible_chunks
+            .chunk_stream.visible_chunks
             .difference(&desired_set)
             .copied()
             .collect();
@@ -760,14 +742,14 @@ impl App {
             }
         }
         for key in &chunks_to_remove {
-            self.resident_chunks.remove(key);
+            self.chunk_stream.resident_chunks.remove(key);
         }
 
-        self.visible_chunks = desired_set;
-        self.last_chunk_center = center;
+        self.chunk_stream.visible_chunks = desired_set;
+        self.chunk_stream.last_chunk_center = center;
 
         for key in desired {
-            if self.resident_chunks.contains(&key) && !self.dirty_chunks.contains(&key) {
+            if self.chunk_stream.resident_chunks.contains(&key) && !self.chunk_stream.dirty_chunks.contains(&key) {
                 continue;
             }
             self.ensure_chunk_requested(key);
@@ -778,59 +760,59 @@ impl App {
         let mut uploads_remaining = MAX_CHUNK_UPLOADS_PER_FRAME;
 
         while uploads_remaining > 0 {
-            let result = match self.chunk_pipeline.result_rx.try_recv() {
+            let result = match self.chunk_stream.pipeline.result_rx.try_recv() {
                 Ok(result) => result,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break,
             };
 
-            self.requested_chunks.remove(&result.key);
-            let newest_version = self.chunk_versions.get(&result.key).copied().unwrap_or(0);
+            self.chunk_stream.requested_chunks.remove(&result.key);
+            let newest_version = self.chunk_stream.chunk_versions.get(&result.key).copied().unwrap_or(0);
             if result.version != newest_version {
                 self.ensure_chunk_requested(result.key);
                 continue;
             }
-            if !self.visible_chunks.contains(&result.key) {
+            if !self.chunk_stream.visible_chunks.contains(&result.key) {
                 continue;
             }
 
             if let Some(gpu) = self.gpu.as_mut() {
                 gpu.upsert_chunk_mesh(result.key, &result.vertices);
             }
-            self.resident_chunks.insert(result.key);
-            self.dirty_chunks.remove(&result.key);
+            self.chunk_stream.resident_chunks.insert(result.key);
+            self.chunk_stream.dirty_chunks.remove(&result.key);
             uploads_remaining -= 1;
         }
     }
 
     fn ensure_chunk_requested(&mut self, key: ChunkRenderKey) {
-        if self.requested_chunks.contains(&key) {
+        if self.chunk_stream.requested_chunks.contains(&key) {
             return;
         }
-        let version = *self.chunk_versions.entry(key).or_insert(1);
+        let version = *self.chunk_stream.chunk_versions.entry(key).or_insert(1);
         if self
-            .chunk_pipeline
+            .chunk_stream.pipeline
             .request_tx
             .send(ChunkBuildRequest { key, version })
             .is_ok()
         {
-            self.requested_chunks.insert(key);
+            self.chunk_stream.requested_chunks.insert(key);
         }
     }
 
     fn mark_chunk_dirty(&mut self, key: ChunkRenderKey) {
         let version = self
-            .chunk_versions
+            .chunk_stream.chunk_versions
             .entry(key)
             .and_modify(|v| *v = v.saturating_add(1))
             .or_insert(1);
-        self.dirty_chunks.insert(key);
-        if self.visible_chunks.contains(&key) && !self.requested_chunks.contains(&key) {
-            let _ = self.chunk_pipeline.request_tx.send(ChunkBuildRequest {
+        self.chunk_stream.dirty_chunks.insert(key);
+        if self.chunk_stream.visible_chunks.contains(&key) && !self.chunk_stream.requested_chunks.contains(&key) {
+            let _ = self.chunk_stream.pipeline.request_tx.send(ChunkBuildRequest {
                 key,
                 version: *version,
             });
-            self.requested_chunks.insert(key);
+            self.chunk_stream.requested_chunks.insert(key);
         }
     }
 
@@ -880,16 +862,16 @@ impl App {
         let item_count = self.menu_item_count();
         match code {
             KeyCode::ArrowUp => {
-                self.menu_index = if self.menu_index == 0 {
+                self.menu.index = if self.menu.index == 0 {
                     item_count - 1
                 } else {
-                    self.menu_index - 1
+                    self.menu.index - 1
                 };
-                self.menu_hover_index = None;
+                self.menu.hover_index = None;
             }
             KeyCode::ArrowDown => {
-                self.menu_index = (self.menu_index + 1) % item_count;
-                self.menu_hover_index = None;
+                self.menu.index = (self.menu.index + 1) % item_count;
+                self.menu.hover_index = None;
             }
             KeyCode::ArrowLeft => {
                 self.adjust_menu_value(-1);
@@ -996,81 +978,83 @@ impl App {
     }
 
     fn activate_menu_item(&mut self) {
-        match self.menu_page {
-            MenuPage::Main => match self.menu_index {
+        match self.menu.page {
+            MenuPage::Main => match self.menu.index {
                 0 => self.close_pause_menu(),
                 1 => {
                     self.respawn_player_random_near_center();
                     self.close_pause_menu();
                 }
                 2 => {
-                    self.menu_page = MenuPage::Settings;
-                    self.menu_index = 0;
+                    self.menu.page = MenuPage::Settings;
+                    self.menu.index = 0;
                 }
                 3 => {
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
-                    }
-                    std::process::exit(0);
+                    self.should_exit = true;
                 }
                 _ => {}
             },
-            MenuPage::Settings => match self.menu_index {
+            MenuPage::Settings => match self.menu.index {
                 0 => {
-                    self.menu_page = MenuPage::Graphics;
-                    self.menu_index = 0;
+                    self.menu.page = MenuPage::Graphics;
+                    self.menu.index = 0;
                 }
                 1 => {
-                    self.menu_page = MenuPage::Main;
-                    self.menu_index = 0;
+                    self.menu.page = MenuPage::Main;
+                    self.menu.index = 0;
                 }
                 _ => {}
             },
-            MenuPage::Graphics => match self.menu_index {
+            MenuPage::Graphics => match self.menu.index {
                 0 => self.adjust_render_distance(1),
-                1 => self.adjust_graphics_setting_by(1, 0.05),
-                2 => self.adjust_graphics_setting_by(2, 0.03),
-                3 => self.adjust_graphics_setting_by(3, 0.05),
+                1 => self.graphics_settings.shadows_enabled = !self.graphics_settings.shadows_enabled,
+                2 => self.graphics_settings.fog_enabled = !self.graphics_settings.fog_enabled,
+                3 => {
+                    self.graphics_settings.atmosphere_enabled = !self.graphics_settings.atmosphere_enabled
+                }
                 4 => self.adjust_graphics_setting_by(4, 0.05),
-                5 => self.adjust_graphics_setting_by(5, 0.02),
-                6 => self.adjust_graphics_setting_by(6, 0.04),
-                7 => self.adjust_graphics_setting_by(7, 8.0),
-                8 => self.adjust_graphics_setting_by(8, 16.0),
-                9 => self.adjust_graphics_setting_by(9, 0.03),
-                10 => self.adjust_graphics_setting_by(10, 0.03),
-                11 => {
+                5 => self.adjust_graphics_setting_by(5, 0.03),
+                6 => self.adjust_graphics_setting_by(6, 0.05),
+                7 => self.adjust_graphics_setting_by(7, 0.05),
+                8 => self.adjust_graphics_setting_by(8, 0.02),
+                9 => self.adjust_graphics_setting_by(9, 0.04),
+                10 => self.adjust_graphics_setting_by(10, 8.0),
+                11 => self.adjust_graphics_setting_by(11, 16.0),
+                12 => self.adjust_graphics_setting_by(12, 0.03),
+                13 => self.adjust_graphics_setting_by(13, 0.03),
+                14 => {
                     self.graphics_settings = GraphicsSettings::default();
                 }
-                12 => {
-                    self.menu_page = MenuPage::Settings;
-                    self.menu_index = 0;
+                15 => {
+                    self.menu.page = MenuPage::Settings;
+                    self.menu.index = 0;
                 }
                 _ => {}
             },
         }
         let item_count = self.menu_item_count().max(1);
-        self.menu_index = self.menu_index.min(item_count - 1);
-        self.menu_hover_index = None;
+        self.menu.index = self.menu.index.min(item_count - 1);
+        self.menu.hover_index = None;
     }
 
     fn menu_back_or_resume(&mut self) {
-        match self.menu_page {
+        match self.menu.page {
             MenuPage::Main => self.close_pause_menu(),
             MenuPage::Settings => {
-                self.menu_page = MenuPage::Main;
-                self.menu_index = 0;
+                self.menu.page = MenuPage::Main;
+                self.menu.index = 0;
             }
             MenuPage::Graphics => {
-                self.menu_page = MenuPage::Settings;
-                self.menu_index = 0;
+                self.menu.page = MenuPage::Settings;
+                self.menu.index = 0;
             }
         }
-        self.menu_hover_index = None;
+        self.menu.hover_index = None;
     }
 
     fn adjust_render_distance(&mut self, delta: i32) {
-        let value = self.render_distance_chunks as i32 + delta;
-        self.render_distance_chunks = value.clamp(
+        let value = self.chunk_stream.render_distance_chunks as i32 + delta;
+        self.chunk_stream.render_distance_chunks = value.clamp(
             MIN_RENDER_DISTANCE_CHUNKS as i32,
             MAX_RENDER_DISTANCE_CHUNKS as i32,
         ) as u32;
@@ -1080,7 +1064,7 @@ impl App {
     }
 
     fn menu_overlay(&self) -> (String, Vec<String>, usize) {
-        match self.menu_page {
+        match self.menu.page {
             MenuPage::Main => (
                 "PAUSED".to_string(),
                 vec![
@@ -1089,12 +1073,12 @@ impl App {
                     "SETTINGS".to_string(),
                     "QUIT TO DESKTOP".to_string(),
                 ],
-                self.menu_index,
+                self.menu.index,
             ),
             MenuPage::Settings => (
                 "SETTINGS".to_string(),
                 vec!["GRAPHICS".to_string(), "BACK".to_string()],
-                self.menu_index,
+                self.menu.index,
             ),
             MenuPage::Graphics => (
                 "GRAPHICS".to_string(),
@@ -1102,11 +1086,35 @@ impl App {
                     format!(
                         "RENDER DISTANCE {}",
                         slider_u32(
-                            self.render_distance_chunks,
+                            self.chunk_stream.render_distance_chunks,
                             MIN_RENDER_DISTANCE_CHUNKS,
                             MAX_RENDER_DISTANCE_CHUNKS,
                             14
                         )
+                    ),
+                    format!(
+                        "SHADOWS {}",
+                        if self.graphics_settings.shadows_enabled {
+                            "ON"
+                        } else {
+                            "OFF"
+                        }
+                    ),
+                    format!(
+                        "FOG {}",
+                        if self.graphics_settings.fog_enabled {
+                            "ON"
+                        } else {
+                            "OFF"
+                        }
+                    ),
+                    format!(
+                        "ATMOSPHERE FX {}",
+                        if self.graphics_settings.atmosphere_enabled {
+                            "ON"
+                        } else {
+                            "OFF"
+                        }
                     ),
                     format!(
                         "SHADER QUALITY {}",
@@ -1151,65 +1159,68 @@ impl App {
                     "RESET TO DEFAULTS".to_string(),
                     "BACK".to_string(),
                 ],
-                self.menu_index,
+                self.menu.index,
             ),
         }
     }
 
     fn adjust_menu_value(&mut self, delta: i32) {
-        if self.menu_page != MenuPage::Graphics {
+        if self.menu.page != MenuPage::Graphics {
             return;
         }
-        match self.menu_index {
+        match self.menu.index {
             0 => self.adjust_render_distance(delta),
-            1 => self.adjust_graphics_setting_by(1, 0.05 * delta as f32),
-            2 => self.adjust_graphics_setting_by(2, 0.03 * delta as f32),
-            3 => self.adjust_graphics_setting_by(3, 0.05 * delta as f32),
+            1 => self.graphics_settings.shadows_enabled = delta > 0,
+            2 => self.graphics_settings.fog_enabled = delta > 0,
+            3 => self.graphics_settings.atmosphere_enabled = delta > 0,
             4 => self.adjust_graphics_setting_by(4, 0.05 * delta as f32),
-            5 => self.adjust_graphics_setting_by(5, 0.02 * delta as f32),
-            6 => self.adjust_graphics_setting_by(6, 0.04 * delta as f32),
-            7 => self.adjust_graphics_setting_by(7, 8.0 * delta as f32),
-            8 => self.adjust_graphics_setting_by(8, 16.0 * delta as f32),
-            9 => self.adjust_graphics_setting_by(9, 0.03 * delta as f32),
-            10 => self.adjust_graphics_setting_by(10, 0.03 * delta as f32),
+            5 => self.adjust_graphics_setting_by(5, 0.03 * delta as f32),
+            6 => self.adjust_graphics_setting_by(6, 0.05 * delta as f32),
+            7 => self.adjust_graphics_setting_by(7, 0.05 * delta as f32),
+            8 => self.adjust_graphics_setting_by(8, 0.02 * delta as f32),
+            9 => self.adjust_graphics_setting_by(9, 0.04 * delta as f32),
+            10 => self.adjust_graphics_setting_by(10, 8.0 * delta as f32),
+            11 => self.adjust_graphics_setting_by(11, 16.0 * delta as f32),
+            12 => self.adjust_graphics_setting_by(12, 0.03 * delta as f32),
+            13 => self.adjust_graphics_setting_by(13, 0.03 * delta as f32),
             _ => {}
         }
     }
 
     fn adjust_graphics_setting_by(&mut self, index: usize, delta: f32) {
         match index {
-            1 => {
+            4 => {
                 self.graphics_settings.shader_quality =
                     (self.graphics_settings.shader_quality + delta).clamp(0.0, 1.0);
             }
-            2 => {
+            5 => {
                 self.graphics_settings.ambient_boost =
                     (self.graphics_settings.ambient_boost + delta).clamp(0.0, 0.70);
             }
-            3 => {
+            6 => {
                 self.graphics_settings.shadow_softness =
                     (self.graphics_settings.shadow_softness + delta).clamp(0.1, 1.5);
             }
-            4 => {
+            7 => {
                 self.graphics_settings.shadow_contrast =
                     (self.graphics_settings.shadow_contrast + delta).clamp(0.2, 2.2);
             }
-            5 => {
+            8 => {
                 self.graphics_settings.far_shadow_lift =
                     (self.graphics_settings.far_shadow_lift + delta).clamp(0.0, 0.6);
             }
-            6 => {
+            9 => {
                 self.graphics_settings.fog_strength =
                     (self.graphics_settings.fog_strength + delta).clamp(0.0, 1.2);
             }
-            7 => {
+            10 => {
                 self.graphics_settings.fog_start =
                     (self.graphics_settings.fog_start + delta).clamp(16.0, 1200.0);
                 if self.graphics_settings.fog_end <= self.graphics_settings.fog_start + 1.0 {
                     self.graphics_settings.fog_end = self.graphics_settings.fog_start + 1.0;
                 }
             }
-            8 => {
+            11 => {
                 self.graphics_settings.fog_end =
                     (self.graphics_settings.fog_end + delta).clamp(24.0, 2000.0);
                 if self.graphics_settings.fog_end <= self.graphics_settings.fog_start + 1.0 {
@@ -1217,11 +1228,11 @@ impl App {
                         (self.graphics_settings.fog_end - 1.0).max(16.0);
                 }
             }
-            9 => {
+            12 => {
                 self.graphics_settings.atmosphere_strength =
                     (self.graphics_settings.atmosphere_strength + delta).clamp(0.0, 1.0);
             }
-            10 => {
+            13 => {
                 self.graphics_settings.color_vibrance =
                     (self.graphics_settings.color_vibrance + delta).clamp(0.5, 1.8);
             }
@@ -1280,12 +1291,12 @@ impl App {
     }
 
     fn terrain_lab_overlay(&self) -> Option<(String, Vec<String>, usize)> {
-        if !self.terrain_lab_mode || !self.terrain_lab_panel_visible {
+        if !self.terrain_lab.enabled || !self.terrain_lab.panel_visible {
             return None;
         }
         let keys = TerrainConfig::parameter_keys();
         let max_rows = 12_usize;
-        let selected = self.terrain_lab_selected.min(keys.len().saturating_sub(1));
+        let selected = self.terrain_lab.selected_index.min(keys.len().saturating_sub(1));
         let page_start = selected.saturating_sub(max_rows / 2);
         let page_end = (page_start + max_rows).min(keys.len());
         let shown = &keys[page_start..page_end];
@@ -1314,14 +1325,14 @@ impl App {
     }
 
     fn terrain_lab_adjust_selected(&mut self, delta: f32) {
-        if !self.terrain_lab_mode {
+        if !self.terrain_lab.enabled {
             return;
         }
         let keys = TerrainConfig::parameter_keys();
         if keys.is_empty() {
             return;
         }
-        let index = self.terrain_lab_selected.min(keys.len() - 1);
+        let index = self.terrain_lab.selected_index.min(keys.len() - 1);
         let key = keys[index];
         let mut cfg = self.world.terrain_config();
         let current = TerrainParamRegistry::value(&cfg, key);
@@ -1332,7 +1343,7 @@ impl App {
     }
 
     fn terrain_lab_save_preset(&mut self) {
-        if !self.terrain_lab_mode {
+        if !self.terrain_lab.enabled {
             return;
         }
         let mut recipe = TerrainRecipe::balanced(self.world_seed);
@@ -1354,18 +1365,18 @@ impl App {
     }
 
     fn handle_terrain_lab_input(&mut self, code: KeyCode, repeat: bool) -> bool {
-        if !self.terrain_lab_mode {
+        if !self.terrain_lab.enabled {
             return false;
         }
         if code == KeyCode::F8 && !repeat {
-            self.terrain_lab_panel_visible = !self.terrain_lab_panel_visible;
+            self.terrain_lab.panel_visible = !self.terrain_lab.panel_visible;
             return true;
         }
         if code == KeyCode::F9 && !repeat {
             self.terrain_lab_save_preset();
             return true;
         }
-        if !self.terrain_lab_panel_visible {
+        if !self.terrain_lab.panel_visible {
             return false;
         }
         let keys = TerrainConfig::parameter_keys();
@@ -1374,34 +1385,34 @@ impl App {
         }
         match code {
             KeyCode::ArrowUp if !repeat => {
-                self.terrain_lab_selected = self.terrain_lab_selected.saturating_sub(1);
+                self.terrain_lab.selected_index = self.terrain_lab.selected_index.saturating_sub(1);
                 true
             }
             KeyCode::ArrowDown if !repeat => {
-                self.terrain_lab_selected = (self.terrain_lab_selected + 1).min(keys.len() - 1);
+                self.terrain_lab.selected_index = (self.terrain_lab.selected_index + 1).min(keys.len() - 1);
                 true
             }
             KeyCode::ArrowLeft => {
                 self.terrain_lab_adjust_selected(-TerrainParamRegistry::step(
-                    keys[self.terrain_lab_selected],
+                    keys[self.terrain_lab.selected_index],
                 ));
                 true
             }
             KeyCode::ArrowRight => {
                 self.terrain_lab_adjust_selected(TerrainParamRegistry::step(
-                    keys[self.terrain_lab_selected],
+                    keys[self.terrain_lab.selected_index],
                 ));
                 true
             }
             KeyCode::PageDown => {
                 self.terrain_lab_adjust_selected(
-                    -TerrainParamRegistry::step(keys[self.terrain_lab_selected]) * 5.0,
+                    -TerrainParamRegistry::step(keys[self.terrain_lab.selected_index]) * 5.0,
                 );
                 true
             }
             KeyCode::PageUp => {
                 self.terrain_lab_adjust_selected(
-                    TerrainParamRegistry::step(keys[self.terrain_lab_selected]) * 5.0,
+                    TerrainParamRegistry::step(keys[self.terrain_lab.selected_index]) * 5.0,
                 );
                 true
             }
@@ -1410,7 +1421,7 @@ impl App {
     }
 
     fn current_menu_layout(&self) -> Option<MenuLayout> {
-        if self.ui_mode != UiMode::Paused {
+        if self.menu.ui_mode != UiMode::Paused {
             return None;
         }
         let window = self.window.as_ref()?;
@@ -1421,49 +1432,49 @@ impl App {
     }
 
     fn update_menu_hover_from_cursor(&mut self) {
-        if self.ui_mode != UiMode::Paused {
-            self.menu_hover_index = None;
+        if self.menu.ui_mode != UiMode::Paused {
+            self.menu.hover_index = None;
             return;
         }
         let Some((cursor_x, cursor_y)) = self.input.cursor_position else {
-            self.menu_hover_index = None;
+            self.menu.hover_index = None;
             return;
         };
         let Some(layout) = self.current_menu_layout() else {
-            self.menu_hover_index = None;
+            self.menu.hover_index = None;
             return;
         };
-        self.menu_hover_index = layout
+        self.menu.hover_index = layout
             .item_rects
             .iter()
             .position(|rect| rect.contains(cursor_x, cursor_y));
     }
 
     fn handle_menu_wheel(&mut self, delta_y: f32) {
-        if self.ui_mode != UiMode::Paused || delta_y.abs() <= f32::EPSILON {
+        if self.menu.ui_mode != UiMode::Paused || delta_y.abs() <= f32::EPSILON {
             return;
         }
         let direction = if delta_y > 0.0 { 1 } else { -1 };
         self.update_menu_hover_from_cursor();
-        if let Some(index) = self.menu_hover_index {
-            self.menu_index = index;
-            if self.menu_page == MenuPage::Graphics && self.menu_index <= 10 {
+        if let Some(index) = self.menu.hover_index {
+            self.menu.index = index;
+            if self.menu.page == MenuPage::Graphics && self.menu.index <= 13 {
                 self.adjust_menu_value(direction);
                 return;
             }
         }
         let count = self.menu_item_count().max(1);
-        self.menu_index = if direction > 0 {
-            self.menu_index.saturating_sub(1)
+        self.menu.index = if direction > 0 {
+            self.menu.index.saturating_sub(1)
         } else {
-            (self.menu_index + 1) % count
+            (self.menu.index + 1) % count
         };
     }
 
     fn handle_terrain_lab_wheel(&mut self, delta_y: f32) {
-        if !self.terrain_lab_mode
-            || !self.terrain_lab_panel_visible
-            || self.ui_mode != UiMode::Playing
+        if !self.terrain_lab.enabled
+            || !self.terrain_lab.panel_visible
+            || self.menu.ui_mode != UiMode::Playing
             || delta_y.abs() <= f32::EPSILON
         {
             return;
@@ -1472,16 +1483,29 @@ impl App {
         if keys.is_empty() {
             return;
         }
-        let step = TerrainParamRegistry::step(keys[self.terrain_lab_selected.min(keys.len() - 1)]);
+        let step = TerrainParamRegistry::step(keys[self.terrain_lab.selected_index.min(keys.len() - 1)]);
         self.terrain_lab_adjust_selected(if delta_y > 0.0 { step } else { -step });
     }
 
     fn hud_lines(&self) -> Vec<String> {
+        let camera = self.active_camera();
+        let (wx, wy, wz) = (
+            camera.position.x.floor() as i64,
+            camera.position.y.floor() as i32,
+            camera.position.z.floor() as i64,
+        );
+        let (cx, cz) = World::world_to_chunk(wx, wz);
         let slot = self.inventory.selected_slot();
         let hotbar = self.inventory.hotbar();
         let mut lines = vec![
             format!("SUN {:.1}", self.world_time_seconds),
             format!("SEED {}", self.world_seed),
+            format!(
+                "XYZ {:.1} {:.1} {:.1}",
+                camera.position.x, camera.position.y, camera.position.z
+            ),
+            format!("BLOCK {} {} {}", wx, wy, wz),
+            format!("CHUNK {} {}", cx, cz),
             format!(
                 "SLOT {} {} {}",
                 self.inventory.selected_hotbar_index() + 1,
@@ -1512,7 +1536,7 @@ impl App {
                 lines.push("F6 RELOAD".to_string());
             }
         }
-        if self.terrain_lab_mode {
+        if self.terrain_lab.enabled {
             lines.push("LAB F8 PANEL F9 SAVE".to_string());
         }
         lines
@@ -1632,8 +1656,21 @@ impl App {
             return;
         };
 
+        if let Some((sub, _)) = find_sub_block_at_point(&self.world, hit.cell, hit.point) {
+            let edge_color = [0.10, 0.13, 0.16, 0.94];
+            for (a, b) in sub_block_face_outline_points(sub, hit.normal) {
+                if let (Some(pa), Some(pb)) = (
+                    world_to_screen(camera, a, screen_size[0], screen_size[1]),
+                    world_to_screen(camera, b, screen_size[0], screen_size[1]),
+                ) {
+                    push_screen_line(vertices, pa, pb, 1.8, edge_color);
+                }
+            }
+            return;
+        }
+
         let plane = face_plane_points(hit.cell, hit.normal, divisions);
-        let color = [0.92, 0.97, 0.88, 0.88];
+        let color = [0.14, 0.18, 0.20, 0.80];
         for (a, b) in plane {
             if let (Some(pa), Some(pb)) = (
                 world_to_screen(camera, a, screen_size[0], screen_size[1]),
@@ -1645,7 +1682,7 @@ impl App {
     }
 
     fn edit_block_from_click(&mut self, remove: bool) {
-        if self.ui_mode != UiMode::Playing {
+        if self.menu.ui_mode != UiMode::Playing {
             return;
         }
         let camera = self.active_camera();
@@ -1666,8 +1703,14 @@ impl App {
         };
 
         if self.subdivide_scale != SubdivideScale::Full {
-            let _ = self.edit_sub_block_from_click(remove, hit);
-            return;
+            if self.edit_sub_block_from_click(remove, hit) {
+                return;
+            }
+            // In subdivision mode, still allow normal block breaking when no
+            // sub-block target exists.
+            if !remove {
+                return;
+            }
         }
 
         if remove {
@@ -1773,7 +1816,13 @@ impl App {
             return false;
         }
         if remove {
-            if let Some((hit_sub, block)) = find_sub_block_at_point(&self.world, hit.cell, hit.point)
+            let mut picked = find_sub_block_at_point(&self.world, hit.cell, hit.point);
+            if picked.is_none() {
+                let probe = hit.point - hit.normal.as_vec3() * 0.0025;
+                let probe_cell = voxel_coords(probe);
+                picked = find_sub_block_at_point(&self.world, probe_cell, probe);
+            }
+            if let Some((hit_sub, block)) = picked
             {
                 let _ = self.world.clear_sub_block_i64(
                     hit_sub.x,
@@ -1804,8 +1853,57 @@ impl App {
             return false;
         }
 
-        let target_base = voxel_coords(hit.previous_point);
-        let target = sub_target_from_world_point(target_base, hit.previous_point, divisions);
+        let target = if let Some((hit_sub, _)) = find_sub_block_at_point(&self.world, hit.cell, hit.point)
+        {
+            let mut base = (hit_sub.x, hit_sub.y, hit_sub.z);
+            let mut sx = hit_sub.sx as i32 + hit.normal.x;
+            let mut sy = hit_sub.sy as i32 + hit.normal.y;
+            let mut sz = hit_sub.sz as i32 + hit.normal.z;
+            let d = divisions as i32;
+
+            if sx < 0 {
+                base.0 -= 1;
+                sx = d - 1;
+            } else if sx >= d {
+                base.0 += 1;
+                sx = 0;
+            }
+            if sy < 0 {
+                base.1 -= 1;
+                sy = d - 1;
+            } else if sy >= d {
+                base.1 += 1;
+                sy = 0;
+            }
+            if sz < 0 {
+                base.2 -= 1;
+                sz = d - 1;
+            } else if sz >= d {
+                base.2 += 1;
+                sz = 0;
+            }
+
+            if base.1 < WORLD_MIN_Y || base.1 > WORLD_MAX_Y {
+                return false;
+            }
+
+            SubTarget {
+                base,
+                sx: sx as u8,
+                sy: sy as u8,
+                sz: sz as u8,
+            }
+        } else {
+            let place_point = if hit.previous != hit.cell {
+                // Crossing into a solid base block: place into the air cell we came from.
+                hit.previous_point
+            } else {
+                // Sub-cell hit inside same base cell: step outward along hit normal.
+                hit.point + hit.normal.as_vec3() * 0.0035
+            };
+            let target_base = voxel_coords(place_point);
+            sub_target_from_world_point(target_base, place_point, divisions)
+        };
         if self
             .world
             .block_at_i64(target.base.0, target.base.1, target.base.2)
@@ -1824,9 +1922,7 @@ impl App {
             return false;
         }
 
-        if !self.spend_sub_units(slot_block, self.sub_piece_cost_units()) {
-            return false;
-        }
+        let unit_cost = self.sub_piece_cost_units();
         if !self.world.set_sub_block_i64(
             target.base.0,
             target.base.1,
@@ -1837,6 +1933,18 @@ impl App {
             target.sz,
             slot_block,
         ) {
+            return false;
+        }
+        if !self.spend_sub_units(slot_block, unit_cost) {
+            let _ = self.world.clear_sub_block_i64(
+                target.base.0,
+                target.base.1,
+                target.base.2,
+                divisions,
+                target.sx,
+                target.sy,
+                target.sz,
+            );
             return false;
         }
         self.mark_block_change_dirty(target.base.0, target.base.2);
@@ -1872,7 +1980,7 @@ impl ApplicationHandler for App {
         self.gpu = Some(gpu);
         self.last_frame = Instant::now();
         self.next_frame_at = self.last_frame;
-        self.last_chunk_center = self.current_chunk_center();
+        self.chunk_stream.last_chunk_center = self.current_chunk_center();
         self.schedule_visible_chunks();
         self.refresh_window_title();
     }
@@ -1905,14 +2013,14 @@ impl ApplicationHandler for App {
                 } else {
                     [1280.0, 720.0]
                 };
-                let menu_overlay = match self.ui_mode {
+                let menu_overlay = match self.menu.ui_mode {
                     UiMode::Paused => {
                         let (title, lines, selected) = self.menu_overlay();
                         Some(self.debug_overlay.build_menu_vertices(
                             &title,
                             &lines,
                             selected,
-                            self.menu_hover_index,
+                            self.menu.hover_index,
                             screen_size,
                         ))
                     }
@@ -1928,7 +2036,7 @@ impl ApplicationHandler for App {
                     }
                     UiMode::Playing => None,
                 };
-                let terrain_lab_overlay = if self.ui_mode == UiMode::Playing {
+                let terrain_lab_overlay = if self.menu.ui_mode == UiMode::Playing {
                     if let Some((title, lines, selected)) = self.terrain_lab_overlay() {
                         Some(self.debug_overlay.build_menu_vertices(
                             &title,
@@ -1943,7 +2051,7 @@ impl ApplicationHandler for App {
                 } else {
                     None
                 };
-                let gameplay_overlay = if self.ui_mode == UiMode::Playing {
+                let gameplay_overlay = if self.menu.ui_mode == UiMode::Playing {
                     self.gameplay_overlay_vertices(screen_size)
                 } else {
                     Vec::new()
@@ -1980,11 +2088,11 @@ impl ApplicationHandler for App {
                         ElementState::Pressed => {
                             self.input.pressed.insert(code);
 
-                            if self.ui_mode == UiMode::Paused {
+                            if self.menu.ui_mode == UiMode::Paused {
                                 self.handle_menu_navigation(code);
                                 return;
                             }
-                            if self.ui_mode == UiMode::Inventory {
+                            if self.menu.ui_mode == UiMode::Inventory {
                                 self.handle_inventory_navigation(code);
                                 return;
                             }
@@ -2031,7 +2139,7 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(pos) => pos.y as f32 / 40.0,
                 };
-                if self.ui_mode == UiMode::Playing
+                if self.menu.ui_mode == UiMode::Playing
                     && self.input.mouse_captured
                     && raycast_world_detailed(
                         &self.world,
@@ -2055,12 +2163,12 @@ impl ApplicationHandler for App {
                 button,
                 ..
             } => {
-                if self.ui_mode == UiMode::Paused
+                if self.menu.ui_mode == UiMode::Paused
                     && (button == MouseButton::Left || button == MouseButton::Right)
                 {
                     self.update_menu_hover_from_cursor();
-                    if let Some(index) = self.menu_hover_index {
-                        self.menu_index = index;
+                    if let Some(index) = self.menu.hover_index {
+                        self.menu.index = index;
                         if button == MouseButton::Left {
                             self.activate_menu_item();
                         } else {
@@ -2069,7 +2177,7 @@ impl ApplicationHandler for App {
                     }
                     return;
                 }
-                if self.ui_mode != UiMode::Playing {
+                if self.menu.ui_mode != UiMode::Playing {
                     return;
                 }
                 if !self.input.mouse_captured && button == MouseButton::Left {
@@ -2104,7 +2212,7 @@ impl ApplicationHandler for App {
         _device_id: winit::event::DeviceId,
         event: DeviceEvent,
     ) {
-        if !self.input.mouse_captured || self.ui_mode != UiMode::Playing {
+        if !self.input.mouse_captured || self.menu.ui_mode != UiMode::Playing {
             return;
         }
 
@@ -2127,6 +2235,10 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.should_exit {
+            event_loop.exit();
+            return;
+        }
         let now = Instant::now();
         if let Some(target_fps) = self.current_frame_cap() {
             let frame_interval = Duration::from_secs_f64(1.0 / target_fps as f64);
@@ -2147,7 +2259,7 @@ impl ApplicationHandler for App {
         self.debug_overlay.record_frame(dt);
         self.update(dt);
         let center = self.current_chunk_center();
-        if center != self.last_chunk_center {
+        if center != self.chunk_stream.last_chunk_center {
             self.schedule_visible_chunks();
         }
         self.process_chunk_build_results();
@@ -2410,3 +2522,4 @@ mod tests {
         })
     }
 }
+

@@ -10,25 +10,32 @@ use subdivism::game::{
 };
 
 fn main() {
+    if let Err(err) = try_main() {
+        eprintln!("{err}");
+        std::process::exit(1);
+    }
+}
+
+fn try_main() -> Result<(), String> {
     let raw_args = std::env::args().skip(1).collect::<Vec<_>>();
     let wants_cli = raw_args.iter().any(|arg| arg == "--cli");
     let wants_help = raw_args.iter().any(|arg| arg == "--help" || arg == "-h");
     if !wants_cli && !wants_help {
         subdivism::app::run_terrain_lab();
-        return;
+        return Ok(());
     }
 
     let options = LabOptions::from_env();
     if options.help {
         print_help();
-        return;
+        return Ok(());
     }
     if options.list_params {
         println!("TERRAIN PARAMETERS");
         for key in TerrainConfig::parameter_keys() {
             println!("  {key}");
         }
-        return;
+        return Ok(());
     }
 
     let seed = options.seed.unwrap_or_else(default_seed);
@@ -41,7 +48,7 @@ fn main() {
     for (key, value) in &options.sets {
         terrain
             .set_named_param(key, *value)
-            .unwrap_or_else(|err| panic!("failed to apply --set {key}={value}: {err}"));
+            .map_err(|err| format!("failed to apply --set {key}={value}: {err}"))?;
     }
     if let Some((x, z)) = options.ravine_offset {
         terrain.ravine_offset_x = x;
@@ -77,9 +84,8 @@ fn main() {
         println!("{}", sample.ascii);
     }
     if let Some(csv_path) = options.csv_path.as_ref() {
-        fs::write(csv_path, sample.csv).unwrap_or_else(|err| {
-            panic!("failed to write sample CSV {}: {err}", csv_path.display())
-        });
+        fs::write(csv_path, sample.csv)
+            .map_err(|err| format!("failed to write sample CSV {}: {err}", csv_path.display()))?;
         println!("WROTE CSV {}", csv_path.display());
     }
 
@@ -102,13 +108,14 @@ fn main() {
         recipe.terrain = terrain;
         recipe
             .write_to_file(out_path)
-            .unwrap_or_else(|err| panic!("failed to write recipe {}: {err}", out_path.display()));
+            .map_err(|err| format!("failed to write recipe {}: {err}", out_path.display()))?;
         println!("WROTE RECIPE {}", out_path.display());
         println!(
             "RUN GAME WITH cargo run -- --terrain-file {}",
             out_path.display()
         );
     }
+    Ok(())
 }
 
 #[derive(Default)]
