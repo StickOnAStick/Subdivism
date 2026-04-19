@@ -7,8 +7,8 @@ use glam::Vec3;
 
 use crate::mesh::{Vertex, push_quad};
 
-mod meshing;
 mod lighting;
+mod meshing;
 mod noise;
 mod palette;
 mod storage;
@@ -18,18 +18,21 @@ use noise::{smooth_range, value_noise_2d, value_noise_3d};
 use storage::WorldStorage;
 
 pub const CHUNK_SIZE: i64 = 16;
-pub const WORLD_MIN_Y: i32 = -256;
-pub const WORLD_MAX_Y: i32 = 1024;
+pub const WORLD_MIN_Y: i32 = -64;
+pub const WORLD_MAX_Y: i32 = 320;
 pub const WORLD_HEIGHT: i32 = WORLD_MAX_Y - WORLD_MIN_Y + 1;
-pub const WORLD_OVERWORLD_FLOOR: i32 = 255;
+pub const WORLD_OVERWORLD_FLOOR: i32 = 0;
+pub const WORLD_SEA_LEVEL: i32 = 0;
+pub const WORLD_SURFACE_MIN_Y: i32 = WORLD_MIN_Y + 2;
 pub const DEFAULT_WORLD_SEED: i64 = 0x5EED_BA5E_u64 as i64;
 pub const MAX_NATURAL_CAVE_DEPTH_BELOW_SURFACE: i32 = 200;
-pub const WORLD_RENDER_FLOOR_Y: i32 = 0;
+pub const WORLD_RENDER_FLOOR_Y: i32 = WORLD_MIN_Y;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Block {
     Air,
+    Water,
     Grass,
     Dirt,
     Stone,
@@ -39,7 +42,7 @@ pub enum Block {
 
 impl Block {
     pub fn is_solid(self) -> bool {
-        !matches!(self, Self::Air)
+        !matches!(self, Self::Air | Self::Water)
     }
 
     fn to_id(self) -> u8 {
@@ -48,11 +51,12 @@ impl Block {
 
     fn from_id(id: u8) -> Self {
         match id {
-            1 => Self::Grass,
-            2 => Self::Dirt,
-            3 => Self::Stone,
-            4 => Self::Deepslate,
-            5 => Self::DeepDark,
+            1 => Self::Water,
+            2 => Self::Grass,
+            3 => Self::Dirt,
+            4 => Self::Stone,
+            5 => Self::Deepslate,
+            6 => Self::DeepDark,
             _ => Self::Air,
         }
     }
@@ -83,12 +87,19 @@ pub struct TerrainConfig {
     pub macro_amplitude: f32,
     pub detail_scale: f32,
     pub detail_amplitude: f32,
+    pub micro_scale: f32,
+    pub micro_amplitude: f32,
     pub mountain_scale: f32,
     pub mountain_amplitude: f32,
+    pub mountain_sharpness: f32,
     pub valley_scale: f32,
     pub valley_depth: f32,
     pub cliff_scale: f32,
     pub cliff_strength: f32,
+    pub cliff_ledge_flatness: f32,
+    pub cliff_recess_strength: f32,
+    pub cliff_edge_rounding: f32,
+    pub cliff_base_smoothing: f32,
     pub terrace_step: f32,
     pub biome_scale: f32,
     pub biome_blend: f32,
@@ -112,167 +123,216 @@ pub struct TerrainParamSpec {
     pub step: f32,
 }
 
-const TERRAIN_PARAM_SPECS: [TerrainParamSpec; 23] = [
+const TERRAIN_PARAM_SPECS: [TerrainParamSpec; 30] = [
     TerrainParamSpec {
         key: "base_height",
         label: "BASE HEIGHT",
-        min: (WORLD_OVERWORLD_FLOOR + 8) as f32,
-        max: (WORLD_MAX_Y - 8) as f32,
-        step: 0.5,
+        min: -128.0,
+        max: 256.0,
+        step: 2.0,
     },
     TerrainParamSpec {
         key: "macro_scale",
-        label: "MACRO SCALE",
-        min: 0.0015,
-        max: 0.08,
-        step: 0.0005,
+        label: "MACRO SPAN",
+        min: 0.0,
+        max: 1.0,
+        step: 0.01,
     },
     TerrainParamSpec {
         key: "macro_amplitude",
         label: "MACRO AMPLITUDE",
-        min: 0.0,
-        max: 30.0,
-        step: 0.4,
+        min: -128.0,
+        max: 128.0,
+        step: 1.0,
     },
     TerrainParamSpec {
         key: "detail_scale",
-        label: "DETAIL SCALE",
-        min: 0.005,
-        max: 0.30,
-        step: 0.001,
+        label: "DETAIL SPAN",
+        min: 0.0,
+        max: 1.0,
+        step: 0.01,
     },
     TerrainParamSpec {
         key: "detail_amplitude",
         label: "DETAIL AMPLITUDE",
+        min: -64.0,
+        max: 64.0,
+        step: 0.5,
+    },
+    TerrainParamSpec {
+        key: "micro_scale",
+        label: "MICRO SPAN",
         min: 0.0,
-        max: 12.0,
-        step: 0.2,
+        max: 1.0,
+        step: 0.01,
+    },
+    TerrainParamSpec {
+        key: "micro_amplitude",
+        label: "MICRO AMPLITUDE",
+        min: -24.0,
+        max: 24.0,
+        step: 0.25,
     },
     TerrainParamSpec {
         key: "mountain_scale",
-        label: "MOUNTAIN SCALE",
-        min: 0.0015,
-        max: 0.08,
-        step: 0.0005,
+        label: "MOUNTAIN SPAN",
+        min: 0.0,
+        max: 1.0,
+        step: 0.01,
     },
     TerrainParamSpec {
         key: "mountain_amplitude",
         label: "MOUNTAIN AMPLITUDE",
         min: 0.0,
-        max: 40.0,
+        max: 192.0,
         step: 0.5,
     },
     TerrainParamSpec {
+        key: "mountain_sharpness",
+        label: "MOUNTAIN SHARPNESS",
+        min: 0.0,
+        max: 1.0,
+        step: 0.02,
+    },
+    TerrainParamSpec {
         key: "valley_scale",
-        label: "VALLEY SCALE",
-        min: 0.0015,
-        max: 0.08,
-        step: 0.0005,
+        label: "VALLEY SPAN",
+        min: 0.0,
+        max: 1.0,
+        step: 0.01,
     },
     TerrainParamSpec {
         key: "valley_depth",
         label: "VALLEY DEPTH",
-        min: 0.0,
-        max: 24.0,
-        step: 0.4,
+        min: -128.0,
+        max: 128.0,
+        step: 1.0,
     },
     TerrainParamSpec {
         key: "cliff_scale",
-        label: "CLIFF SCALE",
-        min: 0.004,
-        max: 0.16,
-        step: 0.0005,
+        label: "CLIFF SPAN",
+        min: 0.0,
+        max: 1.0,
+        step: 0.01,
     },
     TerrainParamSpec {
         key: "cliff_strength",
         label: "CLIFF STRENGTH",
         min: 0.0,
         max: 1.0,
-        step: 0.02,
+        step: 0.05,
+    },
+    TerrainParamSpec {
+        key: "cliff_ledge_flatness",
+        label: "CLIFF LEDGE FLATNESS",
+        min: 0.0,
+        max: 1.0,
+        step: 0.05,
+    },
+    TerrainParamSpec {
+        key: "cliff_recess_strength",
+        label: "CLIFF RECESS STRENGTH",
+        min: 0.0,
+        max: 1.0,
+        step: 0.05,
+    },
+    TerrainParamSpec {
+        key: "cliff_edge_rounding",
+        label: "CLIFF EDGE ROUNDING",
+        min: 0.0,
+        max: 1.0,
+        step: 0.05,
+    },
+    TerrainParamSpec {
+        key: "cliff_base_smoothing",
+        label: "CLIFF BASE SMOOTHING",
+        min: 0.0,
+        max: 1.0,
+        step: 0.05,
     },
     TerrainParamSpec {
         key: "terrace_step",
         label: "TERRACE STEP",
-        min: 0.4,
-        max: 10.0,
-        step: 0.1,
+        min: -32.0,
+        max: 64.0,
+        step: 0.5,
     },
     TerrainParamSpec {
         key: "biome_scale",
-        label: "BIOME SCALE",
-        min: 0.0008,
-        max: 0.03,
-        step: 0.0002,
+        label: "BIOME SPAN",
+        min: 0.0,
+        max: 1.0,
+        step: 0.01,
     },
     TerrainParamSpec {
         key: "biome_blend",
         label: "BIOME BLEND",
-        min: 0.02,
-        max: 0.45,
-        step: 0.01,
+        min: 0.0,
+        max: 1.0,
+        step: 0.05,
     },
     TerrainParamSpec {
         key: "mountain_base_lift",
         label: "MOUNTAIN BASE LIFT",
-        min: -8.0,
-        max: 20.0,
-        step: 0.3,
+        min: -128.0,
+        max: 128.0,
+        step: 1.0,
     },
     TerrainParamSpec {
         key: "desert_base_drop",
         label: "DESERT BASE DROP",
-        min: 0.0,
-        max: 20.0,
-        step: 0.3,
+        min: -128.0,
+        max: 128.0,
+        step: 1.0,
     },
     TerrainParamSpec {
         key: "desert_dune_scale",
-        label: "DESERT DUNE SCALE",
-        min: 0.005,
-        max: 0.20,
-        step: 0.001,
+        label: "DUNE SPAN",
+        min: 0.0,
+        max: 1.0,
+        step: 0.01,
     },
     TerrainParamSpec {
         key: "desert_dune_amplitude",
         label: "DESERT DUNE AMPLITUDE",
-        min: 0.0,
-        max: 12.0,
-        step: 0.2,
+        min: -64.0,
+        max: 128.0,
+        step: 1.0,
     },
     TerrainParamSpec {
         key: "ravine_scale",
-        label: "RAVINE SCALE",
-        min: 0.001,
-        max: 0.08,
-        step: 0.0005,
+        label: "RAVINE SPAN",
+        min: 0.0,
+        max: 1.0,
+        step: 0.01,
     },
     TerrainParamSpec {
         key: "ravine_strength",
         label: "RAVINE STRENGTH",
-        min: 0.0,
-        max: 16.0,
-        step: 0.2,
+        min: -64.0,
+        max: 128.0,
+        step: 1.0,
     },
     TerrainParamSpec {
         key: "ravine_width",
         label: "RAVINE WIDTH",
-        min: 1.0,
-        max: 16.0,
-        step: 0.1,
+        min: -64.0,
+        max: 128.0,
+        step: 1.0,
     },
     TerrainParamSpec {
         key: "ravine_offset_x",
         label: "RAVINE OFFSET X",
-        min: -4096.0,
-        max: 4096.0,
-        step: 1.0,
+        min: -131072.0,
+        max: 131072.0,
+        step: 16.0,
     },
     TerrainParamSpec {
         key: "ravine_offset_z",
         label: "RAVINE OFFSET Z",
-        min: -4096.0,
-        max: 4096.0,
-        step: 1.0,
+        min: -131072.0,
+        max: 131072.0,
+        step: 16.0,
     },
 ];
 
@@ -282,7 +342,10 @@ impl TerrainConfig {
     }
 
     pub fn parameter_keys() -> Vec<&'static str> {
-        Self::parameter_specs().iter().map(|spec| spec.key).collect()
+        Self::parameter_specs()
+            .iter()
+            .map(|spec| spec.key)
+            .collect()
     }
 
     pub fn parameter_spec(key: &str) -> Option<&'static TerrainParamSpec> {
@@ -297,12 +360,19 @@ impl TerrainConfig {
             "macro_amplitude" => Some(self.macro_amplitude),
             "detail_scale" => Some(self.detail_scale),
             "detail_amplitude" => Some(self.detail_amplitude),
+            "micro_scale" => Some(self.micro_scale),
+            "micro_amplitude" => Some(self.micro_amplitude),
             "mountain_scale" => Some(self.mountain_scale),
             "mountain_amplitude" => Some(self.mountain_amplitude),
+            "mountain_sharpness" => Some(self.mountain_sharpness),
             "valley_scale" => Some(self.valley_scale),
             "valley_depth" => Some(self.valley_depth),
             "cliff_scale" => Some(self.cliff_scale),
             "cliff_strength" => Some(self.cliff_strength),
+            "cliff_ledge_flatness" => Some(self.cliff_ledge_flatness),
+            "cliff_recess_strength" => Some(self.cliff_recess_strength),
+            "cliff_edge_rounding" => Some(self.cliff_edge_rounding),
+            "cliff_base_smoothing" => Some(self.cliff_base_smoothing),
             "terrace_step" => Some(self.terrace_step),
             "biome_scale" => Some(self.biome_scale),
             "biome_blend" => Some(self.biome_blend),
@@ -321,27 +391,34 @@ impl TerrainConfig {
 
     pub fn balanced() -> Self {
         Self {
-            base_height: 340.0,
-            macro_scale: 0.012,
-            macro_amplitude: 8.0,
-            detail_scale: 0.045,
-            detail_amplitude: 2.0,
-            mountain_scale: 0.009,
-            mountain_amplitude: 10.0,
-            valley_scale: 0.010,
-            valley_depth: 6.0,
-            cliff_scale: 0.020,
-            cliff_strength: 0.30,
-            terrace_step: 2.5,
-            biome_scale: 0.0038,
-            biome_blend: 0.14,
+            base_height: 34.0,
+            macro_scale: 0.70,
+            macro_amplitude: 9.0,
+            detail_scale: 0.58,
+            detail_amplitude: 2.3,
+            micro_scale: 0.36,
+            micro_amplitude: 0.65,
+            mountain_scale: 0.62,
+            mountain_amplitude: 36.0,
+            mountain_sharpness: 0.28,
+            valley_scale: 0.72,
+            valley_depth: 7.0,
+            cliff_scale: 0.64,
+            cliff_strength: 0.42,
+            cliff_ledge_flatness: 0.55,
+            cliff_recess_strength: 0.28,
+            cliff_edge_rounding: 0.35,
+            cliff_base_smoothing: 0.28,
+            terrace_step: 1.8,
+            biome_scale: 0.52,
+            biome_blend: 0.18,
             mountain_base_lift: 5.0,
-            desert_base_drop: 5.0,
-            desert_dune_scale: 0.030,
-            desert_dune_amplitude: 2.2,
-            ravine_scale: 0.012,
-            ravine_strength: 2.0,
-            ravine_width: 4.5,
+            desert_base_drop: 6.0,
+            desert_dune_scale: 0.48,
+            desert_dune_amplitude: 2.5,
+            ravine_scale: 0.67,
+            ravine_strength: 2.6,
+            ravine_width: 4.4,
             ravine_offset_x: 0.0,
             ravine_offset_z: 0.0,
         }
@@ -349,24 +426,35 @@ impl TerrainConfig {
 
     pub fn alpine() -> Self {
         Self {
-            mountain_amplitude: 18.0,
+            mountain_amplitude: 52.0,
+            mountain_sharpness: 0.40,
             valley_depth: 4.0,
-            cliff_strength: 0.42,
+            cliff_strength: 0.62,
+            cliff_ledge_flatness: 0.68,
+            cliff_recess_strength: 0.34,
+            cliff_edge_rounding: 0.24,
+            cliff_base_smoothing: 0.18,
             mountain_base_lift: 10.0,
             desert_base_drop: 3.0,
-            ravine_strength: 2.6,
+            ravine_strength: 3.0,
             ..Self::balanced()
         }
     }
 
     pub fn canyon() -> Self {
         Self {
-            base_height: 316.0,
+            base_height: 12.0,
             macro_amplitude: 6.0,
-            mountain_amplitude: 5.0,
+            micro_amplitude: 0.42,
+            mountain_amplitude: 18.0,
+            mountain_sharpness: 0.32,
             valley_depth: 12.0,
-            cliff_strength: 0.62,
-            terrace_step: 3.5,
+            cliff_strength: 0.78,
+            cliff_ledge_flatness: 0.76,
+            cliff_recess_strength: 0.52,
+            cliff_edge_rounding: 0.14,
+            cliff_base_smoothing: 0.12,
+            terrace_step: 2.4,
             desert_base_drop: 9.0,
             desert_dune_amplitude: 3.6,
             ravine_strength: 3.4,
@@ -378,10 +466,16 @@ impl TerrainConfig {
     pub fn valleylands() -> Self {
         Self {
             macro_amplitude: 7.0,
-            mountain_amplitude: 6.0,
+            micro_amplitude: 0.78,
+            mountain_amplitude: 24.0,
+            mountain_sharpness: 0.20,
             valley_depth: 9.0,
-            cliff_strength: 0.24,
-            biome_blend: 0.18,
+            cliff_strength: 0.30,
+            cliff_ledge_flatness: 0.42,
+            cliff_recess_strength: 0.16,
+            cliff_edge_rounding: 0.42,
+            cliff_base_smoothing: 0.40,
+            biome_blend: 0.24,
             ravine_strength: 1.5,
             ..Self::balanced()
         }
@@ -404,12 +498,19 @@ impl TerrainConfig {
             "macro_amplitude" => self.macro_amplitude = value,
             "detail_scale" => self.detail_scale = value,
             "detail_amplitude" => self.detail_amplitude = value,
+            "micro_scale" => self.micro_scale = value,
+            "micro_amplitude" => self.micro_amplitude = value,
             "mountain_scale" => self.mountain_scale = value,
             "mountain_amplitude" => self.mountain_amplitude = value,
+            "mountain_sharpness" => self.mountain_sharpness = value,
             "valley_scale" => self.valley_scale = value,
             "valley_depth" => self.valley_depth = value,
             "cliff_scale" => self.cliff_scale = value,
             "cliff_strength" => self.cliff_strength = value,
+            "cliff_ledge_flatness" => self.cliff_ledge_flatness = value,
+            "cliff_recess_strength" => self.cliff_recess_strength = value,
+            "cliff_edge_rounding" => self.cliff_edge_rounding = value,
+            "cliff_base_smoothing" => self.cliff_base_smoothing = value,
             "terrace_step" => self.terrace_step = value,
             "biome_scale" => self.biome_scale = value,
             "biome_blend" => self.biome_blend = value,
@@ -429,31 +530,36 @@ impl TerrainConfig {
     }
 
     pub fn clamp_reasonable(&mut self) {
-        self.base_height = self
-            .base_height
-            .clamp((WORLD_OVERWORLD_FLOOR + 8) as f32, (WORLD_MAX_Y - 8) as f32);
-        self.macro_scale = self.macro_scale.clamp(0.0015, 0.08);
-        self.macro_amplitude = self.macro_amplitude.clamp(0.0, 30.0);
-        self.detail_scale = self.detail_scale.clamp(0.005, 0.30);
-        self.detail_amplitude = self.detail_amplitude.clamp(0.0, 12.0);
-        self.mountain_scale = self.mountain_scale.clamp(0.0015, 0.08);
-        self.mountain_amplitude = self.mountain_amplitude.clamp(0.0, 40.0);
-        self.valley_scale = self.valley_scale.clamp(0.0015, 0.08);
-        self.valley_depth = self.valley_depth.clamp(0.0, 24.0);
-        self.cliff_scale = self.cliff_scale.clamp(0.004, 0.16);
+        self.base_height = self.base_height.clamp(-128.0, 256.0);
+        self.macro_scale = self.macro_scale.clamp(0.0, 1.0);
+        self.macro_amplitude = self.macro_amplitude.clamp(-128.0, 128.0);
+        self.detail_scale = self.detail_scale.clamp(0.0, 1.0);
+        self.detail_amplitude = self.detail_amplitude.clamp(-64.0, 64.0);
+        self.micro_scale = self.micro_scale.clamp(0.0, 1.0);
+        self.micro_amplitude = self.micro_amplitude.clamp(-24.0, 24.0);
+        self.mountain_scale = self.mountain_scale.clamp(0.0, 1.0);
+        self.mountain_amplitude = self.mountain_amplitude.clamp(0.0, 192.0);
+        self.mountain_sharpness = self.mountain_sharpness.clamp(0.0, 1.0);
+        self.valley_scale = self.valley_scale.clamp(0.0, 1.0);
+        self.valley_depth = self.valley_depth.clamp(-128.0, 128.0);
+        self.cliff_scale = self.cliff_scale.clamp(0.0, 1.0);
         self.cliff_strength = self.cliff_strength.clamp(0.0, 1.0);
-        self.terrace_step = self.terrace_step.clamp(0.4, 10.0);
-        self.biome_scale = self.biome_scale.clamp(0.0008, 0.03);
-        self.biome_blend = self.biome_blend.clamp(0.02, 0.45);
-        self.mountain_base_lift = self.mountain_base_lift.clamp(-8.0, 20.0);
-        self.desert_base_drop = self.desert_base_drop.clamp(0.0, 20.0);
-        self.desert_dune_scale = self.desert_dune_scale.clamp(0.005, 0.20);
-        self.desert_dune_amplitude = self.desert_dune_amplitude.clamp(0.0, 12.0);
-        self.ravine_scale = self.ravine_scale.clamp(0.001, 0.08);
-        self.ravine_strength = self.ravine_strength.clamp(0.0, 16.0);
-        self.ravine_width = self.ravine_width.clamp(1.0, 16.0);
-        self.ravine_offset_x = self.ravine_offset_x.clamp(-4096.0, 4096.0);
-        self.ravine_offset_z = self.ravine_offset_z.clamp(-4096.0, 4096.0);
+        self.cliff_ledge_flatness = self.cliff_ledge_flatness.clamp(0.0, 1.0);
+        self.cliff_recess_strength = self.cliff_recess_strength.clamp(0.0, 1.0);
+        self.cliff_edge_rounding = self.cliff_edge_rounding.clamp(0.0, 1.0);
+        self.cliff_base_smoothing = self.cliff_base_smoothing.clamp(0.0, 1.0);
+        self.terrace_step = self.terrace_step.clamp(-32.0, 64.0);
+        self.biome_scale = self.biome_scale.clamp(0.0, 1.0);
+        self.biome_blend = self.biome_blend.clamp(0.0, 1.0);
+        self.mountain_base_lift = self.mountain_base_lift.clamp(-128.0, 128.0);
+        self.desert_base_drop = self.desert_base_drop.clamp(-128.0, 128.0);
+        self.desert_dune_scale = self.desert_dune_scale.clamp(0.0, 1.0);
+        self.desert_dune_amplitude = self.desert_dune_amplitude.clamp(-64.0, 128.0);
+        self.ravine_scale = self.ravine_scale.clamp(0.0, 1.0);
+        self.ravine_strength = self.ravine_strength.clamp(-64.0, 128.0);
+        self.ravine_width = self.ravine_width.clamp(-64.0, 128.0);
+        self.ravine_offset_x = self.ravine_offset_x.clamp(-131072.0, 131072.0);
+        self.ravine_offset_z = self.ravine_offset_z.clamp(-131072.0, 131072.0);
     }
 }
 
@@ -471,6 +577,7 @@ enum BiomeKind {
     Valley,
     Mountain,
     Desert,
+    Forest,
 }
 
 impl World {
@@ -498,9 +605,11 @@ impl World {
             seed,
             terrain,
         };
-        world.storage.spawn_point = world
-            .spawn_point_for_column(0, 0)
-            .unwrap_or(Vec3::new(0.5, (WORLD_OVERWORLD_FLOOR + 3) as f32, 0.5));
+        world.storage.spawn_point = world.spawn_point_for_column(0, 0).unwrap_or(Vec3::new(
+            0.5,
+            (WORLD_OVERWORLD_FLOOR + 3) as f32,
+            0.5,
+        ));
         world
     }
 
@@ -536,6 +645,7 @@ fn biome_index(kind: BiomeKind) -> usize {
         BiomeKind::Valley => 2,
         BiomeKind::Mountain => 3,
         BiomeKind::Desert => 4,
+        BiomeKind::Forest => 5,
     }
 }
 
@@ -545,15 +655,13 @@ fn biome_from_index(index: usize) -> BiomeKind {
         2 => BiomeKind::Valley,
         3 => BiomeKind::Mountain,
         4 => BiomeKind::Desert,
+        5 => BiomeKind::Forest,
         _ => BiomeKind::Meadow,
     }
 }
 
 fn valid_sub_coords(divisions: u8, sx: u8, sy: u8, sz: u8) -> bool {
-    (divisions == 3 || divisions == 6)
-        && sx < divisions
-        && sy < divisions
-        && sz < divisions
+    (divisions == 3 || divisions == 6) && sx < divisions && sy < divisions && sz < divisions
 }
 
 fn add_sub_block_cube(vertices: &mut Vec<Vertex>, pos: SubBlockPos, block: Block, world: &World) {
@@ -659,6 +767,49 @@ fn crust_block_for_y(y: i32) -> Block {
     }
 }
 
+fn should_carve_air(seed: i64, x: i64, y: i32, z: i64, surface_y: i32) -> bool {
+    should_carve_cave(seed, x, y, z, surface_y)
+        || should_force_surface_breakthrough(seed, x, y, z, surface_y)
+}
+
+fn should_force_surface_breakthrough(seed: i64, x: i64, y: i32, z: i64, surface_y: i32) -> bool {
+    let depth_from_surface = (surface_y - y).max(0);
+    if depth_from_surface > 5 {
+        return false;
+    }
+
+    let xf = x as f32;
+    let zf = z as f32;
+    let lane = (1.0 - value_noise_2d(seed.wrapping_add(0xE19B_01AA), xf * 0.095, zf * 0.095).abs())
+        .powf(2.2);
+    if lane < 0.64 + depth_from_surface as f32 * 0.035 {
+        return false;
+    }
+
+    let probe_depth = (depth_from_surface + 2).clamp(2, 5);
+    let mut cave_below = should_carve_cave(seed, x, surface_y - probe_depth, z, surface_y);
+    if !cave_below && depth_from_surface <= 2 && probe_depth < 5 {
+        cave_below = should_carve_cave(seed, x, surface_y - (probe_depth + 1), z, surface_y);
+    }
+    if !cave_below {
+        return false;
+    }
+
+    let yf = y as f32;
+    let vertical_shape = (1.0
+        - value_noise_3d(
+            seed.wrapping_add(0xA6E8_7BAD),
+            xf * 0.21,
+            yf * 0.29,
+            zf * 0.21,
+        )
+        .abs())
+    .powf(2.4 + depth_from_surface as f32 * 0.2);
+    let semi_random = lane * 0.58 + vertical_shape * 0.42;
+    let threshold = 0.60 + depth_from_surface as f32 * 0.04;
+    semi_random > threshold
+}
+
 fn should_carve_cave(seed: i64, x: i64, y: i32, z: i64, surface_y: i32) -> bool {
     let depth_from_surface = (surface_y - y).max(0);
     if depth_from_surface > MAX_NATURAL_CAVE_DEPTH_BELOW_SURFACE {
@@ -670,44 +821,67 @@ fn should_carve_cave(seed: i64, x: i64, y: i32, z: i64, surface_y: i32) -> bool 
     let zf = z as f32;
     let depth_t = (depth_from_surface as f32 / 96.0).clamp(0.0, 1.0);
 
-    // Entrance corridors: sparse, narrow channels that can break to surface.
+    // Surface entrances are usually narrow, with rare larger apertures.
     let entrance_lane = smooth_range(
-        value_noise_2d(seed.wrapping_add(0x1C69_B3F7), xf * 0.0042, zf * 0.0042),
-        0.82,
-        0.94,
+        value_noise_2d(seed.wrapping_add(0x1C69_B3F7), xf * 0.0052, zf * 0.0052),
+        0.74,
+        0.93,
     );
-    let entrance_shape = (1.0
+    let throat_noise = value_noise_3d(
+        seed.wrapping_add(0xC0AC_29B7),
+        xf * 0.038,
+        yf * 0.050,
+        zf * 0.038,
+    );
+    let near_surface = smooth_range(22.0 - depth_from_surface as f32, 0.0, 22.0);
+    let throat_shape = (1.0 - throat_noise.abs()).powf(4.8 + near_surface * 2.4);
+    let narrow_surface_entrance = depth_from_surface <= 16 && entrance_lane * throat_shape > 0.42;
+
+    let rare_surface_gate = smooth_range(
+        value_noise_2d(seed.wrapping_add(0xA409_3822), xf * 0.0035, zf * 0.0035),
+        0.88,
+        0.985,
+    );
+    let occasional_large_surface_opening = depth_from_surface <= 14
+        && rare_surface_gate > 0.62
+        && (1.0
+            - value_noise_3d(
+                seed.wrapping_add(0x510E_527F),
+                xf * 0.024,
+                yf * 0.024,
+                zf * 0.024,
+            )
+            .abs())
+            > 0.78;
+
+    // Surface connector bands create mostly small tunnels near the top.
+    let connector_noise = value_noise_2d(seed.wrapping_add(0xDEAD_BEEF), xf * 0.010, zf * 0.010);
+    let ravine_bias = (1.0
+        - value_noise_2d(seed.wrapping_add(0x5BE0_CD19), xf * 0.0065, zf * 0.0065).abs())
+    .powf(4.8);
+    let connector_mask =
+        (smooth_range(connector_noise, 0.58, 0.92) * 0.52 + ravine_bias * 0.28).clamp(0.0, 1.0);
+    let surface_tunnel_shape = (1.0
         - value_noise_3d(
-            seed.wrapping_add(0xC0AC_29B7),
+            seed.wrapping_add(0x9E37_79B9),
             xf * 0.034,
-            yf * 0.050,
+            yf * 0.030,
             zf * 0.034,
         )
         .abs())
-    .powf(4.2);
-    let narrow_surface_entrance =
-        depth_from_surface <= 18 && entrance_lane > 0.20 && entrance_shape > 0.80;
-
-    // Surface connector bands create sloped/tunnelled entries into deeper cave systems.
-    let connector_noise = value_noise_2d(
-        seed.wrapping_add(0xDEAD_BEEF),
-        xf * 0.010,
-        zf * 0.010,
-    );
-    let ravine_bias = (1.0
-        - value_noise_2d(
-            seed.wrapping_add(0x5BE0_CD19),
-            xf * 0.0065,
-            zf * 0.0065,
-        )
-        .abs())
-    .powf(4.8);
-    let connector_mask = (smooth_range(connector_noise, 0.62, 0.90) * 0.46 + ravine_bias * 0.30)
-        .clamp(0.0, 1.0);
-    let near_surface_connector = depth_from_surface <= 18 && connector_mask > 0.74;
+    .powf(4.4 + near_surface * 2.2);
+    let near_surface_small_tunnel =
+        depth_from_surface <= 20 && connector_mask * surface_tunnel_shape > 0.56;
 
     if depth_from_surface <= 1 {
-        return narrow_surface_entrance;
+        return narrow_surface_entrance || occasional_large_surface_opening;
+    }
+    if depth_from_surface <= 12
+        && (near_surface_small_tunnel
+            || narrow_surface_entrance
+            || occasional_large_surface_opening)
+    {
+        return true;
     }
 
     let coarse_gate = value_noise_3d(
@@ -716,10 +890,9 @@ fn should_carve_cave(seed: i64, x: i64, y: i32, z: i64, surface_y: i32) -> bool 
         yf * 0.022,
         zf * 0.018,
     );
-    let near_surface_tightening =
-        smooth_range(24.0 - depth_from_surface as f32, 0.0, 24.0) * 0.24;
+    let near_surface_tightening = smooth_range(32.0 - depth_from_surface as f32, 0.0, 32.0) * 0.44;
     let coarse_threshold =
-        (0.18 + near_surface_tightening - connector_mask * 0.06 - (1.0 - depth_t) * 0.02).max(0.03);
+        (0.16 + near_surface_tightening - connector_mask * 0.08 - (1.0 - depth_t) * 0.03).max(0.03);
     if coarse_gate < coarse_threshold {
         return false;
     }
@@ -769,29 +942,21 @@ fn should_carve_cave(seed: i64, x: i64, y: i32, z: i64, surface_y: i32) -> bool 
         yf * 0.030 + 13.0,
         wz * 0.035 - 5.0,
     );
-    let chambers = (chamber_field * 0.78 + chamber_detail * 0.22) > 0.58;
+    let chamber_score = chamber_field * 0.78 + chamber_detail * 0.22;
+    let deep_chambers = chamber_score > 0.60 && depth_from_surface > 26;
+    let rare_near_surface_chamber =
+        depth_from_surface <= 16 && occasional_large_surface_opening && chamber_score > 0.78;
 
     let depth_boost = if y < 0 { 0.04 } else { 0.0 } + (1.0 - depth_t) * 0.02;
-    if near_surface_connector {
-        let shaft_noise = value_noise_3d(
-            seed.wrapping_add(0xA409_3822),
-            xf * 0.031,
-            yf * 0.018,
-            zf * 0.031,
-        );
-        let shaft_shape = (1.0 - shaft_noise.abs()).powf(3.4);
-        if shaft_shape > 0.90 {
-            return true;
-        }
-    }
-    if narrow_surface_entrance {
+    if near_surface_small_tunnel && depth_from_surface <= 18 {
         return true;
     }
 
-    let near_surface_penalty =
-        smooth_range(20.0 - depth_from_surface as f32, 0.0, 20.0) * 0.14;
-    worm_tunnel > 0.74 + near_surface_penalty - depth_boost - connector_mask * 0.04
-        || (chambers && (depth_from_surface > 20 || near_surface_connector))
+    let near_surface_penalty = smooth_range(34.0 - depth_from_surface as f32, 0.0, 34.0) * 0.34;
+    let tunnel_threshold = 0.72 + near_surface_penalty - depth_boost - connector_mask * 0.06;
+    let worm_open = worm_tunnel > tunnel_threshold;
+
+    worm_open || deep_chambers || rare_near_surface_chamber
 }
 
 #[cfg(test)]
@@ -805,7 +970,7 @@ mod tests {
         for z in -128..=128 {
             for x in -128..=128 {
                 let y = world.surface_height(x, z);
-                assert!((WORLD_OVERWORLD_FLOOR..=(WORLD_MAX_Y - 4)).contains(&y));
+                assert!((WORLD_SURFACE_MIN_Y..=(WORLD_MAX_Y - 4)).contains(&y));
             }
         }
     }
@@ -962,7 +1127,13 @@ mod tests {
             }
         }
 
-        let light = lighting::build_light_volume(&block_ids, xz_extent, y_extent);
+        let light = lighting::build_light_volume(
+            &block_ids,
+            xz_extent,
+            y_extent,
+            0,
+            y_extent.saturating_sub(1),
+        );
         let center_near_roof = light[grid_index(2, 6, 2)];
         let center_deeper = light[grid_index(2, 2, 2)];
         let open_sky = light[grid_index(0, 6, 0)];
@@ -998,15 +1169,38 @@ mod tests {
     #[test]
     fn depth_strata_follow_requested_y_bands() {
         let world = World::generate_with_terrain(TerrainConfig::balanced());
-        assert_eq!(world.block_at_i64(0, -200, 0), Block::DeepDark);
-        assert_eq!(world.block_at_i64(0, -64, 0), Block::Deepslate);
-        assert_eq!(world.block_at_i64(0, 64, 0), Block::Stone);
+        let sample_has_block = |target_y: i32, expected: Block| -> bool {
+            for z in (-64..=64).step_by(8) {
+                for x in (-64..=64).step_by(8) {
+                    if world.block_at_i64(x, target_y, z) == expected {
+                        return true;
+                    }
+                }
+            }
+            false
+        };
+
+        if WORLD_MIN_Y <= -129 {
+            assert!(
+                sample_has_block(-129, Block::DeepDark),
+                "expected at least one DeepDark sample at y=-129"
+            );
+        }
+        assert!(
+            sample_has_block(WORLD_MIN_Y.max(-64), Block::Deepslate),
+            "expected at least one Deepslate sample near lower strata"
+        );
+        assert!(
+            sample_has_block(WORLD_SEA_LEVEL + 24, Block::Stone),
+            "expected at least one Stone sample at y={}",
+            WORLD_SEA_LEVEL + 24
+        );
     }
 
     #[test]
     fn biome_layout_has_diversity_across_medium_region() {
         let world = World::generate_with_terrain(TerrainConfig::balanced());
-        let mut seen = [false; 5];
+        let mut seen = [false; 6];
         for cz in -64..=64 {
             for cx in -64..=64 {
                 let biome = world.biome_kind_for_chunk(cx, cz);
@@ -1053,6 +1247,3 @@ mod tests {
         Vec3::new(value[0], value[1], value[2])
     }
 }
-
-
-

@@ -6,7 +6,7 @@ use std::{
 use subdivism::game::{
     asset_registry::{AssetRegistry, BiomeEntry, TextureEntry},
     terrain_recipe::TerrainRecipe,
-    world::{TerrainConfig, WORLD_MAX_Y, WORLD_OVERWORLD_FLOOR},
+    world::TerrainConfig,
 };
 
 fn main() {
@@ -262,6 +262,7 @@ fn apply_description(cfg: &mut TerrainConfig, description: &str) {
 
     if any(&["mountain", "mountains", "peak", "peaks", "alpine", "rugged"]) {
         cfg.mountain_amplitude += 8.0;
+        cfg.mountain_sharpness += 0.12;
         cfg.macro_amplitude += 2.0;
         cfg.valley_depth -= 1.5;
     }
@@ -271,7 +272,9 @@ fn apply_description(cfg: &mut TerrainConfig, description: &str) {
     }
     if any(&["canyon", "canyons", "cliff", "cliffs", "mesa", "ravine"]) {
         cfg.cliff_strength += 0.24;
-        cfg.terrace_step += 0.8;
+        cfg.cliff_ledge_flatness += 0.15;
+        cfg.cliff_recess_strength += 0.12;
+        cfg.terrace_step += 0.6;
         cfg.valley_depth += 3.0;
         cfg.ravine_strength += 1.2;
     }
@@ -286,6 +289,7 @@ fn apply_description(cfg: &mut TerrainConfig, description: &str) {
     if any(&["flat", "plain", "plains", "meadow", "gentle"]) {
         cfg.macro_amplitude *= 0.55;
         cfg.mountain_amplitude *= 0.38;
+        cfg.mountain_sharpness *= 0.45;
         cfg.valley_depth *= 0.5;
         cfg.detail_amplitude *= 0.75;
     }
@@ -296,16 +300,19 @@ fn apply_description(cfg: &mut TerrainConfig, description: &str) {
     }
     if any(&["sharp", "steep", "dramatic", "extreme"]) {
         cfg.cliff_strength += 0.12;
+        cfg.cliff_ledge_flatness += 0.10;
+        cfg.cliff_recess_strength += 0.08;
+        cfg.cliff_edge_rounding -= 0.08;
+        cfg.mountain_sharpness += 0.15;
         cfg.mountain_amplitude *= 1.15;
     }
     if any(&["smooth", "soft"]) {
         cfg.cliff_strength *= 0.66;
+        cfg.cliff_edge_rounding += 0.12;
+        cfg.cliff_base_smoothing += 0.18;
+        cfg.mountain_sharpness *= 0.55;
         cfg.detail_amplitude *= 0.72;
     }
-
-    cfg.base_height = cfg
-        .base_height
-        .clamp((WORLD_OVERWORLD_FLOOR + 8) as f32, (WORLD_MAX_Y - 8) as f32);
     cfg.clamp_reasonable();
 }
 

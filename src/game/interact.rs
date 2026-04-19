@@ -185,7 +185,9 @@ pub fn direction_to_screen(
     width: f32,
     height: f32,
 ) -> Option<(f32, f32)> {
-    let world_point = camera.position + direction.normalize_or_zero() * 1000.0;
+    // Keep the projected sky marker point comfortably inside the camera far plane.
+    let project_distance = (camera.lens.z_far * 0.72).clamp(96.0, 900.0);
+    let world_point = camera.position + direction.normalize_or_zero() * project_distance;
     world_to_screen(camera, world_point, width, height)
 }
 

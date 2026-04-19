@@ -2,8 +2,39 @@ use std::collections::HashMap;
 
 use glam::Vec3;
 
-use super::*;
 use super::lighting::{apply_light, build_light_volume, sample_light};
+use super::palette::palette;
+use super::*;
+
+fn face_noise_unit(x: i64, y: i32, z: i64, salt: u64) -> f32 {
+    let mut h = salt;
+    h ^= (x as u64).wrapping_mul(0x9E37_79B1_85EB_CA87);
+    h ^= (y as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    h ^= (z as u64).wrapping_mul(0x1656_67B1_9E37_79F9);
+    h ^= h >> 29;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 32;
+    (h as f32 / u64::MAX as f32).clamp(0.0, 1.0)
+}
+
+fn vary_face_color(base: [f32; 3], block: Block, x: i64, y: i32, z: i64, face_id: u64) -> [f32; 3] {
+    let grain = 0.90 + face_noise_unit(x, y, z, 0xA54F_F53A ^ face_id) * 0.20;
+    let mut shade = grain;
+    if matches!(block, Block::Dirt | Block::Grass) {
+        let strata =
+            0.90 + (((y as f32 * 0.12) + (x as f32 * 0.04) + (z as f32 * 0.03)).sin() * 0.10);
+        shade *= strata;
+    }
+    if matches!(block, Block::Stone | Block::Deepslate | Block::DeepDark) {
+        let rocky = 0.94 + face_noise_unit(x, y, z, 0x510E_527F ^ (face_id << 1)) * 0.10;
+        shade *= rocky;
+    }
+    [
+        (base[0] * shade).clamp(0.0, 1.0),
+        (base[1] * shade).clamp(0.0, 1.0),
+        (base[2] * shade).clamp(0.0, 1.0),
+    ]
+}
 
 impl World {
     pub fn build_chunk_mesh(&self, chunk: (i64, i64)) -> Vec<Vertex> {
@@ -303,6 +334,8 @@ impl World {
         let xz_extent = (CHUNK_SIZE + 2) as usize;
         let layer_stride = xz_extent * xz_extent;
         let mut column_top = vec![WORLD_MIN_Y; layer_stride];
+        let mut surface_heights = vec![WORLD_MIN_Y; layer_stride];
+        let mut column_biomes = vec![BiomeKind::Meadow; layer_stride];
         let mut min_surface = WORLD_MAX_Y;
         let mut max_surface = WORLD_MIN_Y;
         let min_x = base_x - 1;
@@ -317,14 +350,19 @@ impl World {
                 let world_x = base_x + local_x as i64 - 1;
                 let surface_y = self.surface_height(world_x, world_z);
                 let clamped_top = surface_y.clamp(WORLD_MIN_Y, WORLD_MAX_Y);
-                column_top[column_index(local_x, local_z)] = clamped_top;
+                let column = column_index(local_x, local_z);
+                surface_heights[column] = clamped_top;
+                column_top[column] = clamped_top;
+                column_biomes[column] = self.biome_at(world_x, world_z);
                 min_surface = min_surface.min(clamped_top);
                 max_surface = max_surface.max(clamped_top);
             }
         }
 
         let absolute_depth_floor = WORLD_RENDER_FLOOR_Y.max(WORLD_MIN_Y);
-        let mut min_fill_y = absolute_depth_floor;
+        let terrain_depth_floor =
+            (min_surface - MAX_NATURAL_CAVE_DEPTH_BELOW_SURFACE - 2).max(absolute_depth_floor);
+        let mut min_fill_y = terrain_depth_floor;
         let mut max_fill_y = max_surface.min(WORLD_MAX_Y);
         if !overrides.is_empty() {
             for (pos, block) in overrides {
@@ -359,14 +397,64 @@ impl World {
             let world_z = base_z + local_z as i64 - 1;
             for local_x in 0..xz_extent {
                 let world_x = base_x + local_x as i64 - 1;
-                let surface_y = self.surface_height(world_x, world_z);
-                let clamped_top = surface_y.clamp(WORLD_MIN_Y, WORLD_MAX_Y).min(max_fill_y);
-                for y in min_fill_y..=clamped_top {
-                    let Some(yi) = local_y_index(y) else {
-                        continue;
-                    };
-                    let block = self.procedural_block_with_surface(world_x, y, world_z, surface_y);
-                    block_ids[grid_index(local_x, yi, local_z)] = block.to_id();
+                let surface_y = surface_heights[column_index(local_x, local_z)];
+                let clamped_top = surface_y.min(max_fill_y);
+                if clamped_top < min_fill_y {
+                    continue;
+                }
+
+                let cave_floor_y =
+                    (surface_y - MAX_NATURAL_CAVE_DEPTH_BELOW_SURFACE).max(min_fill_y);
+                let deep_end = (cave_floor_y - 1).min(clamped_top);
+                if deep_end >= min_fill_y {
+                    let deep_dark_end = deep_end.min(-129);
+                    if deep_dark_end >= min_fill_y {
+                        for y in min_fill_y..=deep_dark_end {
+                            if let Some(yi) = local_y_index(y) {
+                                block_ids[grid_index(local_x, yi, local_z)] =
+                                    Block::DeepDark.to_id();
+                            }
+                        }
+                    }
+
+                    let deepslate_start = min_fill_y.max(-128);
+                    let deepslate_end = deep_end.min(-1);
+                    if deepslate_end >= deepslate_start {
+                        for y in deepslate_start..=deepslate_end {
+                            if let Some(yi) = local_y_index(y) {
+                                block_ids[grid_index(local_x, yi, local_z)] =
+                                    Block::Deepslate.to_id();
+                            }
+                        }
+                    }
+
+                    let stone_start = min_fill_y.max(0);
+                    if deep_end >= stone_start {
+                        for y in stone_start..=deep_end {
+                            if let Some(yi) = local_y_index(y) {
+                                block_ids[grid_index(local_x, yi, local_z)] = Block::Stone.to_id();
+                            }
+                        }
+                    }
+                }
+
+                let cave_band_start = cave_floor_y.max(min_fill_y);
+                if clamped_top >= cave_band_start {
+                    for y in cave_band_start..=clamped_top {
+                        let Some(yi) = local_y_index(y) else {
+                            continue;
+                        };
+                        let block = if should_carve_air(self.seed, world_x, y, world_z, surface_y) {
+                            Block::Air
+                        } else if y == surface_y && y >= WORLD_OVERWORLD_FLOOR {
+                            Block::Grass
+                        } else if y >= surface_y - 2 && y >= WORLD_OVERWORLD_FLOOR - 16 {
+                            Block::Dirt
+                        } else {
+                            crust_block_for_y(y)
+                        };
+                        block_ids[grid_index(local_x, yi, local_z)] = block.to_id();
+                    }
                 }
             }
         }
@@ -394,7 +482,35 @@ impl World {
             }
         }
 
-        let light_levels = build_light_volume(&block_ids, xz_extent, y_extent);
+        let mut light_min_y = 0_usize;
+        let mut light_max_y = y_extent.saturating_sub(1);
+        let mut found_air_slice = false;
+        for yi in 0..y_extent {
+            let slice_start = yi * layer_stride;
+            let slice_end = slice_start + layer_stride;
+            let has_air = block_ids[slice_start..slice_end]
+                .iter()
+                .any(|id| !Block::from_id(*id).is_solid());
+            if !has_air {
+                continue;
+            }
+            if !found_air_slice {
+                light_min_y = yi;
+                light_max_y = yi;
+                found_air_slice = true;
+            } else {
+                light_max_y = yi;
+            }
+        }
+        if found_air_slice {
+            light_min_y = light_min_y.saturating_sub(1);
+            light_max_y = (light_max_y + 1).min(y_extent.saturating_sub(1));
+        } else {
+            light_min_y = 0;
+            light_max_y = y_extent.saturating_sub(1);
+        }
+        let light_levels =
+            build_light_volume(&block_ids, xz_extent, y_extent, light_min_y, light_max_y);
 
         let mut vertices = Vec::with_capacity(24_576);
         for local_z in 1..=CHUNK_SIZE as usize {
@@ -412,8 +528,9 @@ impl World {
                     }
                     let block = Block::from_id(block_id);
                     let base = Vec3::new(world_x as f32, y as f32, world_z as f32);
+                    let biome = column_biomes[column_index(local_x, local_z)];
                     let (top_color, side_color, bottom_color) =
-                        self.palette_at(block, world_x, world_z);
+                        palette(block, world_x, world_z, biome);
 
                     if yi + 1 >= y_extent
                         || block_ids[grid_index(local_x, yi + 1, local_z)] == Block::Air.to_id()
@@ -435,7 +552,11 @@ impl World {
                                 base + Vec3::new(1.0, 1.0, 1.0),
                                 base + Vec3::new(1.0, 1.0, 0.0),
                             ],
-                            apply_light(top_color, light, 1.0),
+                            apply_light(
+                                vary_face_color(top_color, block, world_x, y, world_z, 11),
+                                light,
+                                1.0,
+                            ),
                             Vec3::Y,
                         );
                     }
@@ -459,7 +580,11 @@ impl World {
                                 base + Vec3::new(1.0, 0.0, 0.0),
                                 base + Vec3::new(1.0, 0.0, 1.0),
                             ],
-                            apply_light(bottom_color, light, 0.62),
+                            apply_light(
+                                vary_face_color(bottom_color, block, world_x, y, world_z, 22),
+                                light,
+                                0.62,
+                            ),
                             -Vec3::Y,
                         );
                     }
@@ -481,7 +606,11 @@ impl World {
                                 base + Vec3::new(0.0, 1.0, 1.0),
                                 base + Vec3::new(0.0, 1.0, 0.0),
                             ],
-                            apply_light(side_color, light, 0.78),
+                            apply_light(
+                                vary_face_color(side_color, block, world_x, y, world_z, 31),
+                                light,
+                                0.78,
+                            ),
                             -Vec3::X,
                         );
                     }
@@ -503,7 +632,11 @@ impl World {
                                 base + Vec3::new(1.0, 1.0, 0.0),
                                 base + Vec3::new(1.0, 1.0, 1.0),
                             ],
-                            apply_light(side_color, light, 0.84),
+                            apply_light(
+                                vary_face_color(side_color, block, world_x, y, world_z, 32),
+                                light,
+                                0.84,
+                            ),
                             Vec3::X,
                         );
                     }
@@ -525,7 +658,11 @@ impl World {
                                 base + Vec3::new(0.0, 1.0, 0.0),
                                 base + Vec3::new(1.0, 1.0, 0.0),
                             ],
-                            apply_light(side_color, light, 0.76),
+                            apply_light(
+                                vary_face_color(side_color, block, world_x, y, world_z, 33),
+                                light,
+                                0.76,
+                            ),
                             -Vec3::Z,
                         );
                     }
@@ -547,7 +684,11 @@ impl World {
                                 base + Vec3::new(1.0, 1.0, 1.0),
                                 base + Vec3::new(0.0, 1.0, 1.0),
                             ],
-                            apply_light(side_color, light, 0.82),
+                            apply_light(
+                                vary_face_color(side_color, block, world_x, y, world_z, 34),
+                                light,
+                                0.82,
+                            ),
                             Vec3::Z,
                         );
                     }

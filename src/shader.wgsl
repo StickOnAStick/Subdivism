@@ -84,5 +84,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let fogged = mix(lit_color * shadow_lift, atmosphere_color, fog_mix);
     let luma = dot(fogged, vec3<f32>(0.299, 0.587, 0.114));
     let base = mix(vec3<f32>(luma), fogged, vibrance);
-    return vec4<f32>(base, 1.0);
+
+    // Prevent distant terrain from collapsing to pure black even when fog is low/off.
+    let distance_mix = smoothstep(36.0, max(fog_end * 1.2, 420.0), horizontal_distance);
+    let far_floor = mix(0.03, 0.22, distance_mix);
+    var lifted = max(base, vec3<f32>(far_floor));
+
+    // Apply a luma floor as a final guard against shadow black crush.
+    let lifted_luma = dot(lifted, vec3<f32>(0.299, 0.587, 0.114));
+    let min_luma = mix(0.05, 0.24, distance_mix);
+    let luma_scale = max(min_luma / max(lifted_luma, 0.0001), 1.0);
+    lifted = clamp(lifted * luma_scale, vec3<f32>(0.0), vec3<f32>(1.0));
+    return vec4<f32>(lifted, 1.0);
 }

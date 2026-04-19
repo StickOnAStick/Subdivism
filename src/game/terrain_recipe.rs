@@ -63,12 +63,19 @@ impl TerrainRecipe {
             &format!("macro_amplitude={:.6}", terrain.macro_amplitude),
             &format!("detail_scale={:.6}", terrain.detail_scale),
             &format!("detail_amplitude={:.6}", terrain.detail_amplitude),
+            &format!("micro_scale={:.6}", terrain.micro_scale),
+            &format!("micro_amplitude={:.6}", terrain.micro_amplitude),
             &format!("mountain_scale={:.6}", terrain.mountain_scale),
             &format!("mountain_amplitude={:.6}", terrain.mountain_amplitude),
+            &format!("mountain_sharpness={:.6}", terrain.mountain_sharpness),
             &format!("valley_scale={:.6}", terrain.valley_scale),
             &format!("valley_depth={:.6}", terrain.valley_depth),
             &format!("cliff_scale={:.6}", terrain.cliff_scale),
             &format!("cliff_strength={:.6}", terrain.cliff_strength),
+            &format!("cliff_ledge_flatness={:.6}", terrain.cliff_ledge_flatness),
+            &format!("cliff_recess_strength={:.6}", terrain.cliff_recess_strength),
+            &format!("cliff_edge_rounding={:.6}", terrain.cliff_edge_rounding),
+            &format!("cliff_base_smoothing={:.6}", terrain.cliff_base_smoothing),
             &format!("terrace_step={:.6}", terrain.terrace_step),
             &format!("biome_scale={:.6}", terrain.biome_scale),
             &format!("biome_blend={:.6}", terrain.biome_blend),
@@ -117,14 +124,31 @@ impl TerrainRecipe {
                 "macro_amplitude" => parse_f32(value, &mut recipe.terrain.macro_amplitude, key)?,
                 "detail_scale" => parse_f32(value, &mut recipe.terrain.detail_scale, key)?,
                 "detail_amplitude" => parse_f32(value, &mut recipe.terrain.detail_amplitude, key)?,
+                "micro_scale" => parse_f32(value, &mut recipe.terrain.micro_scale, key)?,
+                "micro_amplitude" => parse_f32(value, &mut recipe.terrain.micro_amplitude, key)?,
                 "mountain_scale" => parse_f32(value, &mut recipe.terrain.mountain_scale, key)?,
                 "mountain_amplitude" => {
                     parse_f32(value, &mut recipe.terrain.mountain_amplitude, key)?
+                }
+                "mountain_sharpness" => {
+                    parse_f32(value, &mut recipe.terrain.mountain_sharpness, key)?
                 }
                 "valley_scale" => parse_f32(value, &mut recipe.terrain.valley_scale, key)?,
                 "valley_depth" => parse_f32(value, &mut recipe.terrain.valley_depth, key)?,
                 "cliff_scale" => parse_f32(value, &mut recipe.terrain.cliff_scale, key)?,
                 "cliff_strength" => parse_f32(value, &mut recipe.terrain.cliff_strength, key)?,
+                "cliff_ledge_flatness" => {
+                    parse_f32(value, &mut recipe.terrain.cliff_ledge_flatness, key)?
+                }
+                "cliff_recess_strength" => {
+                    parse_f32(value, &mut recipe.terrain.cliff_recess_strength, key)?
+                }
+                "cliff_edge_rounding" => {
+                    parse_f32(value, &mut recipe.terrain.cliff_edge_rounding, key)?
+                }
+                "cliff_base_smoothing" => {
+                    parse_f32(value, &mut recipe.terrain.cliff_base_smoothing, key)?
+                }
                 "terrace_step" => parse_f32(value, &mut recipe.terrain.terrace_step, key)?,
                 "biome_scale" => parse_f32(value, &mut recipe.terrain.biome_scale, key)?,
                 "biome_blend" => parse_f32(value, &mut recipe.terrain.biome_blend, key)?,

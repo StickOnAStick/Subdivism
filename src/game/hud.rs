@@ -1,7 +1,4 @@
-use super::{
-    inventory::InventorySlot,
-    world::Block,
-};
+use super::{inventory::InventorySlot, world::Block};
 
 pub struct HudFormatter;
 
@@ -9,6 +6,7 @@ impl HudFormatter {
     pub fn block_label(block: Block) -> &'static str {
         match block {
             Block::Air => "AIR",
+            Block::Water => "WATER",
             Block::Grass => "GRASS",
             Block::Dirt => "DIRT",
             Block::Stone => "STONE",
@@ -20,6 +18,7 @@ impl HudFormatter {
     pub fn block_short_code(block: Block) -> &'static str {
         match block {
             Block::Air => "_",
+            Block::Water => "W",
             Block::Grass => "G",
             Block::Dirt => "D",
             Block::Stone => "S",
@@ -31,6 +30,7 @@ impl HudFormatter {
     pub fn block_tint_color(block: Block) -> [f32; 4] {
         match block {
             Block::Air => [0.15, 0.17, 0.18, 0.35],
+            Block::Water => [0.24, 0.46, 0.78, 0.88],
             Block::Grass => [0.34, 0.72, 0.36, 0.95],
             Block::Dirt => [0.42, 0.29, 0.20, 0.95],
             Block::Stone => [0.56, 0.58, 0.60, 0.95],

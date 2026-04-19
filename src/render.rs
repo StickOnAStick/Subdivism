@@ -5,7 +5,12 @@ use glam::Vec3;
 use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, window::Window};
 
-use crate::{camera::Camera, debug_overlay::OverlayVertex, game::world::CHUNK_SIZE, mesh::Vertex};
+use crate::{
+    camera::Camera,
+    debug_overlay::OverlayVertex,
+    game::world::{CHUNK_SIZE, WORLD_OVERWORLD_FLOOR},
+    mesh::Vertex,
+};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -49,6 +54,7 @@ pub struct GraphicsSettings {
     pub shadows_enabled: bool,
     pub fog_enabled: bool,
     pub atmosphere_enabled: bool,
+    pub ldo_start_distance_chunks: u32,
     pub shader_quality: f32,
     pub ambient_boost: f32,
     pub shadow_softness: f32,
@@ -59,6 +65,7 @@ pub struct GraphicsSettings {
     pub fog_end: f32,
     pub atmosphere_strength: f32,
     pub color_vibrance: f32,
+    pub ldo_detail_scale: f32,
 }
 
 impl Default for GraphicsSettings {
@@ -67,16 +74,40 @@ impl Default for GraphicsSettings {
             shadows_enabled: true,
             fog_enabled: true,
             atmosphere_enabled: true,
+            ldo_start_distance_chunks: 16,
             shader_quality: 0.72,
-            ambient_boost: 0.24,
+            ambient_boost: 0.22,
             shadow_softness: 0.70,
-            shadow_contrast: 0.95,
+            shadow_contrast: 0.90,
             far_shadow_lift: 0.22,
             fog_strength: 0.32,
             fog_start: 96.0,
             fog_end: 520.0,
             atmosphere_strength: 0.30,
-            color_vibrance: 1.08,
+            color_vibrance: 1.2,
+            ldo_detail_scale: 1.0,
+        }
+    }
+}
+
+impl GraphicsSettings {
+    pub fn low_preset() -> Self {
+        Self {
+            shadows_enabled: true,
+            fog_enabled: false,
+            atmosphere_enabled: false,
+            ldo_start_distance_chunks: 10,
+            shader_quality: 0.2,
+            ambient_boost: 0.22,
+            shadow_softness: 0.2,
+            shadow_contrast: 0.9,
+            far_shadow_lift: 0.22,
+            fog_strength: 0.5,
+            fog_start: 50.0,
+            fog_end: 256.0,
+            atmosphere_strength: 0.4,
+            color_vibrance: 1.2,
+            ldo_detail_scale: 0.72,
         }
     }
 }
@@ -718,29 +749,20 @@ fn chunk_render_key_in_view(camera: Camera, key: ChunkRenderKey) -> bool {
     let span_blocks = span_chunks as f32 * CHUNK_SIZE as f32;
     let center_x = key.origin_chunk.0 as f32 * CHUNK_SIZE as f32 + span_blocks * 0.5;
     let center_z = key.origin_chunk.1 as f32 * CHUNK_SIZE as f32 + span_blocks * 0.5;
-    let to_center = Vec3::new(center_x - camera.position.x, 0.0, center_z - camera.position.z);
+    let center_y = WORLD_OVERWORLD_FLOOR as f32;
+    let to_center = Vec3::new(
+        center_x - camera.position.x,
+        center_y - camera.position.y,
+        center_z - camera.position.z,
+    );
     let distance = to_center.length();
-    let radius = span_blocks * 0.75 + 64.0;
+    let radius = span_blocks * 0.75 + 96.0;
     if distance > camera.lens.z_far + radius {
         return false;
     }
-    if distance <= radius {
-        return true;
-    }
-
-    let mut forward = camera.forward();
-    forward.y = 0.0;
-    forward = forward.normalize_or_zero();
-    if forward.length_squared() <= f32::EPSILON {
-        return true;
-    }
-
-    let dir = to_center.normalize_or_zero();
-    let horizontal_fov =
-        2.0 * ((camera.lens.fov_y_radians * 0.5).tan() * camera.lens.aspect.max(0.1)).atan();
-    let half_fov = (horizontal_fov.max(camera.lens.fov_y_radians) * 0.5 + 0.35).min(3.0);
-    let min_dot = half_fov.cos();
-    forward.dot(dir) >= min_dot
+    // Keep world-chunk culling distance-only to avoid intermittent false negatives that
+    // create visible "void" holes when camera pitch/altitude changes quickly.
+    true
 }
 
 pub fn celestial_state_for_time(time_seconds: f32) -> CelestialState {
