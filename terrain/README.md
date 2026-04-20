@@ -75,8 +75,13 @@ F8 toggle terrain panel
 Arrow Up/Down select parameter
 Arrow Left/Right fine tune selected parameter
 Page Up/Page Down coarse tune selected parameter
-F9 save current terrain preset to terrain/lab_seed_<seed>.terrain
+F9 save current terrain preset using current save name
+F10 edit save name (Enter saves, Esc cancels)
 ```
+
+When saving from Terrain Lab, the game writes:
+- `terrain/presets/<name>.terrain` for reusable named presets
+- `terrain/default.terrain` so normal `cargo run` picks up the saved terrain automatically
 
 Tune multiple dials:
 

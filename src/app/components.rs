@@ -41,14 +41,20 @@ pub(super) struct TerrainLabState {
     pub(super) enabled: bool,
     pub(super) panel_visible: bool,
     pub(super) selected_index: usize,
+    pub(super) save_name: String,
+    pub(super) editing_save_name: bool,
+    pub(super) last_save_status: String,
 }
 
 impl TerrainLabState {
-    pub(super) fn new(enabled: bool) -> Self {
+    pub(super) fn new(enabled: bool, initial_save_name: String) -> Self {
         Self {
             enabled,
             panel_visible: false,
             selected_index: 0,
+            save_name: initial_save_name,
+            editing_save_name: false,
+            last_save_status: String::new(),
         }
     }
 }
@@ -100,13 +106,14 @@ impl WorldSessionState {
         terrain_recipe_path: Option<PathBuf>,
         dev_mode: bool,
         terrain_lab_enabled: bool,
+        terrain_lab_save_name: String,
     ) -> Self {
         Self {
             world_seed,
             terrain_profile,
             terrain_recipe_path,
             dev_mode,
-            terrain_lab: TerrainLabState::new(terrain_lab_enabled),
+            terrain_lab: TerrainLabState::new(terrain_lab_enabled, terrain_lab_save_name),
         }
     }
 }

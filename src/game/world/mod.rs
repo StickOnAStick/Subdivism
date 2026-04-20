@@ -389,6 +389,41 @@ impl TerrainConfig {
         }
     }
 
+    pub fn zeroed() -> Self {
+        Self {
+            base_height: 0.0,
+            macro_scale: 0.0,
+            macro_amplitude: 0.0,
+            detail_scale: 0.0,
+            detail_amplitude: 0.0,
+            micro_scale: 0.0,
+            micro_amplitude: 0.0,
+            mountain_scale: 0.0,
+            mountain_amplitude: 0.0,
+            mountain_sharpness: 0.0,
+            valley_scale: 0.0,
+            valley_depth: 0.0,
+            cliff_scale: 0.0,
+            cliff_strength: 0.0,
+            cliff_ledge_flatness: 0.0,
+            cliff_recess_strength: 0.0,
+            cliff_edge_rounding: 0.0,
+            cliff_base_smoothing: 0.0,
+            terrace_step: 0.0,
+            biome_scale: 0.0,
+            biome_blend: 0.0,
+            mountain_base_lift: 0.0,
+            desert_base_drop: 0.0,
+            desert_dune_scale: 0.0,
+            desert_dune_amplitude: 0.0,
+            ravine_scale: 0.0,
+            ravine_strength: 0.0,
+            ravine_width: 0.0,
+            ravine_offset_x: 0.0,
+            ravine_offset_z: 0.0,
+        }
+    }
+
     pub fn balanced() -> Self {
         Self {
             base_height: 34.0,

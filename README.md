@@ -49,7 +49,15 @@ cargo run -- --dev
 
 Terrain Lab-specific controls:
 - `F8`: Toggle Terrain Lab panel
-- `F9`: Save Terrain Lab preset to `terrain/lab_seed_<seed>.terrain`
+- `F9`: Save Terrain Lab preset using current save name
+- `F10`: Edit Terrain Lab save name (`Enter` save, `Esc` cancel)
+
+Terrain Lab saves now write both:
+- `terrain/presets/<name>.terrain`
+- `terrain/default.terrain` (auto-import path used by `cargo run`)
+
+Graphics/runtime settings now persist to:
+- `settings/user.settings` (auto-loaded on startup, auto-saved when changed in-game)
 
 ## Project Layout
 
@@ -70,6 +78,7 @@ Terrain Lab-specific controls:
   - See [perf/README.md](perf/README.md)
 - `docs/`
   - Architecture and maintenance docs
+  - [Game architecture overview](docs/game_architecture_overview.md)
   - [Design overview](docs/design_overview.md)
   - [Loose ends and cleanup plan](docs/loose_ends.md)
 

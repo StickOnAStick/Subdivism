@@ -42,10 +42,13 @@ use crate::{
 
 #[path = "app/components.rs"]
 mod components;
+#[path = "app/settings.rs"]
+mod settings;
 use components::{
     BuildModeState, CameraRuntimeState, ChunkStreamingState, DiagnosticsState, MenuState,
     PlatformRuntimeState, RuntimeState, WorldSessionState,
 };
+use settings::AppSettings;
 
 const FREE_CAMERA_SPEED: f32 = 10.0;
 const LOOK_SENSITIVITY: f32 = 0.0025;
@@ -64,6 +67,8 @@ const FULL_DETAIL_RADIUS_CHUNKS: i64 = 16;
 const MID_DETAIL_RADIUS_CHUNKS: i64 = 32;
 const LOW_DETAIL_RADIUS_CHUNKS: i64 = 64;
 const DEFAULT_TERRAIN_RECIPE_PATH: &str = "terrain/default.terrain";
+const TERRAIN_PRESET_RECIPE_DIR: &str = "terrain/presets";
+const MAX_TERRAIN_LAB_SAVE_NAME_CHARS: usize = 40;
 
 pub fn run() {
     let options = AppLaunchOptions::from_env();
@@ -327,12 +332,26 @@ struct App {
     session: WorldSessionState,
     runtime: RuntimeState,
     graphics_settings: GraphicsSettings,
+    settings_path: PathBuf,
     diagnostics: DiagnosticsState,
     build_mode: BuildModeState,
 }
 
 impl App {
     fn new(options: AppLaunchOptions) -> Self {
+        let settings_path = settings::default_settings_path();
+        let persisted_settings = match AppSettings::load_from_file(&settings_path) {
+            Ok(Some(settings)) => settings,
+            Ok(None) => AppSettings::default(),
+            Err(err) => {
+                eprintln!(
+                    "failed to load app settings {}: {err}",
+                    settings_path.display()
+                );
+                AppSettings::default()
+            }
+        };
+
         let mut terrain = TerrainConfig::balanced();
         let mut world_seed = options.seed_override.unwrap_or(DEFAULT_WORLD_SEED);
         let mut terrain_profile = "balanced".to_string();
@@ -350,6 +369,11 @@ impl App {
                 }
             }
         }
+        if options.terrain_lab {
+            terrain = TerrainConfig::zeroed();
+            terrain_profile = "terrain_lab_zeroed".to_string();
+            terrain_recipe_path = None;
+        }
 
         let world = World::generate_with_terrain_and_seed(terrain, world_seed);
         let lens = CameraLens::default();
@@ -364,7 +388,8 @@ impl App {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_nanos() as u64)
             .unwrap_or(0x9E3779B97F4A7C15);
-        let chunk_stream = ChunkStreamingState::new(world.clone());
+        let mut chunk_stream = ChunkStreamingState::new(world.clone());
+        chunk_stream.render_distance_chunks = persisted_settings.render_distance_chunks;
         let chunk_worker_count = desired_chunk_worker_count();
         let chunk_worker_env_override = chunk_worker_override_from_env();
         let mut debug_overlay = DebugOverlay::new();
@@ -377,8 +402,10 @@ impl App {
             terrain_recipe_path,
             options.dev_mode,
             options.terrain_lab,
+            default_terrain_lab_save_name(world_seed),
         );
-        let runtime = RuntimeState::new(seed);
+        let mut runtime = RuntimeState::new(seed);
+        runtime.frame_cap_index = persisted_settings.frame_cap_index;
         let diagnostics =
             DiagnosticsState::new(debug_overlay, chunk_worker_count, chunk_worker_env_override);
 
@@ -398,7 +425,8 @@ impl App {
             inventory: Inventory::new(),
             session,
             runtime,
-            graphics_settings: GraphicsSettings::default(),
+            graphics_settings: persisted_settings.graphics_settings,
+            settings_path,
             diagnostics,
             build_mode: BuildModeState::new(),
         }
@@ -561,6 +589,24 @@ impl App {
         }
     }
 
+    fn current_app_settings(&self) -> AppSettings {
+        AppSettings::new(
+            self.chunk_stream.render_distance_chunks,
+            self.runtime.frame_cap_index,
+            self.graphics_settings,
+        )
+    }
+
+    fn persist_app_settings(&self) {
+        let settings = self.current_app_settings();
+        if let Err(err) = settings.write_to_file(&self.settings_path) {
+            eprintln!(
+                "failed to save app settings {}: {err}",
+                self.settings_path.display()
+            );
+        }
+    }
+
     fn refresh_window_title(&self) {
         if let Some(window) = &self.platform.window {
             let dev_flag = if self.session.dev_mode { " DEV" } else { "" };
@@ -581,6 +627,7 @@ impl App {
         self.runtime.frame_cap_index = (self.runtime.frame_cap_index + 1) % FRAME_CAP_PRESETS.len();
         self.runtime.next_frame_at = Instant::now();
         self.refresh_window_title();
+        self.persist_app_settings();
     }
 
     fn toggle_camera_mode(&mut self) {
@@ -1081,12 +1128,17 @@ impl App {
                 1 => self.adjust_graphics_setting_by(1, 1.0),
                 2 => self.adjust_graphics_setting_by(2, 0.05),
                 3 => {
-                    self.graphics_settings.shadows_enabled = !self.graphics_settings.shadows_enabled
+                    self.graphics_settings.shadows_enabled = !self.graphics_settings.shadows_enabled;
+                    self.persist_app_settings();
                 }
-                4 => self.graphics_settings.fog_enabled = !self.graphics_settings.fog_enabled,
+                4 => {
+                    self.graphics_settings.fog_enabled = !self.graphics_settings.fog_enabled;
+                    self.persist_app_settings();
+                }
                 5 => {
                     self.graphics_settings.atmosphere_enabled =
-                        !self.graphics_settings.atmosphere_enabled
+                        !self.graphics_settings.atmosphere_enabled;
+                    self.persist_app_settings();
                 }
                 6 => self.adjust_graphics_setting_by(6, 0.05),
                 7 => self.adjust_graphics_setting_by(7, 0.03),
@@ -1103,6 +1155,7 @@ impl App {
                 }
                 17 => {
                     self.graphics_settings = GraphicsSettings::default();
+                    self.persist_app_settings();
                 }
                 18 => {
                     self.menu.page = MenuPage::Settings;
@@ -1132,14 +1185,20 @@ impl App {
     }
 
     fn adjust_render_distance(&mut self, delta: i32) {
+        let previous = self.chunk_stream.render_distance_chunks;
         let value = self.chunk_stream.render_distance_chunks as i32 + delta;
-        self.chunk_stream.render_distance_chunks = value.clamp(
+        let next = value.clamp(
             MIN_RENDER_DISTANCE_CHUNKS as i32,
             MAX_RENDER_DISTANCE_CHUNKS as i32,
         ) as u32;
+        if next == previous {
+            return;
+        }
+        self.chunk_stream.render_distance_chunks = next;
         self.update_far_plane_for_render_distance();
         self.schedule_visible_chunks();
         self.refresh_window_title();
+        self.persist_app_settings();
     }
 
     fn apply_low_graphics_preset(&mut self) {
@@ -1149,6 +1208,7 @@ impl App {
         self.update_far_plane_for_render_distance();
         self.schedule_visible_chunks();
         self.refresh_window_title();
+        self.persist_app_settings();
     }
 
     fn menu_overlay(&self) -> (String, Vec<String>, usize) {
@@ -1274,9 +1334,27 @@ impl App {
             0 => self.adjust_render_distance(delta),
             1 => self.adjust_graphics_setting_by(1, delta as f32),
             2 => self.adjust_graphics_setting_by(2, 0.05 * delta as f32),
-            3 => self.graphics_settings.shadows_enabled = delta > 0,
-            4 => self.graphics_settings.fog_enabled = delta > 0,
-            5 => self.graphics_settings.atmosphere_enabled = delta > 0,
+            3 => {
+                let next = delta > 0;
+                if self.graphics_settings.shadows_enabled != next {
+                    self.graphics_settings.shadows_enabled = next;
+                    self.persist_app_settings();
+                }
+            }
+            4 => {
+                let next = delta > 0;
+                if self.graphics_settings.fog_enabled != next {
+                    self.graphics_settings.fog_enabled = next;
+                    self.persist_app_settings();
+                }
+            }
+            5 => {
+                let next = delta > 0;
+                if self.graphics_settings.atmosphere_enabled != next {
+                    self.graphics_settings.atmosphere_enabled = next;
+                    self.persist_app_settings();
+                }
+            }
             6 => self.adjust_graphics_setting_by(6, 0.05 * delta as f32),
             7 => self.adjust_graphics_setting_by(7, 0.03 * delta as f32),
             8 => self.adjust_graphics_setting_by(8, 0.05 * delta as f32),
@@ -1292,68 +1370,120 @@ impl App {
     }
 
     fn adjust_graphics_setting_by(&mut self, index: usize, delta: f32) {
+        let mut changed = false;
         match index {
             1 => {
                 let value = self.graphics_settings.ldo_start_distance_chunks as i32 + delta as i32;
-                self.graphics_settings.ldo_start_distance_chunks = value.clamp(
+                let next = value.clamp(
                     MIN_LDO_START_DISTANCE_CHUNKS as i32,
                     MAX_LDO_START_DISTANCE_CHUNKS as i32,
                 ) as u32;
-                self.schedule_visible_chunks();
+                if next != self.graphics_settings.ldo_start_distance_chunks {
+                    self.graphics_settings.ldo_start_distance_chunks = next;
+                    self.schedule_visible_chunks();
+                    changed = true;
+                }
             }
             2 => {
-                self.graphics_settings.ldo_detail_scale =
-                    (self.graphics_settings.ldo_detail_scale + delta).clamp(0.55, 1.8);
-                self.schedule_visible_chunks();
+                let next = (self.graphics_settings.ldo_detail_scale + delta).clamp(0.55, 1.8);
+                if (next - self.graphics_settings.ldo_detail_scale).abs() > f32::EPSILON {
+                    self.graphics_settings.ldo_detail_scale = next;
+                    self.schedule_visible_chunks();
+                    changed = true;
+                }
             }
             6 => {
-                self.graphics_settings.shader_quality =
-                    (self.graphics_settings.shader_quality + delta).clamp(0.0, 1.0);
+                let next = (self.graphics_settings.shader_quality + delta).clamp(0.0, 1.0);
+                if (next - self.graphics_settings.shader_quality).abs() > f32::EPSILON {
+                    self.graphics_settings.shader_quality = next;
+                    changed = true;
+                }
             }
             7 => {
-                self.graphics_settings.ambient_boost =
-                    (self.graphics_settings.ambient_boost + delta).clamp(0.0, 0.70);
+                let next = (self.graphics_settings.ambient_boost + delta).clamp(0.0, 0.70);
+                if (next - self.graphics_settings.ambient_boost).abs() > f32::EPSILON {
+                    self.graphics_settings.ambient_boost = next;
+                    changed = true;
+                }
             }
             8 => {
-                self.graphics_settings.shadow_softness =
-                    (self.graphics_settings.shadow_softness + delta).clamp(0.1, 1.5);
+                let next = (self.graphics_settings.shadow_softness + delta).clamp(0.1, 1.5);
+                if (next - self.graphics_settings.shadow_softness).abs() > f32::EPSILON {
+                    self.graphics_settings.shadow_softness = next;
+                    changed = true;
+                }
             }
             9 => {
-                self.graphics_settings.shadow_contrast =
-                    (self.graphics_settings.shadow_contrast + delta).clamp(0.2, 2.2);
+                let next = (self.graphics_settings.shadow_contrast + delta).clamp(0.2, 2.2);
+                if (next - self.graphics_settings.shadow_contrast).abs() > f32::EPSILON {
+                    self.graphics_settings.shadow_contrast = next;
+                    changed = true;
+                }
             }
             10 => {
-                self.graphics_settings.far_shadow_lift =
-                    (self.graphics_settings.far_shadow_lift + delta).clamp(0.0, 0.6);
+                let next = (self.graphics_settings.far_shadow_lift + delta).clamp(0.0, 0.6);
+                if (next - self.graphics_settings.far_shadow_lift).abs() > f32::EPSILON {
+                    self.graphics_settings.far_shadow_lift = next;
+                    changed = true;
+                }
             }
             11 => {
-                self.graphics_settings.fog_strength =
-                    (self.graphics_settings.fog_strength + delta).clamp(0.0, 1.2);
+                let next = (self.graphics_settings.fog_strength + delta).clamp(0.0, 1.2);
+                if (next - self.graphics_settings.fog_strength).abs() > f32::EPSILON {
+                    self.graphics_settings.fog_strength = next;
+                    changed = true;
+                }
             }
             12 => {
-                self.graphics_settings.fog_start =
-                    (self.graphics_settings.fog_start + delta).clamp(16.0, 1200.0);
-                if self.graphics_settings.fog_end <= self.graphics_settings.fog_start + 1.0 {
-                    self.graphics_settings.fog_end = self.graphics_settings.fog_start + 1.0;
+                let previous_start = self.graphics_settings.fog_start;
+                let previous_end = self.graphics_settings.fog_end;
+                let next_start = (previous_start + delta).clamp(16.0, 1200.0);
+                let mut next_end = previous_end;
+                if next_end <= next_start + 1.0 {
+                    next_end = next_start + 1.0;
+                }
+                if (next_start - previous_start).abs() > f32::EPSILON
+                    || (next_end - previous_end).abs() > f32::EPSILON
+                {
+                    self.graphics_settings.fog_start = next_start;
+                    self.graphics_settings.fog_end = next_end;
+                    changed = true;
                 }
             }
             13 => {
-                self.graphics_settings.fog_end =
-                    (self.graphics_settings.fog_end + delta).clamp(24.0, 2000.0);
-                if self.graphics_settings.fog_end <= self.graphics_settings.fog_start + 1.0 {
-                    self.graphics_settings.fog_start =
-                        (self.graphics_settings.fog_end - 1.0).max(16.0);
+                let previous_start = self.graphics_settings.fog_start;
+                let previous_end = self.graphics_settings.fog_end;
+                let next_end = (previous_end + delta).clamp(24.0, 2000.0);
+                let mut next_start = previous_start;
+                if next_end <= next_start + 1.0 {
+                    next_start = (next_end - 1.0).max(16.0);
+                }
+                if (next_start - previous_start).abs() > f32::EPSILON
+                    || (next_end - previous_end).abs() > f32::EPSILON
+                {
+                    self.graphics_settings.fog_start = next_start;
+                    self.graphics_settings.fog_end = next_end;
+                    changed = true;
                 }
             }
             14 => {
-                self.graphics_settings.atmosphere_strength =
-                    (self.graphics_settings.atmosphere_strength + delta).clamp(0.0, 1.0);
+                let next = (self.graphics_settings.atmosphere_strength + delta).clamp(0.0, 1.0);
+                if (next - self.graphics_settings.atmosphere_strength).abs() > f32::EPSILON {
+                    self.graphics_settings.atmosphere_strength = next;
+                    changed = true;
+                }
             }
             15 => {
-                self.graphics_settings.color_vibrance =
-                    (self.graphics_settings.color_vibrance + delta).clamp(0.5, 1.8);
+                let next = (self.graphics_settings.color_vibrance + delta).clamp(0.5, 1.8);
+                if (next - self.graphics_settings.color_vibrance).abs() > f32::EPSILON {
+                    self.graphics_settings.color_vibrance = next;
+                    changed = true;
+                }
             }
             _ => {}
+        }
+        if changed {
+            self.persist_app_settings();
         }
     }
 
@@ -1421,10 +1551,20 @@ impl App {
         let page_start = selected.saturating_sub(max_rows / 2);
         let page_end = (page_start + max_rows).min(keys.len());
         let shown = &keys[page_start..page_end];
-        let mut lines = Vec::with_capacity(shown.len() + 3);
+        let mut lines = Vec::with_capacity(shown.len() + 8);
         lines.push("WHEEL/UPDOWN SELECT LEFTRIGHT TUNE".to_string());
         lines.push("SHIFT FINE CTRL ULTRA-FINE PGUP/PGDN COARSE".to_string());
-        lines.push("F8 PANEL F9 SAVE DEFAULT".to_string());
+        lines.push("F8 PANEL F9 SAVE PRESET F10 EDIT NAME".to_string());
+        if self.session.terrain_lab.editing_save_name {
+            lines.push("NAME EDIT ACTIVE TYPE / BKSP ENTER=SAVE ESC=CANCEL".to_string());
+        } else {
+            lines.push("NAME EDIT OFF".to_string());
+        }
+        lines.push(format!("SAVE NAME {}", self.session.terrain_lab.save_name));
+        if !self.session.terrain_lab.last_save_status.is_empty() {
+            lines.push(self.session.terrain_lab.last_save_status.clone());
+        }
+        let header_rows = lines.len();
         let cfg = self.world.terrain_config();
         for key in shown {
             let value = TerrainParamRegistry::value(&cfg, key);
@@ -1442,7 +1582,7 @@ impl App {
         Some((
             "TERRAIN LAB".to_string(),
             lines,
-            (selected - page_start) + 3,
+            (selected - page_start) + header_rows,
         ))
     }
 
@@ -1482,22 +1622,78 @@ impl App {
         if !self.session.terrain_lab.enabled {
             return;
         }
+        let typed_name = self.session.terrain_lab.save_name.trim();
+        let terrain_name = if typed_name.is_empty() {
+            default_terrain_lab_save_name(self.session.world_seed)
+        } else {
+            typed_name.to_string()
+        };
+        self.session.terrain_lab.save_name = terrain_name.clone();
+        let file_stem = sanitize_terrain_recipe_name(&terrain_name);
+        let named_path = PathBuf::from(TERRAIN_PRESET_RECIPE_DIR).join(format!("{file_stem}.terrain"));
+        let default_path = PathBuf::from(DEFAULT_TERRAIN_RECIPE_PATH);
+
         let mut recipe = TerrainRecipe::balanced(self.session.world_seed);
-        recipe.name = format!("terrain_lab_seed_{}", self.session.world_seed);
+        recipe.name = terrain_name;
         recipe.description = "Saved from in-game Terrain Lab".to_string();
         recipe.profile = "terrain_lab".to_string();
         recipe.seed = self.session.world_seed;
         recipe.terrain = self.world.terrain_config();
-        let path = PathBuf::from(DEFAULT_TERRAIN_RECIPE_PATH);
-        match recipe.write_to_file(&path) {
-            Ok(_) => {
-                eprintln!("terrain lab preset saved to {}", path.display());
-                self.session.terrain_recipe_path = Some(path);
-            }
-            Err(err) => {
-                eprintln!("failed to save terrain lab preset: {err}");
-            }
+        if let Err(err) = recipe.write_to_file(&named_path) {
+            self.session.terrain_lab.last_save_status = format!("SAVE FAILED {err}");
+            eprintln!("failed to save named terrain preset {}: {err}", named_path.display());
+            return;
         }
+        if let Err(err) = recipe.write_to_file(&default_path) {
+            self.session.terrain_lab.last_save_status = format!("DEFAULT IMPORT FAILED {err}");
+            eprintln!(
+                "failed to update default terrain recipe {}: {err}",
+                default_path.display()
+            );
+            return;
+        }
+        self.session.terrain_profile = "terrain_lab".to_string();
+        self.session.terrain_recipe_path = Some(default_path.clone());
+        self.session.terrain_lab.last_save_status = format!(
+            "SAVED {} (DEFAULT IMPORT {})",
+            named_path.display(),
+            default_path.display()
+        );
+        eprintln!(
+            "terrain lab preset saved to {} and imported as {}",
+            named_path.display(),
+            default_path.display()
+        );
+    }
+
+    fn handle_terrain_lab_name_input(&mut self, code: KeyCode) -> bool {
+        if !self.session.terrain_lab.editing_save_name {
+            return false;
+        }
+        match code {
+            KeyCode::Escape => {
+                self.session.terrain_lab.editing_save_name = false;
+                return true;
+            }
+            KeyCode::Enter => {
+                self.terrain_lab_save_preset();
+                self.session.terrain_lab.editing_save_name = false;
+                return true;
+            }
+            KeyCode::Backspace => {
+                self.session.terrain_lab.save_name.pop();
+                return true;
+            }
+            _ => {}
+        }
+        let shift_held = self.input.key(KeyCode::ShiftLeft) || self.input.key(KeyCode::ShiftRight);
+        if let Some(ch) = terrain_lab_save_name_char(code, shift_held)
+            && self.session.terrain_lab.save_name.len() < MAX_TERRAIN_LAB_SAVE_NAME_CHARS
+        {
+            self.session.terrain_lab.save_name.push(ch);
+            return true;
+        }
+        true
     }
 
     fn handle_terrain_lab_input(&mut self, code: KeyCode, repeat: bool) -> bool {
@@ -1514,6 +1710,19 @@ impl App {
         }
         if !self.session.terrain_lab.panel_visible {
             return false;
+        }
+        if code == KeyCode::F10 && !repeat {
+            self.session.terrain_lab.editing_save_name = !self.session.terrain_lab.editing_save_name;
+            if self.session.terrain_lab.editing_save_name
+                && self.session.terrain_lab.save_name.trim().is_empty()
+            {
+                self.session.terrain_lab.save_name =
+                    default_terrain_lab_save_name(self.session.world_seed);
+            }
+            return true;
+        }
+        if self.session.terrain_lab.editing_save_name {
+            return self.handle_terrain_lab_name_input(code);
         }
         let keys = TerrainConfig::parameter_keys();
         if keys.is_empty() {
@@ -2496,6 +2705,77 @@ fn digit_to_hotbar_index(code: KeyCode) -> Option<usize> {
         KeyCode::Digit6 => Some(5),
         KeyCode::Digit7 => Some(6),
         KeyCode::Digit8 => Some(7),
+        _ => None,
+    }
+}
+
+fn default_terrain_lab_save_name(seed: i64) -> String {
+    format!("terrain_lab_seed_{seed}")
+}
+
+fn sanitize_terrain_recipe_name(raw: &str) -> String {
+    let lowered = raw.trim().to_ascii_lowercase();
+    let mapped = lowered
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | '0'..='9' => ch,
+            '-' | '_' => ch,
+            ' ' => '_',
+            _ => '_',
+        })
+        .collect::<String>();
+    let collapsed = mapped
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
+    if collapsed.is_empty() {
+        "terrain".to_string()
+    } else {
+        collapsed
+    }
+}
+
+fn terrain_lab_save_name_char(code: KeyCode, shift_held: bool) -> Option<char> {
+    match code {
+        KeyCode::KeyA => Some(if shift_held { 'A' } else { 'a' }),
+        KeyCode::KeyB => Some(if shift_held { 'B' } else { 'b' }),
+        KeyCode::KeyC => Some(if shift_held { 'C' } else { 'c' }),
+        KeyCode::KeyD => Some(if shift_held { 'D' } else { 'd' }),
+        KeyCode::KeyE => Some(if shift_held { 'E' } else { 'e' }),
+        KeyCode::KeyF => Some(if shift_held { 'F' } else { 'f' }),
+        KeyCode::KeyG => Some(if shift_held { 'G' } else { 'g' }),
+        KeyCode::KeyH => Some(if shift_held { 'H' } else { 'h' }),
+        KeyCode::KeyI => Some(if shift_held { 'I' } else { 'i' }),
+        KeyCode::KeyJ => Some(if shift_held { 'J' } else { 'j' }),
+        KeyCode::KeyK => Some(if shift_held { 'K' } else { 'k' }),
+        KeyCode::KeyL => Some(if shift_held { 'L' } else { 'l' }),
+        KeyCode::KeyM => Some(if shift_held { 'M' } else { 'm' }),
+        KeyCode::KeyN => Some(if shift_held { 'N' } else { 'n' }),
+        KeyCode::KeyO => Some(if shift_held { 'O' } else { 'o' }),
+        KeyCode::KeyP => Some(if shift_held { 'P' } else { 'p' }),
+        KeyCode::KeyQ => Some(if shift_held { 'Q' } else { 'q' }),
+        KeyCode::KeyR => Some(if shift_held { 'R' } else { 'r' }),
+        KeyCode::KeyS => Some(if shift_held { 'S' } else { 's' }),
+        KeyCode::KeyT => Some(if shift_held { 'T' } else { 't' }),
+        KeyCode::KeyU => Some(if shift_held { 'U' } else { 'u' }),
+        KeyCode::KeyV => Some(if shift_held { 'V' } else { 'v' }),
+        KeyCode::KeyW => Some(if shift_held { 'W' } else { 'w' }),
+        KeyCode::KeyX => Some(if shift_held { 'X' } else { 'x' }),
+        KeyCode::KeyY => Some(if shift_held { 'Y' } else { 'y' }),
+        KeyCode::KeyZ => Some(if shift_held { 'Z' } else { 'z' }),
+        KeyCode::Digit0 => Some('0'),
+        KeyCode::Digit1 => Some('1'),
+        KeyCode::Digit2 => Some('2'),
+        KeyCode::Digit3 => Some('3'),
+        KeyCode::Digit4 => Some('4'),
+        KeyCode::Digit5 => Some('5'),
+        KeyCode::Digit6 => Some('6'),
+        KeyCode::Digit7 => Some('7'),
+        KeyCode::Digit8 => Some('8'),
+        KeyCode::Digit9 => Some('9'),
+        KeyCode::Minus => Some(if shift_held { '_' } else { '-' }),
+        KeyCode::Space => Some(' '),
         _ => None,
     }
 }
