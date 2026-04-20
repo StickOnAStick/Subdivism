@@ -610,7 +610,11 @@ impl App {
     fn refresh_window_title(&self) {
         if let Some(window) = &self.platform.window {
             let dev_flag = if self.session.dev_mode { " DEV" } else { "" };
-            let lab_flag = if self.session.terrain_lab.enabled { " LAB" } else { "" };
+            let lab_flag = if self.session.terrain_lab.enabled {
+                " LAB"
+            } else {
+                ""
+            };
             window.set_title(&format!(
                 "Voxel Starter [{} | {} | RD {} | SEED {}{}{}]",
                 self.frame_cap_label(),
@@ -745,7 +749,8 @@ impl App {
             self.camera.free_camera.position - Vec3::Y * PLAYER_EYE_HEIGHT,
             self.physics.respawn_margin,
         ) {
-            self.camera.free_camera.position = self.world.spawn_point() + Vec3::Y * PLAYER_EYE_HEIGHT;
+            self.camera.free_camera.position =
+                self.world.spawn_point() + Vec3::Y * PLAYER_EYE_HEIGHT;
         }
     }
 
@@ -1128,7 +1133,8 @@ impl App {
                 1 => self.adjust_graphics_setting_by(1, 1.0),
                 2 => self.adjust_graphics_setting_by(2, 0.05),
                 3 => {
-                    self.graphics_settings.shadows_enabled = !self.graphics_settings.shadows_enabled;
+                    self.graphics_settings.shadows_enabled =
+                        !self.graphics_settings.shadows_enabled;
                     self.persist_app_settings();
                 }
                 4 => {
@@ -1630,7 +1636,8 @@ impl App {
         };
         self.session.terrain_lab.save_name = terrain_name.clone();
         let file_stem = sanitize_terrain_recipe_name(&terrain_name);
-        let named_path = PathBuf::from(TERRAIN_PRESET_RECIPE_DIR).join(format!("{file_stem}.terrain"));
+        let named_path =
+            PathBuf::from(TERRAIN_PRESET_RECIPE_DIR).join(format!("{file_stem}.terrain"));
         let default_path = PathBuf::from(DEFAULT_TERRAIN_RECIPE_PATH);
 
         let mut recipe = TerrainRecipe::balanced(self.session.world_seed);
@@ -1641,7 +1648,10 @@ impl App {
         recipe.terrain = self.world.terrain_config();
         if let Err(err) = recipe.write_to_file(&named_path) {
             self.session.terrain_lab.last_save_status = format!("SAVE FAILED {err}");
-            eprintln!("failed to save named terrain preset {}: {err}", named_path.display());
+            eprintln!(
+                "failed to save named terrain preset {}: {err}",
+                named_path.display()
+            );
             return;
         }
         if let Err(err) = recipe.write_to_file(&default_path) {
@@ -1712,7 +1722,8 @@ impl App {
             return false;
         }
         if code == KeyCode::F10 && !repeat {
-            self.session.terrain_lab.editing_save_name = !self.session.terrain_lab.editing_save_name;
+            self.session.terrain_lab.editing_save_name =
+                !self.session.terrain_lab.editing_save_name;
             if self.session.terrain_lab.editing_save_name
                 && self.session.terrain_lab.save_name.trim().is_empty()
             {
@@ -1730,7 +1741,8 @@ impl App {
         }
         match code {
             KeyCode::ArrowUp if !repeat => {
-                self.session.terrain_lab.selected_index = self.session.terrain_lab.selected_index.saturating_sub(1);
+                self.session.terrain_lab.selected_index =
+                    self.session.terrain_lab.selected_index.saturating_sub(1);
                 true
             }
             KeyCode::ArrowDown if !repeat => {
@@ -1774,7 +1786,11 @@ impl App {
         let size = window.inner_size();
         let screen_size = [size.width as f32, size.height as f32];
         let (title, lines, _) = self.menu_overlay();
-        Some(self.diagnostics.debug_overlay.menu_layout(&title, &lines, screen_size))
+        Some(
+            self.diagnostics
+                .debug_overlay
+                .menu_layout(&title, &lines, screen_size),
+        )
     }
 
     fn update_menu_hover_from_cursor(&mut self) {
@@ -1886,7 +1902,10 @@ impl App {
                     "CHUNK WORKERS {} (ENV {})",
                     self.diagnostics.chunk_worker_count, override_count
                 ),
-                None => format!("CHUNK WORKERS {} (AUTO)", self.diagnostics.chunk_worker_count),
+                None => format!(
+                    "CHUNK WORKERS {} (AUTO)",
+                    self.diagnostics.chunk_worker_count
+                ),
             },
         ];
         if self.session.dev_mode {
@@ -2466,7 +2485,8 @@ impl ApplicationHandler for App {
                     let mut overlay_vertices = sky_overlay;
                     overlay_vertices.extend(gameplay_overlay);
                     overlay_vertices.extend(
-                        self.diagnostics.debug_overlay
+                        self.diagnostics
+                            .debug_overlay
                             .build_vertices(gpu.estimated_gpu_memory_bytes(), &hud_lines),
                     );
                     if let Some(menu_vertices) = menu_overlay {
@@ -2505,7 +2525,8 @@ impl ApplicationHandler for App {
                             }
 
                             if code == KeyCode::F3 && !event.repeat {
-                                self.diagnostics.debug_overlay.visible = !self.diagnostics.debug_overlay.visible;
+                                self.diagnostics.debug_overlay.visible =
+                                    !self.diagnostics.debug_overlay.visible;
                             }
                             if code == KeyCode::F4 && !event.repeat {
                                 self.cycle_frame_cap();
@@ -2633,7 +2654,8 @@ impl ApplicationHandler for App {
                 CameraMode::Free => {
                     self.camera.free_camera.yaw += delta.0 as f32 * LOOK_SENSITIVITY;
                     self.camera.free_camera.pitch -= delta.1 as f32 * LOOK_SENSITIVITY;
-                    self.camera.free_camera.pitch = self.camera.free_camera.pitch.clamp(-MAX_PITCH, MAX_PITCH);
+                    self.camera.free_camera.pitch =
+                        self.camera.free_camera.pitch.clamp(-MAX_PITCH, MAX_PITCH);
                 }
             }
             self.sync_active_camera();
@@ -3029,4 +3051,3 @@ mod tests {
         })
     }
 }
-

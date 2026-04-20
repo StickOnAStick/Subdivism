@@ -28,6 +28,13 @@ fn span_and_frequency(raw: f32, legacy_min: f32, legacy_max: f32) -> (f32, f32) 
     }
 }
 
+fn region_frequency_multiplier(region_scale: f32) -> f32 {
+    let t = region_scale.clamp(0.0, 1.0);
+    let curved = t * t * (3.0 - 2.0 * t);
+    // 0.0 => tighter/smaller regions, 1.0 => legacy broad regions.
+    2.35 + (1.0 - 2.35) * curved
+}
+
 impl World {
     pub(super) fn procedural_block(&self, x: i64, y: i32, z: i64) -> Block {
         let surface_y = self.surface_height(x, z);
@@ -68,15 +75,26 @@ impl World {
         let cfg = self.terrain;
         let fx = x as f32;
         let fz = z as f32;
-        let (_, macro_frequency) = span_and_frequency(cfg.macro_scale, 0.0015, 0.0800);
-        let (_, detail_frequency) = span_and_frequency(cfg.detail_scale, 0.0050, 0.3000);
+        let region_multiplier = region_frequency_multiplier(cfg.biome_region_scale);
+        let broad_multiplier = region_multiplier.powf(0.55);
+        let relief_multiplier = region_multiplier.powf(0.90);
+
+        let (_, macro_frequency_raw) = span_and_frequency(cfg.macro_scale, 0.0015, 0.0800);
+        let macro_frequency = macro_frequency_raw * broad_multiplier;
+        let (_, detail_frequency_raw) = span_and_frequency(cfg.detail_scale, 0.0050, 0.3000);
+        let detail_frequency = detail_frequency_raw * relief_multiplier.powf(0.28);
         let micro_span = cfg.micro_scale.clamp(0.0, 1.0);
         let micro_frequency = span_to_frequency(micro_span, 0.0600, 0.9000);
-        let (_, biome_frequency) = span_and_frequency(cfg.biome_scale, 0.0008, 0.0300);
-        let (_, valley_frequency) = span_and_frequency(cfg.valley_scale, 0.0015, 0.0800);
-        let (_, dune_frequency) = span_and_frequency(cfg.desert_dune_scale, 0.0050, 0.2000);
-        let (_, ravine_frequency) = span_and_frequency(cfg.ravine_scale, 0.0010, 0.0800);
-        let (_, cliff_frequency) = span_and_frequency(cfg.cliff_scale, 0.0040, 0.1600);
+        let (_, biome_frequency_raw) = span_and_frequency(cfg.biome_scale, 0.0008, 0.0300);
+        let biome_frequency = biome_frequency_raw * region_multiplier;
+        let (_, valley_frequency_raw) = span_and_frequency(cfg.valley_scale, 0.0015, 0.0800);
+        let valley_frequency = valley_frequency_raw * relief_multiplier;
+        let (_, dune_frequency_raw) = span_and_frequency(cfg.desert_dune_scale, 0.0050, 0.2000);
+        let dune_frequency = dune_frequency_raw * relief_multiplier.powf(0.62);
+        let (_, ravine_frequency_raw) = span_and_frequency(cfg.ravine_scale, 0.0010, 0.0800);
+        let ravine_frequency = ravine_frequency_raw * relief_multiplier;
+        let (_, cliff_frequency_raw) = span_and_frequency(cfg.cliff_scale, 0.0040, 0.1600);
+        let cliff_frequency = cliff_frequency_raw * relief_multiplier;
 
         let biome_warp = fbm_2d(
             self.seed.wrapping_add(0x9E37_79B9),
@@ -141,8 +159,9 @@ impl World {
             2.2,
             0.45,
         );
-        let (mountain_span, mountain_frequency) =
+        let (mountain_span, mountain_frequency_raw) =
             span_and_frequency(cfg.mountain_scale, 0.0035, 0.0600);
+        let mountain_frequency = mountain_frequency_raw * relief_multiplier;
         let mountain_sharpness = cfg.mountain_sharpness.clamp(0.0, 1.0);
         let mountain_base = fbm_2d(
             self.seed.wrapping_add(0xBB67_AE85),
@@ -398,7 +417,8 @@ impl World {
         let local_x = x.rem_euclid(CHUNK_SIZE) as f32;
         let local_z = z.rem_euclid(CHUNK_SIZE) as f32;
         let edge_extent = (CHUNK_SIZE - 1) as f32;
-        let blend_width = 5.5_f32;
+        let region_multiplier = region_frequency_multiplier(self.terrain.biome_region_scale);
+        let blend_width = (5.5 / region_multiplier.powf(0.45)).clamp(2.2, 5.5);
 
         let mut scores = [0.05_f32; 6];
         scores[biome_index(primary)] += 1.0;
@@ -465,29 +485,38 @@ impl World {
     pub(super) fn biome_kind_for_chunk(&self, chunk_x: i64, chunk_z: i64) -> BiomeKind {
         let fx = chunk_x as f32;
         let fz = chunk_z as f32;
-        let warp_x =
-            value_noise_2d(self.seed ^ 0x94D0_49BB_u64 as i64, fx * 0.017, fz * 0.017) * 18.0;
+        let region_multiplier = region_frequency_multiplier(self.terrain.biome_region_scale);
+        let warp_frequency = 0.017 * region_multiplier;
+        let region_frequency = 0.041 * region_multiplier;
+        let moisture_frequency = 0.048 * region_multiplier;
+        let relief_frequency = 0.056 * region_multiplier;
+        let warp_amplitude = 18.0 / region_multiplier.powf(0.32);
+        let warp_x = value_noise_2d(
+            self.seed ^ 0x94D0_49BB_u64 as i64,
+            fx * warp_frequency,
+            fz * warp_frequency,
+        ) * warp_amplitude;
         let warp_z = value_noise_2d(
             self.seed ^ 0x510E_527F_u64 as i64,
-            fx * 0.017 + 37.2,
-            fz * 0.017 - 12.6,
-        ) * 18.0;
+            fx * warp_frequency + 37.2,
+            fz * warp_frequency - 12.6,
+        ) * warp_amplitude;
         let wx = fx + warp_x;
         let wz = fz + warp_z;
         let region = value_noise_2d(
             self.seed ^ 0x6A09E667F3BCC909_u64 as i64,
-            wx * 0.041,
-            wz * 0.041,
+            wx * region_frequency,
+            wz * region_frequency,
         );
         let moisture = value_noise_2d(
             self.seed ^ 0xBB67AE8584CAA73B_u64 as i64,
-            wx * 0.048 + 21.3,
-            wz * 0.048 - 37.8,
+            wx * moisture_frequency + 21.3,
+            wz * moisture_frequency - 37.8,
         );
         let relief = value_noise_2d(
             self.seed ^ 0x3C6EF372FE94F82B_u64 as i64,
-            wx * 0.056 - 17.0,
-            wz * 0.056 + 9.0,
+            wx * relief_frequency - 17.0,
+            wz * relief_frequency + 9.0,
         );
         let continentality = region * 0.72 + relief * 0.28;
         if continentality < -0.34 {

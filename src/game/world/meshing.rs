@@ -324,6 +324,142 @@ impl World {
         vertices
     }
 
+    fn append_procedural_surface_smoothing(
+        &self,
+        vertices: &mut Vec<Vertex>,
+        overrides: &HashMap<BlockPos, Block>,
+        sub_overrides: &super::storage::SubOverrideState,
+        block_ids: &[u8],
+        column_top: &[i32],
+        xz_extent: usize,
+        base_x: i64,
+        base_z: i64,
+        min_fill_y: i32,
+        max_fill_y: i32,
+    ) {
+        let layer_stride = xz_extent * xz_extent;
+        let column_index = |x: usize, z: usize| z * xz_extent + x;
+        let grid_index = |x: usize, y: usize, z: usize| y * layer_stride + z * xz_extent + x;
+        let local_y_index = |world_y: i32| -> Option<usize> {
+            if world_y < min_fill_y || world_y > max_fill_y {
+                None
+            } else {
+                Some((world_y - min_fill_y) as usize)
+            }
+        };
+
+        for local_z in 1..=CHUNK_SIZE as usize {
+            let world_z = base_z + local_z as i64 - 1;
+            for local_x in 1..=CHUNK_SIZE as usize {
+                let world_x = base_x + local_x as i64 - 1;
+                let top_y = column_top[column_index(local_x, local_z)].min(max_fill_y);
+                if top_y < min_fill_y || top_y >= WORLD_MAX_Y {
+                    continue;
+                }
+                let Some(top_yi) = local_y_index(top_y) else {
+                    continue;
+                };
+                if overrides.contains_key(&BlockPos {
+                    x: world_x,
+                    y: top_y,
+                    z: world_z,
+                }) {
+                    continue;
+                }
+                let top_block = Block::from_id(block_ids[grid_index(local_x, top_yi, local_z)]);
+                if !top_block.is_solid() || matches!(top_block, Block::Water) {
+                    continue;
+                }
+
+                let smooth_cell_y = top_y + 1;
+                if !contains_world_y(smooth_cell_y) {
+                    continue;
+                }
+                if sub_overrides.has_entries_in_cell(world_x, smooth_cell_y, world_z) {
+                    continue;
+                }
+
+                let west_rise = (column_top[column_index(local_x - 1, local_z)] - top_y).max(0);
+                let east_rise = (column_top[column_index(local_x + 1, local_z)] - top_y).max(0);
+                let north_rise = (column_top[column_index(local_x, local_z - 1)] - top_y).max(0);
+                let south_rise = (column_top[column_index(local_x, local_z + 1)] - top_y).max(0);
+                let nw_rise = (column_top[column_index(local_x - 1, local_z - 1)] - top_y).max(0);
+                let ne_rise = (column_top[column_index(local_x + 1, local_z - 1)] - top_y).max(0);
+                let sw_rise = (column_top[column_index(local_x - 1, local_z + 1)] - top_y).max(0);
+                let se_rise = (column_top[column_index(local_x + 1, local_z + 1)] - top_y).max(0);
+
+                let max_rise = west_rise
+                    .max(east_rise)
+                    .max(north_rise)
+                    .max(south_rise)
+                    .max(nw_rise)
+                    .max(ne_rise)
+                    .max(sw_rise)
+                    .max(se_rise);
+                if max_rise <= 0 || max_rise > 3 {
+                    continue;
+                }
+
+                let edge_rise_sum = west_rise + east_rise + north_rise + south_rise;
+                let divisions: u8 = if max_rise >= 3 || edge_rise_sum >= 5 {
+                    6
+                } else {
+                    3
+                };
+                let inv_div = 1.0 / divisions as f32;
+
+                for sz in 0..divisions {
+                    let zf = (sz as f32 + 0.5) * inv_div;
+                    for sx in 0..divisions {
+                        let xf = (sx as f32 + 0.5) * inv_div;
+
+                        let mut local_height = 0.0_f32;
+                        local_height = local_height.max((west_rise as f32 * (1.0 - xf)).min(1.0));
+                        local_height = local_height.max((east_rise as f32 * xf).min(1.0));
+                        local_height = local_height.max((north_rise as f32 * (1.0 - zf)).min(1.0));
+                        local_height = local_height.max((south_rise as f32 * zf).min(1.0));
+                        local_height =
+                            local_height.max((nw_rise as f32 * (1.0 - xf) * (1.0 - zf)).min(1.0));
+                        local_height =
+                            local_height.max((ne_rise as f32 * xf * (1.0 - zf)).min(1.0));
+                        local_height =
+                            local_height.max((sw_rise as f32 * (1.0 - xf) * zf).min(1.0));
+                        local_height = local_height.max((se_rise as f32 * xf * zf).min(1.0));
+
+                        if local_height <= 0.01 {
+                            continue;
+                        }
+
+                        let roughness = face_noise_unit(
+                            world_x * divisions as i64 + sx as i64,
+                            smooth_cell_y,
+                            world_z * divisions as i64 + sz as i64,
+                            0x8C2D_4F5B,
+                        );
+                        local_height = (local_height + (roughness - 0.5) * 0.08).clamp(0.0, 1.0);
+
+                        let fill_levels = (local_height * divisions as f32).floor() as u8;
+                        if fill_levels == 0 {
+                            continue;
+                        }
+                        for sy in 0..fill_levels {
+                            let sub = SubBlockPos {
+                                x: world_x,
+                                y: smooth_cell_y,
+                                z: world_z,
+                                divisions,
+                                sx,
+                                sy,
+                                sz,
+                            };
+                            add_sub_block_cube(vertices, sub, top_block, self);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn build_chunk_mesh_with_overrides(
         &self,
         chunk: (i64, i64),
@@ -701,6 +837,18 @@ impl World {
             .sub_overrides
             .read()
             .expect("sub overrides read lock poisoned");
+        self.append_procedural_surface_smoothing(
+            &mut vertices,
+            overrides,
+            &sub_overrides,
+            &block_ids,
+            &column_top,
+            xz_extent,
+            base_x,
+            base_z,
+            min_fill_y,
+            max_fill_y,
+        );
         let chunk_max_x = base_x + CHUNK_SIZE - 1;
         let chunk_max_z = base_z + CHUNK_SIZE - 1;
         for (pos, block) in sub_overrides.iter_all() {

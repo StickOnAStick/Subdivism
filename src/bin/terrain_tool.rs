@@ -283,6 +283,12 @@ fn apply_description(cfg: &mut TerrainConfig, description: &str) {
         cfg.desert_dune_amplitude += 2.0;
         cfg.biome_blend += 0.04;
     }
+    if any(&["small", "compact", "tight", "dense", "local"]) {
+        cfg.biome_region_scale -= 0.18;
+    }
+    if any(&["vast", "broad", "wide", "expansive", "continental"]) {
+        cfg.biome_region_scale += 0.18;
+    }
     if any(&["blend", "blended", "smooth", "transition"]) {
         cfg.biome_blend += 0.06;
     }

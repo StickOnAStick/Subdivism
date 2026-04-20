@@ -78,6 +78,7 @@ impl TerrainRecipe {
             &format!("cliff_base_smoothing={:.6}", terrain.cliff_base_smoothing),
             &format!("terrace_step={:.6}", terrain.terrace_step),
             &format!("biome_scale={:.6}", terrain.biome_scale),
+            &format!("biome_region_scale={:.6}", terrain.biome_region_scale),
             &format!("biome_blend={:.6}", terrain.biome_blend),
             &format!("mountain_base_lift={:.6}", terrain.mountain_base_lift),
             &format!("desert_base_drop={:.6}", terrain.desert_base_drop),
@@ -151,6 +152,9 @@ impl TerrainRecipe {
                 }
                 "terrace_step" => parse_f32(value, &mut recipe.terrain.terrace_step, key)?,
                 "biome_scale" => parse_f32(value, &mut recipe.terrain.biome_scale, key)?,
+                "biome_region_scale" => {
+                    parse_f32(value, &mut recipe.terrain.biome_region_scale, key)?
+                }
                 "biome_blend" => parse_f32(value, &mut recipe.terrain.biome_blend, key)?,
                 "mountain_base_lift" => {
                     parse_f32(value, &mut recipe.terrain.mountain_base_lift, key)?

@@ -287,7 +287,9 @@ fn parse_bool(input: &str, key: &str) -> Result<bool, String> {
     if input.eq_ignore_ascii_case("false") || input == "0" {
         return Ok(false);
     }
-    Err(format!("invalid {key} `{input}`: expected true/false or 1/0"))
+    Err(format!(
+        "invalid {key} `{input}`: expected true/false or 1/0"
+    ))
 }
 
 fn clamp_f32_or_default(value: f32, min: f32, max: f32, default: f32) -> f32 {
@@ -340,7 +342,10 @@ mod tests {
             parsed.render_distance_chunks,
             super::super::MAX_RENDER_DISTANCE_CHUNKS
         );
-        assert_eq!(parsed.frame_cap_index, super::super::FRAME_CAP_PRESETS.len() - 1);
+        assert_eq!(
+            parsed.frame_cap_index,
+            super::super::FRAME_CAP_PRESETS.len() - 1
+        );
         assert_eq!(
             parsed.graphics_settings.ldo_start_distance_chunks,
             super::super::MAX_LDO_START_DISTANCE_CHUNKS

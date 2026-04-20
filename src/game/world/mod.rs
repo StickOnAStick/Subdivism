@@ -102,6 +102,7 @@ pub struct TerrainConfig {
     pub cliff_base_smoothing: f32,
     pub terrace_step: f32,
     pub biome_scale: f32,
+    pub biome_region_scale: f32,
     pub biome_blend: f32,
     pub mountain_base_lift: f32,
     pub desert_base_drop: f32,
@@ -123,7 +124,7 @@ pub struct TerrainParamSpec {
     pub step: f32,
 }
 
-const TERRAIN_PARAM_SPECS: [TerrainParamSpec; 30] = [
+const TERRAIN_PARAM_SPECS: [TerrainParamSpec; 31] = [
     TerrainParamSpec {
         key: "base_height",
         label: "BASE HEIGHT",
@@ -265,6 +266,13 @@ const TERRAIN_PARAM_SPECS: [TerrainParamSpec; 30] = [
         step: 0.01,
     },
     TerrainParamSpec {
+        key: "biome_region_scale",
+        label: "BIOME REGION SIZE",
+        min: 0.0,
+        max: 1.0,
+        step: 0.01,
+    },
+    TerrainParamSpec {
         key: "biome_blend",
         label: "BIOME BLEND",
         min: 0.0,
@@ -375,6 +383,7 @@ impl TerrainConfig {
             "cliff_base_smoothing" => Some(self.cliff_base_smoothing),
             "terrace_step" => Some(self.terrace_step),
             "biome_scale" => Some(self.biome_scale),
+            "biome_region_scale" => Some(self.biome_region_scale),
             "biome_blend" => Some(self.biome_blend),
             "mountain_base_lift" => Some(self.mountain_base_lift),
             "desert_base_drop" => Some(self.desert_base_drop),
@@ -411,6 +420,7 @@ impl TerrainConfig {
             cliff_base_smoothing: 0.0,
             terrace_step: 0.0,
             biome_scale: 0.0,
+            biome_region_scale: 0.0,
             biome_blend: 0.0,
             mountain_base_lift: 0.0,
             desert_base_drop: 0.0,
@@ -446,6 +456,7 @@ impl TerrainConfig {
             cliff_base_smoothing: 0.28,
             terrace_step: 1.8,
             biome_scale: 0.52,
+            biome_region_scale: 0.55,
             biome_blend: 0.18,
             mountain_base_lift: 5.0,
             desert_base_drop: 6.0,
@@ -516,12 +527,23 @@ impl TerrainConfig {
         }
     }
 
+    pub fn expansive() -> Self {
+        Self {
+            biome_region_scale: 1.0,
+            biome_blend: 0.16,
+            mountain_scale: 0.54,
+            valley_scale: 0.64,
+            ..Self::balanced()
+        }
+    }
+
     pub fn from_profile_name(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
             "balanced" => Some(Self::balanced()),
             "alpine" | "mountain" | "mountains" => Some(Self::alpine()),
             "canyon" | "cliff" | "cliffs" => Some(Self::canyon()),
             "valleylands" | "valley" | "valleys" => Some(Self::valleylands()),
+            "expansive" | "continental" | "large" => Some(Self::expansive()),
             _ => None,
         }
     }
@@ -548,6 +570,7 @@ impl TerrainConfig {
             "cliff_base_smoothing" => self.cliff_base_smoothing = value,
             "terrace_step" => self.terrace_step = value,
             "biome_scale" => self.biome_scale = value,
+            "biome_region_scale" => self.biome_region_scale = value,
             "biome_blend" => self.biome_blend = value,
             "mountain_base_lift" => self.mountain_base_lift = value,
             "desert_base_drop" => self.desert_base_drop = value,
@@ -585,6 +608,7 @@ impl TerrainConfig {
         self.cliff_base_smoothing = self.cliff_base_smoothing.clamp(0.0, 1.0);
         self.terrace_step = self.terrace_step.clamp(-32.0, 64.0);
         self.biome_scale = self.biome_scale.clamp(0.0, 1.0);
+        self.biome_region_scale = self.biome_region_scale.clamp(0.0, 1.0);
         self.biome_blend = self.biome_blend.clamp(0.0, 1.0);
         self.mountain_base_lift = self.mountain_base_lift.clamp(-128.0, 128.0);
         self.desert_base_drop = self.desert_base_drop.clamp(-128.0, 128.0);

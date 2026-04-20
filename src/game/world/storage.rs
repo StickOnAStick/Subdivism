@@ -67,6 +67,10 @@ impl SubOverrideState {
     pub(super) fn iter_all(&self) -> impl Iterator<Item = (&SubBlockPos, &Block)> {
         self.by_pos.iter()
     }
+
+    pub(super) fn has_entries_in_cell(&self, x: i64, y: i32, z: i64) -> bool {
+        self.by_cell.contains_key(&BlockPos { x, y, z })
+    }
 }
 
 #[derive(Clone)]
