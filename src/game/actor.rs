@@ -25,6 +25,7 @@ pub struct ActorState {
     pub motion: MotionState,
     pub look: LookState,
     pub on_ground: bool,
+    pub landing_velocity_carry_timer: f32,
 }
 
 impl ActorState {
@@ -39,6 +40,7 @@ impl ActorState {
                 pitch: -0.35,
             },
             on_ground: false,
+            landing_velocity_carry_timer: 0.0,
         }
     }
 
@@ -85,5 +87,6 @@ impl ActorRoster {
         actor.motion.position = spawn_position;
         actor.motion.velocity = Vec3::ZERO;
         actor.on_ground = true;
+        actor.landing_velocity_carry_timer = 0.0;
     }
 }

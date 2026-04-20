@@ -5,7 +5,10 @@ use std::{
 
 use glam::Vec3;
 
-use crate::mesh::{Vertex, push_quad};
+use crate::{
+    game::block_style::BlockStyleBook,
+    mesh::{Vertex, push_quad},
+};
 
 mod lighting;
 mod meshing;
@@ -38,18 +41,219 @@ pub enum Block {
     Stone,
     Deepslate,
     DeepDark,
+    CustomA,
+    CustomB,
+    CustomC,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockActionState {
+    Inert,
+    Fluid,
+    Growable,
+    Toggleable,
+    Powered,
+}
+
+impl BlockActionState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Inert => "INERT",
+            Self::Fluid => "FLUID",
+            Self::Growable => "GROWABLE",
+            Self::Toggleable => "TOGGLEABLE",
+            Self::Powered => "POWERED",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BlockProperties {
+    pub label: &'static str,
+    pub short_code: &'static str,
+    pub solid: bool,
+    pub liquid: bool,
+    pub replaceable: bool,
+    pub friction: f32,
+    pub hardness: f32,
+    pub light_emission: u8,
+    pub action_state: BlockActionState,
+    pub hud_tint: [f32; 4],
 }
 
 impl Block {
-    pub fn is_solid(self) -> bool {
-        !matches!(self, Self::Air | Self::Water)
+    pub const COUNT: usize = 10;
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Air,
+        Self::Water,
+        Self::Grass,
+        Self::Dirt,
+        Self::Stone,
+        Self::Deepslate,
+        Self::DeepDark,
+        Self::CustomA,
+        Self::CustomB,
+        Self::CustomC,
+    ];
+
+    pub fn all() -> &'static [Self] {
+        &Self::ALL
     }
 
-    fn to_id(self) -> u8 {
+    pub fn properties(self) -> BlockProperties {
+        match self {
+            Self::Air => BlockProperties {
+                label: "AIR",
+                short_code: "_",
+                solid: false,
+                liquid: false,
+                replaceable: true,
+                friction: 0.0,
+                hardness: 0.0,
+                light_emission: 0,
+                action_state: BlockActionState::Inert,
+                hud_tint: [0.15, 0.17, 0.18, 0.35],
+            },
+            Self::Water => BlockProperties {
+                label: "WATER",
+                short_code: "W",
+                solid: false,
+                liquid: true,
+                replaceable: true,
+                friction: 0.32,
+                hardness: 0.0,
+                light_emission: 0,
+                action_state: BlockActionState::Fluid,
+                hud_tint: [0.24, 0.46, 0.78, 0.88],
+            },
+            Self::Grass => BlockProperties {
+                label: "GRASS",
+                short_code: "G",
+                solid: true,
+                liquid: false,
+                replaceable: false,
+                friction: 1.0,
+                hardness: 0.8,
+                light_emission: 0,
+                action_state: BlockActionState::Growable,
+                hud_tint: [0.34, 0.72, 0.36, 0.95],
+            },
+            Self::Dirt => BlockProperties {
+                label: "DIRT",
+                short_code: "D",
+                solid: true,
+                liquid: false,
+                replaceable: false,
+                friction: 0.92,
+                hardness: 1.0,
+                light_emission: 0,
+                action_state: BlockActionState::Inert,
+                hud_tint: [0.42, 0.29, 0.20, 0.95],
+            },
+            Self::Stone => BlockProperties {
+                label: "STONE",
+                short_code: "S",
+                solid: true,
+                liquid: false,
+                replaceable: false,
+                friction: 0.88,
+                hardness: 2.4,
+                light_emission: 0,
+                action_state: BlockActionState::Inert,
+                hud_tint: [0.56, 0.58, 0.60, 0.95],
+            },
+            Self::Deepslate => BlockProperties {
+                label: "DEEPSLATE",
+                short_code: "L",
+                solid: true,
+                liquid: false,
+                replaceable: false,
+                friction: 0.84,
+                hardness: 3.0,
+                light_emission: 0,
+                action_state: BlockActionState::Inert,
+                hud_tint: [0.35, 0.37, 0.40, 0.95],
+            },
+            Self::DeepDark => BlockProperties {
+                label: "DEEPDARK",
+                short_code: "K",
+                solid: true,
+                liquid: false,
+                replaceable: false,
+                friction: 0.78,
+                hardness: 3.4,
+                light_emission: 0,
+                action_state: BlockActionState::Powered,
+                hud_tint: [0.08, 0.10, 0.11, 0.95],
+            },
+            Self::CustomA => BlockProperties {
+                label: "CUSTOM_A",
+                short_code: "A",
+                solid: true,
+                liquid: false,
+                replaceable: false,
+                friction: 0.9,
+                hardness: 1.6,
+                light_emission: 0,
+                action_state: BlockActionState::Toggleable,
+                hud_tint: [0.84, 0.42, 0.28, 0.95],
+            },
+            Self::CustomB => BlockProperties {
+                label: "CUSTOM_B",
+                short_code: "B",
+                solid: true,
+                liquid: false,
+                replaceable: false,
+                friction: 0.94,
+                hardness: 2.1,
+                light_emission: 6,
+                action_state: BlockActionState::Powered,
+                hud_tint: [0.28, 0.56, 0.90, 0.95],
+            },
+            Self::CustomC => BlockProperties {
+                label: "CUSTOM_C",
+                short_code: "C",
+                solid: true,
+                liquid: false,
+                replaceable: false,
+                friction: 0.86,
+                hardness: 2.8,
+                light_emission: 0,
+                action_state: BlockActionState::Inert,
+                hud_tint: [0.74, 0.78, 0.34, 0.95],
+            },
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        self.properties().label
+    }
+
+    pub fn short_code(self) -> &'static str {
+        self.properties().short_code
+    }
+
+    pub fn hud_tint(self) -> [f32; 4] {
+        self.properties().hud_tint
+    }
+
+    pub fn is_solid(self) -> bool {
+        self.properties().solid
+    }
+
+    pub fn is_liquid(self) -> bool {
+        self.properties().liquid
+    }
+
+    pub fn is_replaceable(self) -> bool {
+        self.properties().replaceable
+    }
+
+    pub(crate) fn to_id(self) -> u8 {
         self as u8
     }
 
-    fn from_id(id: u8) -> Self {
+    pub(crate) fn from_id(id: u8) -> Self {
         match id {
             1 => Self::Water,
             2 => Self::Grass,
@@ -57,6 +261,9 @@ impl Block {
             4 => Self::Stone,
             5 => Self::Deepslate,
             6 => Self::DeepDark,
+            7 => Self::CustomA,
+            8 => Self::CustomB,
+            9 => Self::CustomC,
             _ => Self::Air,
         }
     }
@@ -83,6 +290,7 @@ pub struct SubBlockPos {
 #[derive(Clone, Copy, Debug)]
 pub struct TerrainConfig {
     pub base_height: f32,
+    pub horizontal_frequency_boost: f32,
     pub macro_scale: f32,
     pub macro_amplitude: f32,
     pub detail_scale: f32,
@@ -123,13 +331,20 @@ pub struct TerrainParamSpec {
     pub step: f32,
 }
 
-const TERRAIN_PARAM_SPECS: [TerrainParamSpec; 30] = [
+const TERRAIN_PARAM_SPECS: [TerrainParamSpec; 31] = [
     TerrainParamSpec {
         key: "base_height",
         label: "BASE HEIGHT",
         min: -128.0,
         max: 256.0,
         step: 2.0,
+    },
+    TerrainParamSpec {
+        key: "horizontal_frequency_boost",
+        label: "HORIZONTAL DENSITY",
+        min: 0.5,
+        max: 3.0,
+        step: 0.05,
     },
     TerrainParamSpec {
         key: "macro_scale",
@@ -356,6 +571,7 @@ impl TerrainConfig {
     pub fn named_param_value(&self, key: &str) -> Option<f32> {
         match key {
             "base_height" => Some(self.base_height),
+            "horizontal_frequency_boost" => Some(self.horizontal_frequency_boost),
             "macro_scale" => Some(self.macro_scale),
             "macro_amplitude" => Some(self.macro_amplitude),
             "detail_scale" => Some(self.detail_scale),
@@ -392,6 +608,7 @@ impl TerrainConfig {
     pub fn balanced() -> Self {
         Self {
             base_height: 34.0,
+            horizontal_frequency_boost: 1.35,
             macro_scale: 0.70,
             macro_amplitude: 9.0,
             detail_scale: 0.58,
@@ -494,6 +711,7 @@ impl TerrainConfig {
     pub fn set_named_param(&mut self, key: &str, value: f32) -> Result<(), String> {
         match key.to_ascii_lowercase().as_str() {
             "base_height" => self.base_height = value,
+            "horizontal_frequency_boost" => self.horizontal_frequency_boost = value,
             "macro_scale" => self.macro_scale = value,
             "macro_amplitude" => self.macro_amplitude = value,
             "detail_scale" => self.detail_scale = value,
@@ -531,6 +749,7 @@ impl TerrainConfig {
 
     pub fn clamp_reasonable(&mut self) {
         self.base_height = self.base_height.clamp(-128.0, 256.0);
+        self.horizontal_frequency_boost = self.horizontal_frequency_boost.clamp(0.5, 3.0);
         self.macro_scale = self.macro_scale.clamp(0.0, 1.0);
         self.macro_amplitude = self.macro_amplitude.clamp(-128.0, 128.0);
         self.detail_scale = self.detail_scale.clamp(0.0, 1.0);
@@ -568,6 +787,7 @@ pub struct World {
     storage: WorldStorage,
     seed: i64,
     terrain: TerrainConfig,
+    block_styles: BlockStyleBook,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -604,6 +824,7 @@ impl World {
             },
             seed,
             terrain,
+            block_styles: BlockStyleBook::default(),
         };
         world.storage.spawn_point = world.spawn_point_for_column(0, 0).unwrap_or(Vec3::new(
             0.5,
@@ -635,6 +856,14 @@ impl World {
 
     pub fn terrain_config(&self) -> TerrainConfig {
         self.terrain
+    }
+
+    pub fn block_style_book(&self) -> &BlockStyleBook {
+        &self.block_styles
+    }
+
+    pub fn set_block_style_book(&mut self, styles: BlockStyleBook) {
+        self.block_styles = styles;
     }
 }
 

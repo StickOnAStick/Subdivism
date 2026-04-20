@@ -86,6 +86,14 @@ impl World {
         self.block_at(x, y, z).is_solid()
     }
 
+    pub fn is_water(&self, x: i32, y: i32, z: i32) -> bool {
+        self.is_water_i64(x as i64, y, z as i64)
+    }
+
+    pub fn is_water_i64(&self, x: i64, y: i32, z: i64) -> bool {
+        self.block_at(x, y, z).is_liquid()
+    }
+
     pub fn block_at_i64(&self, x: i64, y: i32, z: i64) -> Block {
         self.block_at(x, y, z)
     }

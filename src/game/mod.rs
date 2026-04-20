@@ -1,5 +1,6 @@
 pub mod actor;
 pub mod asset_registry;
+pub mod block_style;
 pub mod hud;
 pub mod interact;
 pub mod inventory;

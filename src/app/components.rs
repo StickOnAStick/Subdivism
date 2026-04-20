@@ -10,7 +10,10 @@ use winit::window::{Window, WindowId};
 use crate::{
     camera::{Camera, CameraLens},
     debug_overlay::DebugOverlay,
-    game::world::Block,
+    game::{
+        block_style::{TextureBrush, TextureFace},
+        world::Block,
+    },
     render::{ChunkRenderKey, GpuState},
 };
 
@@ -53,6 +56,30 @@ impl TerrainLabState {
     }
 }
 
+pub(super) struct TextureLabState {
+    pub(super) enabled: bool,
+    pub(super) panel_visible: bool,
+    pub(super) selected_row: usize,
+    pub(super) selected_block: Block,
+    pub(super) selected_face: TextureFace,
+    pub(super) selected_brush: TextureBrush,
+    pub(super) brush_strength: f32,
+}
+
+impl TextureLabState {
+    pub(super) fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            panel_visible: false,
+            selected_row: 0,
+            selected_block: Block::Stone,
+            selected_face: TextureFace::Top,
+            selected_brush: TextureBrush::Lighten,
+            brush_strength: 0.08,
+        }
+    }
+}
+
 pub(super) struct PlatformRuntimeState {
     pub(super) window: Option<Arc<Window>>,
     pub(super) window_id: Option<WindowId>,
@@ -91,6 +118,7 @@ pub(super) struct WorldSessionState {
     pub(super) terrain_recipe_path: Option<PathBuf>,
     pub(super) dev_mode: bool,
     pub(super) terrain_lab: TerrainLabState,
+    pub(super) texture_lab: TextureLabState,
 }
 
 impl WorldSessionState {
@@ -100,6 +128,7 @@ impl WorldSessionState {
         terrain_recipe_path: Option<PathBuf>,
         dev_mode: bool,
         terrain_lab_enabled: bool,
+        texture_lab_enabled: bool,
     ) -> Self {
         Self {
             world_seed,
@@ -107,6 +136,7 @@ impl WorldSessionState {
             terrain_recipe_path,
             dev_mode,
             terrain_lab: TerrainLabState::new(terrain_lab_enabled),
+            texture_lab: TextureLabState::new(texture_lab_enabled),
         }
     }
 }

@@ -66,8 +66,9 @@ impl World {
 
     pub(super) fn surface_height(&self, x: i64, z: i64) -> i32 {
         let cfg = self.terrain;
-        let fx = x as f32;
-        let fz = z as f32;
+        let horizontal_boost = cfg.horizontal_frequency_boost.clamp(0.5, 3.0);
+        let fx = x as f32 * horizontal_boost;
+        let fz = z as f32 * horizontal_boost;
         let (_, macro_frequency) = span_and_frequency(cfg.macro_scale, 0.0015, 0.0800);
         let (_, detail_frequency) = span_and_frequency(cfg.detail_scale, 0.0050, 0.3000);
         let micro_span = cfg.micro_scale.clamp(0.0, 1.0);
@@ -389,7 +390,8 @@ impl World {
         z: i64,
     ) -> ([f32; 3], [f32; 3], [f32; 3]) {
         let biome = self.biome_at(x, z);
-        palette(block, x, z, biome)
+        let style = self.block_style_book().style(block);
+        palette(block, style, x, z, biome)
     }
 
     pub(super) fn biome_at(&self, x: i64, z: i64) -> BiomeKind {
@@ -463,8 +465,9 @@ impl World {
     }
 
     pub(super) fn biome_kind_for_chunk(&self, chunk_x: i64, chunk_z: i64) -> BiomeKind {
-        let fx = chunk_x as f32;
-        let fz = chunk_z as f32;
+        let horizontal_boost = self.terrain.horizontal_frequency_boost.clamp(0.5, 3.0);
+        let fx = chunk_x as f32 * horizontal_boost;
+        let fz = chunk_z as f32 * horizontal_boost;
         let warp_x =
             value_noise_2d(self.seed ^ 0x94D0_49BB_u64 as i64, fx * 0.017, fz * 0.017) * 18.0;
         let warp_z = value_noise_2d(

@@ -166,13 +166,19 @@ pub fn sub_slot_overlaps_existing(
     sy: u8,
     sz: u8,
 ) -> bool {
-    let (new_min, new_max) = sub_target_bounds(base, divisions, sx, sy, sz);
+    if divisions == 0 {
+        return false;
+    }
     for (sub, block) in world.sub_blocks_in_cell(base.0, base.1, base.2) {
         if !block.is_solid() {
             continue;
         }
-        let (min, max) = sub_pos_bounds(sub);
-        if aabb_overlap(new_min, new_max, min, max) {
+        if sub_slots_overlap(
+            divisions,
+            (sx, sy, sz),
+            sub.divisions,
+            (sub.sx, sub.sy, sub.sz),
+        ) {
             return true;
         }
     }
@@ -469,24 +475,44 @@ fn sub_pos_bounds(pos: SubBlockPos) -> (Vec3, Vec3) {
     (min, max)
 }
 
-fn sub_target_bounds(base: (i64, i32, i64), divisions: u8, sx: u8, sy: u8, sz: u8) -> (Vec3, Vec3) {
-    let step = 1.0 / divisions as f32;
-    let min = Vec3::new(
-        base.0 as f32 + sx as f32 * step,
-        base.1 as f32 + sy as f32 * step,
-        base.2 as f32 + sz as f32 * step,
-    );
-    let max = min + Vec3::splat(step);
-    (min, max)
+fn sub_slots_overlap(
+    a_divisions: u8,
+    a_slot: (u8, u8, u8),
+    b_divisions: u8,
+    b_slot: (u8, u8, u8),
+) -> bool {
+    if a_divisions == 0 || b_divisions == 0 {
+        return false;
+    }
+    let unit = lcm_u8(a_divisions, b_divisions) as u32;
+    let a_step = unit / a_divisions as u32;
+    let b_step = unit / b_divisions as u32;
+
+    let (ax0, ax1) = (a_slot.0 as u32 * a_step, (a_slot.0 as u32 + 1) * a_step);
+    let (ay0, ay1) = (a_slot.1 as u32 * a_step, (a_slot.1 as u32 + 1) * a_step);
+    let (az0, az1) = (a_slot.2 as u32 * a_step, (a_slot.2 as u32 + 1) * a_step);
+
+    let (bx0, bx1) = (b_slot.0 as u32 * b_step, (b_slot.0 as u32 + 1) * b_step);
+    let (by0, by1) = (b_slot.1 as u32 * b_step, (b_slot.1 as u32 + 1) * b_step);
+    let (bz0, bz1) = (b_slot.2 as u32 * b_step, (b_slot.2 as u32 + 1) * b_step);
+
+    ax0 < bx1 && ax1 > bx0 && ay0 < by1 && ay1 > by0 && az0 < bz1 && az1 > bz0
 }
 
-fn aabb_overlap(min_a: Vec3, max_a: Vec3, min_b: Vec3, max_b: Vec3) -> bool {
-    min_a.x < max_b.x
-        && max_a.x > min_b.x
-        && min_a.y < max_b.y
-        && max_a.y > min_b.y
-        && min_a.z < max_b.z
-        && max_a.z > min_b.z
+fn gcd_u8(mut a: u8, mut b: u8) -> u8 {
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    a.max(1)
+}
+
+fn lcm_u8(a: u8, b: u8) -> u8 {
+    let gcd = gcd_u8(a, b);
+    ((a as u16 / gcd as u16) * b as u16)
+        .min(u8::MAX as u16)
+        .max(1) as u8
 }
 
 fn face_normal_from_sub_transition(

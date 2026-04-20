@@ -93,21 +93,21 @@ impl Default for GraphicsSettings {
 impl GraphicsSettings {
     pub fn low_preset() -> Self {
         Self {
-            shadows_enabled: true,
+            shadows_enabled: false,
             fog_enabled: false,
             atmosphere_enabled: false,
-            ldo_start_distance_chunks: 10,
-            shader_quality: 0.2,
-            ambient_boost: 0.22,
-            shadow_softness: 0.2,
-            shadow_contrast: 0.9,
-            far_shadow_lift: 0.22,
-            fog_strength: 0.5,
-            fog_start: 50.0,
-            fog_end: 256.0,
-            atmosphere_strength: 0.4,
-            color_vibrance: 1.2,
-            ldo_detail_scale: 0.72,
+            ldo_start_distance_chunks: 8,
+            shader_quality: 0.08,
+            ambient_boost: 0.18,
+            shadow_softness: 0.1,
+            shadow_contrast: 0.6,
+            far_shadow_lift: 0.1,
+            fog_strength: 0.18,
+            fog_start: 40.0,
+            fog_end: 200.0,
+            atmosphere_strength: 0.0,
+            color_vibrance: 1.0,
+            ldo_detail_scale: 0.62,
         }
     }
 }

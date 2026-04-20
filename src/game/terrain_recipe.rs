@@ -59,6 +59,10 @@ impl TerrainRecipe {
             &format!("profile={}", self.profile),
             &format!("seed={}", self.seed),
             &format!("base_height={:.6}", terrain.base_height),
+            &format!(
+                "horizontal_frequency_boost={:.6}",
+                terrain.horizontal_frequency_boost
+            ),
             &format!("macro_scale={:.6}", terrain.macro_scale),
             &format!("macro_amplitude={:.6}", terrain.macro_amplitude),
             &format!("detail_scale={:.6}", terrain.detail_scale),
@@ -120,6 +124,9 @@ impl TerrainRecipe {
                         .map_err(|err| format!("invalid seed `{value}`: {err}"))?;
                 }
                 "base_height" => parse_f32(value, &mut recipe.terrain.base_height, key)?,
+                "horizontal_frequency_boost" => {
+                    parse_f32(value, &mut recipe.terrain.horizontal_frequency_boost, key)?
+                }
                 "macro_scale" => parse_f32(value, &mut recipe.terrain.macro_scale, key)?,
                 "macro_amplitude" => parse_f32(value, &mut recipe.terrain.macro_amplitude, key)?,
                 "detail_scale" => parse_f32(value, &mut recipe.terrain.detail_scale, key)?,

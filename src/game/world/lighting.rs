@@ -143,13 +143,5 @@ pub(super) fn apply_light(color: [f32; 3], light_level: u8, face_shade: f32) -> 
 }
 
 fn block_light_emission(block: Block) -> u8 {
-    match block {
-        Block::Air
-        | Block::Water
-        | Block::Grass
-        | Block::Dirt
-        | Block::Stone
-        | Block::Deepslate
-        | Block::DeepDark => 0,
-    }
+    block.properties().light_emission
 }

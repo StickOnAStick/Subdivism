@@ -1,4 +1,5 @@
 use super::*;
+use crate::game::block_style::BlockStyle;
 
 type Color = [f32; 3];
 
@@ -29,38 +30,6 @@ const BIOME_TINT_MOUNTAIN: Color = [0.78, 0.84, 0.92];
 const BIOME_TINT_DESERT: Color = [1.22, 1.06, 0.70];
 const BIOME_TINT_FOREST: Color = [0.70, 1.04, 0.72];
 
-const GRASS_TOP_A: Color = [0.36, 0.78, 0.40];
-const GRASS_TOP_B: Color = [0.30, 0.70, 0.34];
-const GRASS_BASE: FacePalette = FacePalette::new(
-    GRASS_TOP_A,        // top is selected per checker variant
-    [0.33, 0.25, 0.16], // sides (dirt + grass fringe)
-    [0.16, 0.22, 0.14], // underside
-);
-
-const DIRT_BASE: FacePalette = FacePalette::new(
-    [0.40, 0.28, 0.18], // top
-    [0.35, 0.23, 0.14], // sides
-    [0.22, 0.14, 0.09], // underside
-);
-
-const STONE_BASE: FacePalette = FacePalette::new(
-    [0.55, 0.57, 0.60], // top
-    [0.48, 0.50, 0.53], // sides
-    [0.35, 0.36, 0.39], // underside
-);
-
-const DEEPSLATE_BASE: FacePalette = FacePalette::new(
-    [0.34, 0.36, 0.39], // top
-    [0.28, 0.30, 0.33], // sides
-    [0.22, 0.24, 0.27], // underside
-);
-
-const DEEP_DARK_BASE: FacePalette = FacePalette::new(
-    [0.06, 0.08, 0.09], // top
-    [0.04, 0.06, 0.07], // sides
-    [0.02, 0.03, 0.04], // underside
-);
-
 const AIR_BASE: FacePalette = FacePalette::new([0.0; 3], [0.0; 3], [0.0; 3]);
 
 fn tint_color(color: Color, tint: Color) -> Color {
@@ -77,6 +46,15 @@ fn tint_palette(base: FacePalette, tint: Color) -> FacePalette {
         tint_color(base.side, tint),
         tint_color(base.bottom, tint),
     )
+}
+
+fn blend_tint_strength(tint: Color, strength: f32) -> Color {
+    let s = strength.clamp(0.0, 1.25);
+    [
+        (1.0 + (tint[0] - 1.0) * s).clamp(0.0, 1.35),
+        (1.0 + (tint[1] - 1.0) * s).clamp(0.0, 1.35),
+        (1.0 + (tint[2] - 1.0) * s).clamp(0.0, 1.35),
+    ]
 }
 
 fn add_uniform_offset(color: Color, offset: f32) -> Color {
@@ -113,34 +91,37 @@ fn stone_variation_offset(x: i64, z: i64) -> f32 {
     variation_bucket * 0.016 - 0.024
 }
 
-pub(super) fn palette(block: Block, x: i64, z: i64, biome: BiomeKind) -> (Color, Color, Color) {
-    let tint = biome_tint(biome);
+pub(super) fn palette(
+    block: Block,
+    style: BlockStyle,
+    x: i64,
+    z: i64,
+    biome: BiomeKind,
+) -> (Color, Color, Color) {
+    let tint = blend_tint_strength(biome_tint(biome), style.biome_tint_strength);
+    let mut base = FacePalette::new(style.top, style.side, style.bottom);
     match block {
-        Block::Water => tint_palette(
-            FacePalette::new([0.22, 0.46, 0.78], [0.18, 0.36, 0.64], [0.12, 0.24, 0.44]),
-            tint,
-        )
-        .to_tuple(),
+        Block::Water => tint_palette(base, tint).to_tuple(),
         Block::Grass => {
-            let top = if ((x + z) & 1) == 0 {
-                GRASS_TOP_A
-            } else {
-                GRASS_TOP_B
-            };
-            tint_palette(
-                FacePalette::new(top, GRASS_BASE.side, GRASS_BASE.bottom),
-                tint,
-            )
-            .to_tuple()
+            // Checker blend keeps grass from appearing as a perfectly flat painted sheet.
+            let checker = if ((x + z) & 1) == 0 { 1.0 } else { -1.0 };
+            let variation = checker * (0.04 * style.grain_strength.clamp(0.0, 1.0));
+            base.top = add_uniform_offset(base.top, variation);
+            tint_palette(base, tint).to_tuple()
         }
-        Block::Dirt => tint_palette(DIRT_BASE, tint).to_tuple(),
-        // Keep rock tones biome-neutral so stone never reads as sand/mud from biome tinting.
+        Block::Dirt => tint_palette(base, tint).to_tuple(),
         Block::Stone => {
-            let offset = stone_variation_offset(x, z);
-            apply_uniform_brightness_offset(STONE_BASE, offset).to_tuple()
+            let offset = stone_variation_offset(x, z) * style.grain_strength.clamp(0.0, 1.0);
+            apply_uniform_brightness_offset(base, offset).to_tuple()
         }
-        Block::Deepslate => DEEPSLATE_BASE.to_tuple(),
-        Block::DeepDark => DEEP_DARK_BASE.to_tuple(),
+        Block::Deepslate | Block::DeepDark => {
+            let offset = stone_variation_offset(x, z) * 0.5 * style.grain_strength.clamp(0.0, 1.0);
+            apply_uniform_brightness_offset(base, offset).to_tuple()
+        }
+        Block::CustomA | Block::CustomB | Block::CustomC => {
+            let offset = stone_variation_offset(x, z) * 0.35 * style.grain_strength.clamp(0.0, 1.0);
+            tint_palette(apply_uniform_brightness_offset(base, offset), tint).to_tuple()
+        }
         Block::Air => AIR_BASE.to_tuple(),
     }
 }

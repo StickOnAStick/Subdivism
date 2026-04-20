@@ -1,6 +1,6 @@
 # `src/bin/` Tooling Binaries
 
-Subdivism includes three utility binaries.
+Subdivism includes four utility binaries.
 
 ## `terrain_tool`
 
@@ -37,6 +37,19 @@ Examples:
 ```bash
 cargo run --bin perf_suite
 cargo run --bin perf_suite -- --full
+```
+
+## `texture_lab`
+
+Purpose:
+- Interactive texture/material tuning mode with palette sliders and brush operations
+- Save edited block styles to `terrain/block_styles.lab`
+- Push the selected lab block directly into the active hotbar slot for in-world testing
+
+Examples:
+```bash
+cargo run --bin texture_lab
+cargo run -- --texture-lab
 ```
 
 ## Notes

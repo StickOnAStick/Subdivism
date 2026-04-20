@@ -69,6 +69,17 @@ impl Inventory {
         self.hotbar[self.selected_hotbar]
     }
 
+    pub fn set_selected_hotbar_block(&mut self, block: Block, count: u32) {
+        if matches!(block, Block::Air) || count == 0 {
+            self.hotbar[self.selected_hotbar] = InventorySlot::default();
+            return;
+        }
+        self.hotbar[self.selected_hotbar] = InventorySlot {
+            block,
+            count: count.clamp(1, STACK_LIMIT),
+        };
+    }
+
     pub fn hotbar(&self) -> &[InventorySlot; HOTBAR_SIZE] {
         &self.hotbar
     }

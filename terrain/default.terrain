@@ -5,6 +5,7 @@ description=Saved from in-game Terrain Lab
 profile=terrain_lab
 seed=1592638046
 base_height=18.000000
+horizontal_frequency_boost=1.650000
 macro_scale=0.800000
 macro_amplitude=2.000000
 detail_scale=1.000000

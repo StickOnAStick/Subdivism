@@ -529,8 +529,9 @@ impl World {
                     let block = Block::from_id(block_id);
                     let base = Vec3::new(world_x as f32, y as f32, world_z as f32);
                     let biome = column_biomes[column_index(local_x, local_z)];
+                    let style = self.block_style_book().style(block);
                     let (top_color, side_color, bottom_color) =
-                        palette(block, world_x, world_z, biome);
+                        palette(block, style, world_x, world_z, biome);
 
                     if yi + 1 >= y_extent
                         || block_ids[grid_index(local_x, yi + 1, local_z)] == Block::Air.to_id()

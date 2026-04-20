@@ -88,6 +88,10 @@ impl DebugOverlay {
         }
     }
 
+    pub fn current_fps(&self) -> f32 {
+        self.fps
+    }
+
     pub fn build_vertices(&self, memory_bytes: u64, extra_lines: &[String]) -> Vec<OverlayVertex> {
         if !self.visible {
             return Vec::new();

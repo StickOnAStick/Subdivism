@@ -21,19 +21,21 @@ use crate::{
     debug_overlay::{DebugOverlay, MenuLayout, OverlayVertex},
     game::{
         actor::{ActorRoster, PLAYER_EYE_HEIGHT},
+        block_style::{BlockStyleBook, DEFAULT_BLOCK_STYLE_PATH, TextureFace},
         hud::HudFormatter,
         interact::{
-            RaycastHit, SubTarget, direction_to_screen, face_plane_points, find_sub_block_at_point,
-            push_screen_line, raycast_world_detailed, sub_block_face_outline_points,
-            sub_slot_overlaps_existing, sub_target_from_world_point, voxel_coords, world_to_screen,
+            FaceNormal, RaycastHit, SubTarget, direction_to_screen, face_plane_points,
+            find_sub_block_at_point, push_screen_line, raycast_world_detailed,
+            sub_block_face_outline_points, sub_slot_overlaps_existing, sub_target_from_world_point,
+            voxel_coords, world_to_screen,
         },
         inventory::{BACKPACK_COLS, BACKPACK_ROWS, BACKPACK_SIZE, HOTBAR_SIZE, Inventory},
         physics::{self, MovementInput, PhysicsConfig},
         terrain_params::TerrainParamRegistry,
         terrain_recipe::TerrainRecipe,
         world::{
-            Block, CHUNK_SIZE, DEFAULT_WORLD_SEED, TerrainConfig, WORLD_MAX_Y, WORLD_MIN_Y,
-            WORLD_OVERWORLD_FLOOR, World,
+            Block, CHUNK_SIZE, DEFAULT_WORLD_SEED, SubBlockPos, TerrainConfig, WORLD_MAX_Y,
+            WORLD_MIN_Y, WORLD_OVERWORLD_FLOOR, World,
         },
     },
     mesh::Vertex,
@@ -57,13 +59,14 @@ const MIN_RENDER_DISTANCE_CHUNKS: u32 = 2;
 const MAX_RENDER_DISTANCE_CHUNKS: u32 = 128;
 const MIN_LDO_START_DISTANCE_CHUNKS: u32 = 6;
 const MAX_LDO_START_DISTANCE_CHUNKS: u32 = 48;
-const LOW_PRESET_RENDER_DISTANCE_CHUNKS: u32 = 12;
-const MIN_CHUNK_UPLOADS_PER_FRAME: usize = 8;
-const MIN_CHUNK_REQUESTS_IN_FLIGHT: usize = 192;
+const LOW_PRESET_RENDER_DISTANCE_CHUNKS: u32 = 10;
+const MIN_CHUNK_UPLOADS_PER_FRAME: usize = 4;
+const MIN_CHUNK_REQUESTS_IN_FLIGHT: usize = 96;
 const FULL_DETAIL_RADIUS_CHUNKS: i64 = 16;
 const MID_DETAIL_RADIUS_CHUNKS: i64 = 32;
 const LOW_DETAIL_RADIUS_CHUNKS: i64 = 64;
 const DEFAULT_TERRAIN_RECIPE_PATH: &str = "terrain/default.terrain";
+const TEXTURE_LAB_ROW_COUNT: usize = 16;
 
 pub fn run() {
     let options = AppLaunchOptions::from_env();
@@ -80,12 +83,22 @@ pub fn run_terrain_lab() {
     event_loop.run_app(&mut app).expect("event loop error");
 }
 
+pub fn run_texture_lab() {
+    let mut options = AppLaunchOptions::from_env();
+    options.texture_lab = true;
+    let event_loop = EventLoop::new().expect("failed to create event loop");
+    let mut app = App::new(options);
+    event_loop.run_app(&mut app).expect("event loop error");
+}
+
 #[derive(Clone, Debug)]
 struct AppLaunchOptions {
     seed_override: Option<i64>,
     terrain_file: Option<PathBuf>,
     dev_mode: bool,
     terrain_lab: bool,
+    texture_lab: bool,
+    low_power: bool,
 }
 
 impl AppLaunchOptions {
@@ -93,7 +106,11 @@ impl AppLaunchOptions {
         let mut seed_override = None;
         let mut terrain_file = None;
         let mut dev_mode = false;
+        let mut low_power = low_power_mode_from_env().unwrap_or_else(default_low_power_hint);
         let mut terrain_lab = std::env::var("SUBDIVISM_TERRAIN_LAB")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let mut texture_lab = std::env::var("SUBDIVISM_TEXTURE_LAB")
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         let mut args = std::env::args().skip(1);
@@ -119,6 +136,15 @@ impl AppLaunchOptions {
                 "--terrain-lab" => {
                     terrain_lab = true;
                 }
+                "--texture-lab" => {
+                    texture_lab = true;
+                }
+                "--low-power" => {
+                    low_power = true;
+                }
+                "--high-power" => {
+                    low_power = false;
+                }
                 _ => {}
             }
         }
@@ -133,6 +159,8 @@ impl AppLaunchOptions {
             terrain_file,
             dev_mode,
             terrain_lab,
+            texture_lab,
+            low_power,
         }
     }
 }
@@ -298,8 +326,18 @@ fn desired_chunk_worker_count() -> usize {
     let available = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2);
+    let low_power_mode = low_power_mode_from_env()
+        .unwrap_or_else(|| default_low_power_hint_with_available(available));
 
-    if available <= 2 {
+    if low_power_mode {
+        if available <= 2 {
+            available.max(1)
+        } else if available <= 4 {
+            2
+        } else {
+            available.saturating_sub(3).clamp(2, 4)
+        }
+    } else if available <= 2 {
         available.max(1)
     } else {
         available.saturating_sub(1).clamp(2, 8)
@@ -311,6 +349,31 @@ fn chunk_worker_override_from_env() -> Option<usize> {
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
         .map(|parsed| parsed.clamp(1, 12))
+}
+
+fn low_power_mode_from_env() -> Option<bool> {
+    std::env::var("SUBDIVISM_LOW_POWER")
+        .ok()
+        .and_then(|raw| parse_env_bool(&raw))
+}
+
+fn default_low_power_hint() -> bool {
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    default_low_power_hint_with_available(available)
+}
+
+fn default_low_power_hint_with_available(available: usize) -> bool {
+    cfg!(target_os = "macos") && available <= 10
+}
+
+fn parse_env_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 struct App {
@@ -327,6 +390,7 @@ struct App {
     session: WorldSessionState,
     runtime: RuntimeState,
     graphics_settings: GraphicsSettings,
+    low_power_mode: bool,
     diagnostics: DiagnosticsState,
     build_mode: BuildModeState,
 }
@@ -351,11 +415,23 @@ impl App {
             }
         }
 
-        let world = World::generate_with_terrain_and_seed(terrain, world_seed);
+        let mut world = World::generate_with_terrain_and_seed(terrain, world_seed);
+        let style_path = BlockStyleBook::default_path();
+        match BlockStyleBook::load_or_default(&style_path) {
+            Ok(styles) => {
+                world.set_block_style_book(styles);
+            }
+            Err(err) => {
+                eprintln!(
+                    "failed to load block style book {}: {err}",
+                    style_path.display()
+                );
+            }
+        }
         let lens = CameraLens::default();
         let actors = ActorRoster::new(world.spawn_point());
         let free_camera = actors.local_player().camera(lens);
-        let camera_mode = if options.terrain_lab {
+        let camera_mode = if options.terrain_lab || options.texture_lab {
             CameraMode::Free
         } else {
             CameraMode::Player
@@ -368,7 +444,7 @@ impl App {
         let chunk_worker_count = desired_chunk_worker_count();
         let chunk_worker_env_override = chunk_worker_override_from_env();
         let mut debug_overlay = DebugOverlay::new();
-        if options.terrain_lab {
+        if options.terrain_lab || options.texture_lab {
             debug_overlay.visible = true;
         }
         let session = WorldSessionState::new(
@@ -377,12 +453,13 @@ impl App {
             terrain_recipe_path,
             options.dev_mode,
             options.terrain_lab,
+            options.texture_lab,
         );
         let runtime = RuntimeState::new(seed);
         let diagnostics =
             DiagnosticsState::new(debug_overlay, chunk_worker_count, chunk_worker_env_override);
 
-        Self {
+        let mut app = Self {
             platform: PlatformRuntimeState::new(),
             world,
             actors,
@@ -399,9 +476,14 @@ impl App {
             session,
             runtime,
             graphics_settings: GraphicsSettings::default(),
+            low_power_mode: options.low_power,
             diagnostics,
             build_mode: BuildModeState::new(),
+        };
+        if app.low_power_mode {
+            app.apply_low_graphics_preset();
         }
+        app
     }
 
     fn active_camera(&self) -> Camera {
@@ -509,7 +591,8 @@ impl App {
     }
 
     fn rebuild_world_from_terrain(&mut self, terrain: TerrainConfig, preserve_view: bool) {
-        let world = World::generate_with_terrain_and_seed(terrain, self.session.world_seed);
+        let mut world = World::generate_with_terrain_and_seed(terrain, self.session.world_seed);
+        world.set_block_style_book(self.world.block_style_book().clone());
         let profile = if self.session.terrain_lab.enabled {
             "terrain_lab".to_string()
         } else {
@@ -546,7 +629,8 @@ impl App {
             }
         }
 
-        let world = World::generate_with_terrain_and_seed(terrain, seed);
+        let mut world = World::generate_with_terrain_and_seed(terrain, seed);
+        world.set_block_style_book(self.world.block_style_book().clone());
         self.replace_world(world, seed, profile, recipe_path);
     }
 
@@ -564,15 +648,27 @@ impl App {
     fn refresh_window_title(&self) {
         if let Some(window) = &self.platform.window {
             let dev_flag = if self.session.dev_mode { " DEV" } else { "" };
-            let lab_flag = if self.session.terrain_lab.enabled { " LAB" } else { "" };
+            let lab_flag = if self.session.terrain_lab.enabled {
+                " LAB"
+            } else {
+                ""
+            };
+            let texture_lab_flag = if self.session.texture_lab.enabled {
+                " TLAB"
+            } else {
+                ""
+            };
+            let power_flag = if self.low_power_mode { " LP" } else { "" };
             window.set_title(&format!(
-                "Voxel Starter [{} | {} | RD {} | SEED {}{}{}]",
+                "Voxel Starter [{} | {} | RD {} | SEED {}{}{}{}{}]",
                 self.frame_cap_label(),
                 self.camera.mode.label(),
                 self.chunk_stream.render_distance_chunks,
                 self.session.world_seed,
                 dev_flag,
-                lab_flag
+                lab_flag,
+                texture_lab_flag,
+                power_flag
             ));
         }
     }
@@ -698,7 +794,8 @@ impl App {
             self.camera.free_camera.position - Vec3::Y * PLAYER_EYE_HEIGHT,
             self.physics.respawn_margin,
         ) {
-            self.camera.free_camera.position = self.world.spawn_point() + Vec3::Y * PLAYER_EYE_HEIGHT;
+            self.camera.free_camera.position =
+                self.world.spawn_point() + Vec3::Y * PLAYER_EYE_HEIGHT;
         }
     }
 
@@ -725,26 +822,55 @@ impl App {
         (full, mid, low)
     }
 
+    fn chunk_stream_pressure_scale(&self) -> f32 {
+        let fps = self.diagnostics.debug_overlay.current_fps();
+        let mut scale: f32 = if fps <= 0.0 {
+            1.0
+        } else if fps < 45.0 {
+            0.40
+        } else if fps < 60.0 {
+            0.58
+        } else if fps < 90.0 {
+            0.78
+        } else {
+            1.0
+        };
+        if self.low_power_mode {
+            scale *= 0.76;
+        }
+        scale.clamp(0.25, 1.0)
+    }
+
     fn max_chunk_requests_in_flight(&self) -> usize {
         let rd = self.chunk_stream.render_distance_chunks as usize;
-        let target = 128 + rd.saturating_mul(10);
+        let target = 96 + rd.saturating_mul(8);
         let boosted = if self.session.terrain_lab.enabled {
             target.saturating_mul(2)
         } else {
             target
         };
-        boosted.clamp(MIN_CHUNK_REQUESTS_IN_FLIGHT, 2048)
+        let scaled = (boosted as f32 * self.chunk_stream_pressure_scale()).round() as usize;
+        let floor = if self.low_power_mode {
+            MIN_CHUNK_REQUESTS_IN_FLIGHT / 2
+        } else {
+            MIN_CHUNK_REQUESTS_IN_FLIGHT
+        };
+        let cap = if self.low_power_mode { 384 } else { 1024 };
+        scaled.clamp(floor.max(24), cap)
     }
 
     fn max_chunk_uploads_per_frame(&self) -> usize {
         let rd = self.chunk_stream.render_distance_chunks as usize;
         let base = if self.session.terrain_lab.enabled {
-            20
+            10
         } else {
             MIN_CHUNK_UPLOADS_PER_FRAME
         };
-        let scaled = base + rd / 8;
-        scaled.clamp(base, 64)
+        let rd_divisor = if self.low_power_mode { 16 } else { 10 };
+        let target = base + rd / rd_divisor.max(1);
+        let scaled = (target as f32 * self.chunk_stream_pressure_scale()).round() as usize;
+        let cap = if self.low_power_mode { 14 } else { 40 };
+        scaled.clamp(2, cap)
     }
 
     fn has_pending_visible_chunk_work(&self) -> bool {
@@ -762,48 +888,52 @@ impl App {
         })
     }
 
+    fn prune_non_visible_chunks(&mut self, desired_visible: &HashSet<ChunkRenderKey>) {
+        let stale_resident: Vec<_> = self
+            .chunk_stream
+            .resident_chunks
+            .iter()
+            .copied()
+            .filter(|key| !desired_visible.contains(key))
+            .collect();
+        if let Some(gpu) = self.platform.gpu.as_mut() {
+            for key in &stale_resident {
+                gpu.remove_chunk_mesh(*key);
+            }
+        }
+        for key in stale_resident {
+            self.chunk_stream.resident_chunks.remove(&key);
+            self.chunk_stream.requested_chunks.remove(&key);
+            self.chunk_stream.dirty_chunks.remove(&key);
+            self.chunk_stream.chunk_versions.remove(&key);
+        }
+
+        self.chunk_stream
+            .requested_chunks
+            .retain(|key| desired_visible.contains(key));
+        self.chunk_stream
+            .dirty_chunks
+            .retain(|key| desired_visible.contains(key));
+        self.chunk_stream
+            .chunk_versions
+            .retain(|key, _| desired_visible.contains(key));
+    }
+
     fn schedule_visible_chunks(&mut self) {
         let center = self.current_chunk_center();
         let render_distance = (self.chunk_stream.render_distance_chunks as i64)
             .clamp(1, MAX_RENDER_DISTANCE_CHUNKS as i64);
         let (full_detail_radius, mid_detail_radius, low_detail_radius) = self.lod_ring_limits();
-        let mut desired = Vec::new();
-        collect_lod_ring(
-            &mut desired,
+        let desired = collect_visible_chunk_keys(
             center,
-            0,
-            render_distance.min(full_detail_radius),
-            0,
+            render_distance,
+            full_detail_radius,
+            mid_detail_radius,
+            low_detail_radius,
         );
-        if render_distance > full_detail_radius {
-            collect_lod_ring(
-                &mut desired,
-                center,
-                full_detail_radius,
-                render_distance.min(mid_detail_radius),
-                1,
-            );
-        }
-        if render_distance > mid_detail_radius {
-            collect_lod_ring(
-                &mut desired,
-                center,
-                mid_detail_radius,
-                render_distance.min(low_detail_radius),
-                2,
-            );
-        }
-        if render_distance > low_detail_radius {
-            collect_lod_ring(&mut desired, center, low_detail_radius, render_distance, 3);
-        }
-
-        desired.sort_by_key(|key| {
-            let dx = key.origin_chunk.0 - center.0;
-            let dz = key.origin_chunk.1 - center.1;
-            (dx * dx + dz * dz, key.lod_level)
-        });
         let desired_set: HashSet<ChunkRenderKey> = desired.iter().copied().collect();
 
+        self.prune_non_visible_chunks(&desired_set);
         self.chunk_stream.visible_chunks = desired_set;
         self.chunk_stream.last_chunk_center = center;
         let max_in_flight = self.max_chunk_requests_in_flight();
@@ -832,6 +962,9 @@ impl App {
             };
 
             self.chunk_stream.requested_chunks.remove(&result.key);
+            if !self.chunk_stream.visible_chunks.contains(&result.key) {
+                continue;
+            }
             let newest_version = self
                 .chunk_stream
                 .chunk_versions
@@ -840,9 +973,6 @@ impl App {
                 .unwrap_or(0);
             if result.version != newest_version {
                 self.ensure_chunk_requested(result.key);
-                continue;
-            }
-            if !self.chunk_stream.visible_chunks.contains(&result.key) {
                 continue;
             }
 
@@ -856,6 +986,9 @@ impl App {
     }
 
     fn ensure_chunk_requested(&mut self, key: ChunkRenderKey) {
+        if !self.chunk_stream.visible_chunks.contains(&key) {
+            return;
+        }
         if self.chunk_stream.requested_chunks.contains(&key) {
             return;
         }
@@ -911,6 +1044,22 @@ impl App {
                 lod_level,
             });
         }
+    }
+
+    fn rebuild_visible_meshes_from_world_state(&mut self) {
+        let mut existing_keys = self.chunk_stream.visible_chunks.clone();
+        existing_keys.extend(self.chunk_stream.resident_chunks.iter().copied());
+        if let Some(gpu) = self.platform.gpu.as_mut() {
+            for key in existing_keys {
+                gpu.remove_chunk_mesh(key);
+            }
+        }
+        self.chunk_stream.pipeline = ChunkBuildPipeline::new(self.world.clone());
+        self.chunk_stream.resident_chunks.clear();
+        self.chunk_stream.requested_chunks.clear();
+        self.chunk_stream.dirty_chunks.clear();
+        self.chunk_stream.chunk_versions.clear();
+        self.schedule_visible_chunks();
     }
 
     fn respawn_player_random_near_center(&mut self) {
@@ -1103,6 +1252,7 @@ impl App {
                 }
                 17 => {
                     self.graphics_settings = GraphicsSettings::default();
+                    self.low_power_mode = false;
                 }
                 18 => {
                     self.menu.page = MenuPage::Settings;
@@ -1144,6 +1294,7 @@ impl App {
 
     fn apply_low_graphics_preset(&mut self) {
         self.graphics_settings = GraphicsSettings::low_preset();
+        self.low_power_mode = true;
         self.chunk_stream.render_distance_chunks = LOW_PRESET_RENDER_DISTANCE_CHUNKS
             .clamp(MIN_RENDER_DISTANCE_CHUNKS, MAX_RENDER_DISTANCE_CHUNKS);
         self.update_far_plane_for_render_distance();
@@ -1257,7 +1408,7 @@ impl App {
                         "VIBRANCE {}",
                         slider_f32(self.graphics_settings.color_vibrance, 0.5, 1.8, 14)
                     ),
-                    "APPLY LOW PRESET (RD 12)".to_string(),
+                    "APPLY LOW PRESET (RD 10)".to_string(),
                     "RESET TO DEFAULTS".to_string(),
                     "BACK".to_string(),
                 ],
@@ -1521,7 +1672,8 @@ impl App {
         }
         match code {
             KeyCode::ArrowUp if !repeat => {
-                self.session.terrain_lab.selected_index = self.session.terrain_lab.selected_index.saturating_sub(1);
+                self.session.terrain_lab.selected_index =
+                    self.session.terrain_lab.selected_index.saturating_sub(1);
                 true
             }
             KeyCode::ArrowDown if !repeat => {
@@ -1557,6 +1709,285 @@ impl App {
         }
     }
 
+    fn texture_lab_overlay(&self) -> Option<(String, Vec<String>, usize)> {
+        if !self.session.texture_lab.enabled || !self.session.texture_lab.panel_visible {
+            return None;
+        }
+        let selected_row = self
+            .session
+            .texture_lab
+            .selected_row
+            .min(TEXTURE_LAB_ROW_COUNT.saturating_sub(1));
+        let selected_block = self.session.texture_lab.selected_block;
+        let selected_face = self.session.texture_lab.selected_face;
+        let selected_brush = self.session.texture_lab.selected_brush;
+        let style = self.world.block_style_book().style(selected_block);
+        let props = selected_block.properties();
+        let mut lines = Vec::with_capacity(TEXTURE_LAB_ROW_COUNT + 3);
+        lines.push("F10 PANEL F11 SAVE ENTER APPLY BRUSH".to_string());
+        lines.push("WHEEL/UPDOWN SELECT LEFTRIGHT ADJUST".to_string());
+        lines.push("SHIFT FINE CTRL ULTRA-FINE B TO HOTBAR".to_string());
+        lines.push(format!("BLOCK {}", selected_block.label()));
+        lines.push(format!("FACE {}", selected_face.label()));
+        lines.push(format!("BRUSH {}", selected_brush.label()));
+        lines.push(format!(
+            "BRUSH STRENGTH {:.3}",
+            self.session.texture_lab.brush_strength
+        ));
+        lines.push("APPLY BRUSH (ENTER/SPACE)".to_string());
+        lines.push(format!(
+            "BIOME TINT {}",
+            slider_f32(style.biome_tint_strength, 0.0, 1.25, 12)
+        ));
+        lines.push(format!(
+            "GRAIN {}",
+            slider_f32(style.grain_strength, 0.0, 1.0, 12)
+        ));
+        lines.push(format!("TOP R {}", slider_f32(style.top[0], 0.0, 1.0, 12)));
+        lines.push(format!("TOP G {}", slider_f32(style.top[1], 0.0, 1.0, 12)));
+        lines.push(format!("TOP B {}", slider_f32(style.top[2], 0.0, 1.0, 12)));
+        lines.push(format!(
+            "SIDE R {}",
+            slider_f32(style.side[0], 0.0, 1.0, 12)
+        ));
+        lines.push(format!(
+            "SIDE G {}",
+            slider_f32(style.side[1], 0.0, 1.0, 12)
+        ));
+        lines.push(format!(
+            "SIDE B {}",
+            slider_f32(style.side[2], 0.0, 1.0, 12)
+        ));
+        lines.push(format!(
+            "BOTTOM R {}",
+            slider_f32(style.bottom[0], 0.0, 1.0, 12)
+        ));
+        lines.push(format!(
+            "BOTTOM G {}",
+            slider_f32(style.bottom[1], 0.0, 1.0, 12)
+        ));
+        lines.push(format!(
+            "BOTTOM B {}",
+            slider_f32(style.bottom[2], 0.0, 1.0, 12)
+        ));
+        lines.push(format!(
+            "PROPS {} {} F{:.2} H{:.2} L{}",
+            props.action_state.label(),
+            if props.solid { "SOLID" } else { "GHOST" },
+            props.friction,
+            props.hardness,
+            props.light_emission
+        ));
+        Some(("TEXTURE LAB".to_string(), lines, selected_row + 3))
+    }
+
+    fn texture_lab_step(&self) -> f32 {
+        let ctrl_held =
+            self.input.key(KeyCode::ControlLeft) || self.input.key(KeyCode::ControlRight);
+        let shift_held = self.input.key(KeyCode::ShiftLeft) || self.input.key(KeyCode::ShiftRight);
+        if ctrl_held {
+            0.0025
+        } else if shift_held {
+            0.01
+        } else {
+            0.025
+        }
+    }
+
+    fn texture_lab_apply_style_book(&mut self, styles: BlockStyleBook) {
+        self.world.set_block_style_book(styles);
+        self.rebuild_visible_meshes_from_world_state();
+    }
+
+    fn texture_lab_apply_brush(&mut self) {
+        let mut styles = self.world.block_style_book().clone();
+        let seed = self
+            .runtime
+            .rng_state
+            .wrapping_add(self.runtime.world_time_seconds.to_bits() as u64);
+        styles.apply_brush(
+            self.session.texture_lab.selected_block,
+            self.session.texture_lab.selected_face,
+            self.session.texture_lab.selected_brush,
+            self.session.texture_lab.brush_strength,
+            seed,
+        );
+        self.runtime.rng_state ^= self.runtime.rng_state << 13;
+        self.runtime.rng_state ^= self.runtime.rng_state >> 7;
+        self.runtime.rng_state ^= self.runtime.rng_state << 17;
+        self.texture_lab_apply_style_book(styles);
+    }
+
+    fn texture_lab_adjust_selected(&mut self, delta: f32) {
+        if !self.session.texture_lab.enabled {
+            return;
+        }
+        let row = self
+            .session
+            .texture_lab
+            .selected_row
+            .min(TEXTURE_LAB_ROW_COUNT.saturating_sub(1));
+        let dir = if delta > 0.0 {
+            1
+        } else if delta < 0.0 {
+            -1
+        } else {
+            0
+        };
+        if dir == 0 {
+            return;
+        }
+        match row {
+            0 => {
+                let all = Block::all();
+                let current_index = all
+                    .iter()
+                    .position(|block| *block == self.session.texture_lab.selected_block)
+                    .unwrap_or(0) as i32;
+                let next = (current_index + dir).rem_euclid(all.len() as i32) as usize;
+                self.session.texture_lab.selected_block = all[next];
+            }
+            1 => {
+                self.session.texture_lab.selected_face =
+                    self.session.texture_lab.selected_face.cycle(dir);
+            }
+            2 => {
+                self.session.texture_lab.selected_brush =
+                    self.session.texture_lab.selected_brush.cycle(dir);
+            }
+            3 => {
+                let step = self.texture_lab_step();
+                self.session.texture_lab.brush_strength =
+                    (self.session.texture_lab.brush_strength + step * dir as f32).clamp(0.005, 0.5);
+            }
+            4 => {}
+            5 => {
+                let step = self.texture_lab_step();
+                let mut styles = self.world.block_style_book().clone();
+                styles.adjust_biome_tint_strength(
+                    self.session.texture_lab.selected_block,
+                    step * dir as f32,
+                );
+                self.texture_lab_apply_style_book(styles);
+            }
+            6 => {
+                let step = self.texture_lab_step();
+                let mut styles = self.world.block_style_book().clone();
+                styles.adjust_grain_strength(
+                    self.session.texture_lab.selected_block,
+                    step * dir as f32,
+                );
+                self.texture_lab_apply_style_book(styles);
+            }
+            7..=15 => {
+                let step = self.texture_lab_step();
+                let mut styles = self.world.block_style_book().clone();
+                let (face, channel) = if row <= 9 {
+                    (TextureFace::Top, row - 7)
+                } else if row <= 12 {
+                    (TextureFace::Side, row - 10)
+                } else {
+                    (TextureFace::Bottom, row - 13)
+                };
+                styles.adjust_face_channel(
+                    self.session.texture_lab.selected_block,
+                    face,
+                    channel,
+                    step * dir as f32,
+                );
+                self.texture_lab_apply_style_book(styles);
+            }
+            _ => {}
+        }
+    }
+
+    fn texture_lab_save_preset(&mut self) {
+        if !self.session.texture_lab.enabled {
+            return;
+        }
+        let path = PathBuf::from(DEFAULT_BLOCK_STYLE_PATH);
+        match self.world.block_style_book().write_to_file(&path) {
+            Ok(_) => eprintln!("texture lab style book saved to {}", path.display()),
+            Err(err) => eprintln!("failed to save texture lab style book: {err}"),
+        }
+    }
+
+    fn texture_lab_apply_selected_block_to_hotbar(&mut self) {
+        self.inventory
+            .set_selected_hotbar_block(self.session.texture_lab.selected_block, 64);
+    }
+
+    fn handle_texture_lab_input(&mut self, code: KeyCode, repeat: bool) -> bool {
+        if !self.session.texture_lab.enabled {
+            return false;
+        }
+        if code == KeyCode::F10 && !repeat {
+            self.session.texture_lab.panel_visible = !self.session.texture_lab.panel_visible;
+            return true;
+        }
+        if code == KeyCode::F11 && !repeat {
+            self.texture_lab_save_preset();
+            return true;
+        }
+        if !self.session.texture_lab.panel_visible {
+            return false;
+        }
+        match code {
+            KeyCode::ArrowUp if !repeat => {
+                self.session.texture_lab.selected_row =
+                    self.session.texture_lab.selected_row.saturating_sub(1);
+                true
+            }
+            KeyCode::ArrowDown if !repeat => {
+                self.session.texture_lab.selected_row =
+                    (self.session.texture_lab.selected_row + 1).min(TEXTURE_LAB_ROW_COUNT - 1);
+                true
+            }
+            KeyCode::ArrowLeft => {
+                self.texture_lab_adjust_selected(-1.0);
+                true
+            }
+            KeyCode::ArrowRight => {
+                self.texture_lab_adjust_selected(1.0);
+                true
+            }
+            KeyCode::PageDown => {
+                self.texture_lab_adjust_selected(-4.0);
+                true
+            }
+            KeyCode::PageUp => {
+                self.texture_lab_adjust_selected(4.0);
+                true
+            }
+            KeyCode::Enter | KeyCode::Space if !repeat => {
+                self.texture_lab_apply_brush();
+                true
+            }
+            KeyCode::KeyB if !repeat => {
+                self.texture_lab_apply_selected_block_to_hotbar();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_texture_lab_wheel(&mut self, delta_y: f32) -> bool {
+        if !self.session.texture_lab.enabled
+            || !self.session.texture_lab.panel_visible
+            || self.menu.ui_mode != UiMode::Playing
+            || delta_y.abs() <= f32::EPSILON
+        {
+            return false;
+        }
+        let direction = if delta_y > 0.0 { -1 } else { 1 };
+        self.session.texture_lab.selected_row = if direction < 0 {
+            self.session.texture_lab.selected_row.saturating_sub(1)
+        } else {
+            (self.session.texture_lab.selected_row + 1).min(TEXTURE_LAB_ROW_COUNT - 1)
+        };
+        true
+    }
+
     fn current_menu_layout(&self) -> Option<MenuLayout> {
         if self.menu.ui_mode != UiMode::Paused {
             return None;
@@ -1565,7 +1996,11 @@ impl App {
         let size = window.inner_size();
         let screen_size = [size.width as f32, size.height as f32];
         let (title, lines, _) = self.menu_overlay();
-        Some(self.diagnostics.debug_overlay.menu_layout(&title, &lines, screen_size))
+        Some(
+            self.diagnostics
+                .debug_overlay
+                .menu_layout(&title, &lines, screen_size),
+        )
     }
 
     fn update_menu_hover_from_cursor(&mut self) {
@@ -1638,6 +2073,7 @@ impl App {
         );
         let (cx, cz) = World::world_to_chunk(wx, wz);
         let slot = self.inventory.selected_slot();
+        let slot_props = slot.block.properties();
         let hotbar = self.inventory.hotbar();
         let mut lines = vec![
             format!("SUN {:.1}", self.runtime.world_time_seconds),
@@ -1653,6 +2089,14 @@ impl App {
                 self.inventory.selected_hotbar_index() + 1,
                 HudFormatter::block_label(slot.block),
                 slot.count
+            ),
+            format!(
+                "BLK {} {} F{:.2} H{:.2} L{}",
+                slot_props.action_state.label(),
+                if slot_props.solid { "SOLID" } else { "GHOST" },
+                slot_props.friction,
+                slot_props.hardness,
+                slot_props.light_emission
             ),
             format!(
                 "HOTBAR {} {} {} {}",
@@ -1677,8 +2121,19 @@ impl App {
                     "CHUNK WORKERS {} (ENV {})",
                     self.diagnostics.chunk_worker_count, override_count
                 ),
-                None => format!("CHUNK WORKERS {} (AUTO)", self.diagnostics.chunk_worker_count),
+                None => format!(
+                    "CHUNK WORKERS {} (AUTO)",
+                    self.diagnostics.chunk_worker_count
+                ),
             },
+            format!(
+                "POWER PROFILE {}",
+                if self.low_power_mode {
+                    "LOW"
+                } else {
+                    "STANDARD"
+                }
+            ),
         ];
         if self.session.dev_mode {
             lines.push(format!(
@@ -1707,8 +2162,12 @@ impl App {
         }
         let camera = self.active_camera();
         let celestial = celestial_state_for_time(self.runtime.world_time_seconds);
+        let check_occlusion = !self.low_power_mode && self.graphics_settings.shader_quality > 0.25;
         let sky_body_occluded = |direction: Vec3| -> bool {
-            raycast_world_detailed(&self.world, camera.position, direction, 4096.0, 0.75, None)
+            if !check_occlusion {
+                return false;
+            }
+            raycast_world_detailed(&self.world, camera.position, direction, 1024.0, 0.75, None)
                 .is_some()
         };
 
@@ -2046,57 +2505,35 @@ impl App {
             return false;
         }
 
-        let target =
-            if let Some((hit_sub, _)) = find_sub_block_at_point(&self.world, hit.cell, hit.point) {
-                let mut base = (hit_sub.x, hit_sub.y, hit_sub.z);
-                let mut sx = hit_sub.sx as i32 + hit.normal.x;
-                let mut sy = hit_sub.sy as i32 + hit.normal.y;
-                let mut sz = hit_sub.sz as i32 + hit.normal.z;
-                let d = divisions as i32;
-
-                if sx < 0 {
-                    base.0 -= 1;
-                    sx = d - 1;
-                } else if sx >= d {
-                    base.0 += 1;
-                    sx = 0;
-                }
-                if sy < 0 {
-                    base.1 -= 1;
-                    sy = d - 1;
-                } else if sy >= d {
-                    base.1 += 1;
-                    sy = 0;
-                }
-                if sz < 0 {
-                    base.2 -= 1;
-                    sz = d - 1;
-                } else if sz >= d {
-                    base.2 += 1;
-                    sz = 0;
-                }
-
-                if base.1 < WORLD_MIN_Y || base.1 > WORLD_MAX_Y {
-                    return false;
-                }
-
-                SubTarget {
-                    base,
-                    sx: sx as u8,
-                    sy: sy as u8,
-                    sz: sz as u8,
-                }
-            } else {
-                let place_point = if hit.previous != hit.cell {
-                    // Crossing into a solid base block: place into the air cell we came from.
-                    hit.previous_point
-                } else {
-                    // Sub-cell hit inside same base cell: step outward along hit normal.
-                    hit.point + hit.normal.as_vec3() * 0.0035
-                };
-                let target_base = voxel_coords(place_point);
-                sub_target_from_world_point(target_base, place_point, divisions)
+        let target = if let Some((hit_sub, _)) =
+            find_sub_block_at_point(&self.world, hit.cell, hit.point)
+        {
+            let place_point = sub_place_point_from_hit_sub(hit, hit_sub);
+            let target_base = voxel_coords(place_point);
+            if target_base.1 < WORLD_MIN_Y || target_base.1 > WORLD_MAX_Y {
+                return false;
+            }
+            let initial_target = sub_target_from_world_point(target_base, place_point, divisions);
+            let Some(adjusted_target) = resolve_sub_target_overlap_along_normal(
+                &self.world,
+                initial_target,
+                hit.normal,
+                divisions,
+            ) else {
+                return false;
             };
+            adjusted_target
+        } else {
+            let place_point = if hit.previous != hit.cell {
+                // Crossing into a solid base block: place into the air cell we came from.
+                hit.previous_point
+            } else {
+                // Sub-cell hit inside same base cell: step outward along hit normal.
+                hit.point + hit.normal.as_vec3() * 0.0035
+            };
+            let target_base = voxel_coords(place_point);
+            sub_target_from_world_point(target_base, place_point, divisions)
+        };
         if self
             .world
             .block_at_i64(target.base.0, target.base.1, target.base.2)
@@ -2246,6 +2683,21 @@ impl ApplicationHandler for App {
                 } else {
                     None
                 };
+                let texture_lab_overlay = if self.menu.ui_mode == UiMode::Playing {
+                    if let Some((title, lines, selected)) = self.texture_lab_overlay() {
+                        Some(self.diagnostics.debug_overlay.build_menu_vertices(
+                            &title,
+                            &lines,
+                            selected,
+                            None,
+                            screen_size,
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 let gameplay_overlay = if self.menu.ui_mode == UiMode::Playing {
                     self.gameplay_overlay_vertices(screen_size)
                 } else {
@@ -2257,7 +2709,8 @@ impl ApplicationHandler for App {
                     let mut overlay_vertices = sky_overlay;
                     overlay_vertices.extend(gameplay_overlay);
                     overlay_vertices.extend(
-                        self.diagnostics.debug_overlay
+                        self.diagnostics
+                            .debug_overlay
                             .build_vertices(gpu.estimated_gpu_memory_bytes(), &hud_lines),
                     );
                     if let Some(menu_vertices) = menu_overlay {
@@ -2265,6 +2718,9 @@ impl ApplicationHandler for App {
                     }
                     if let Some(lab_vertices) = terrain_lab_overlay {
                         overlay_vertices.extend(lab_vertices);
+                    }
+                    if let Some(texture_vertices) = texture_lab_overlay {
+                        overlay_vertices.extend(texture_vertices);
                     }
                     match gpu.render(&overlay_vertices) {
                         RenderOutcome::Success | RenderOutcome::SkipFrame => {}
@@ -2294,9 +2750,13 @@ impl ApplicationHandler for App {
                             if self.handle_terrain_lab_input(code, event.repeat) {
                                 return;
                             }
+                            if self.handle_texture_lab_input(code, event.repeat) {
+                                return;
+                            }
 
                             if code == KeyCode::F3 && !event.repeat {
-                                self.diagnostics.debug_overlay.visible = !self.diagnostics.debug_overlay.visible;
+                                self.diagnostics.debug_overlay.visible =
+                                    !self.diagnostics.debug_overlay.visible;
                             }
                             if code == KeyCode::F4 && !event.repeat {
                                 self.cycle_frame_cap();
@@ -2335,6 +2795,9 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::PixelDelta(pos) => pos.y as f32 / 40.0,
                 };
                 if self.handle_terrain_lab_wheel(delta_y) {
+                    return;
+                }
+                if self.handle_texture_lab_wheel(delta_y) {
                     return;
                 }
                 if self.menu.ui_mode == UiMode::Playing
@@ -2424,7 +2887,8 @@ impl ApplicationHandler for App {
                 CameraMode::Free => {
                     self.camera.free_camera.yaw += delta.0 as f32 * LOOK_SENSITIVITY;
                     self.camera.free_camera.pitch -= delta.1 as f32 * LOOK_SENSITIVITY;
-                    self.camera.free_camera.pitch = self.camera.free_camera.pitch.clamp(-MAX_PITCH, MAX_PITCH);
+                    self.camera.free_camera.pitch =
+                        self.camera.free_camera.pitch.clamp(-MAX_PITCH, MAX_PITCH);
                 }
             }
             self.sync_active_camera();
@@ -2507,66 +2971,99 @@ fn aligned_origin(chunk: (i64, i64), step_chunks: i64) -> (i64, i64) {
     )
 }
 
-fn collect_lod_ring(
-    out: &mut Vec<ChunkRenderKey>,
+fn collect_visible_chunk_keys(
     center_chunk: (i64, i64),
-    min_radius: i64,
-    max_radius: i64,
-    lod_level: u8,
-) {
-    if max_radius <= 0 || max_radius <= min_radius {
-        return;
+    render_distance: i64,
+    full_detail_radius: i64,
+    mid_detail_radius: i64,
+    low_detail_radius: i64,
+) -> Vec<ChunkRenderKey> {
+    if render_distance <= 0 {
+        return Vec::new();
     }
-    let step = 1_i64 << lod_level;
-    let min_sq = (min_radius * min_radius) as f32;
-    let max_sq = (max_radius * max_radius) as f32;
-    let start_x = (center_chunk.0 - max_radius).div_euclid(step) * step;
-    let end_x = (center_chunk.0 + max_radius).div_euclid(step) * step;
-    let start_z = (center_chunk.1 - max_radius).div_euclid(step) * step;
-    let end_z = (center_chunk.1 + max_radius).div_euclid(step) * step;
+    let render_sq = (render_distance * render_distance) as f32;
+    let full_sq = (full_detail_radius.max(0) * full_detail_radius.max(0)) as f32;
+    let mid_sq = (mid_detail_radius.max(full_detail_radius)
+        * mid_detail_radius.max(full_detail_radius)) as f32;
+    let low_sq = (low_detail_radius.max(mid_detail_radius)
+        * low_detail_radius.max(mid_detail_radius)) as f32;
+    let mut desired = HashSet::new();
+
+    let min_x = center_chunk.0 - render_distance;
+    let max_x = center_chunk.0 + render_distance;
+    let min_z = center_chunk.1 - render_distance;
+    let max_z = center_chunk.1 + render_distance;
+
+    for z in min_z..=max_z {
+        for x in min_x..=max_x {
+            let dx = x as f32 - center_chunk.0 as f32;
+            let dz = z as f32 - center_chunk.1 as f32;
+            let dist_sq = dx * dx + dz * dz;
+            if dist_sq > render_sq {
+                continue;
+            }
+            let mut lod_level = if dist_sq <= full_sq {
+                0
+            } else if dist_sq <= mid_sq {
+                1
+            } else if dist_sq <= low_sq {
+                2
+            } else {
+                3
+            };
+            while lod_level > 0 {
+                let step_chunks = 1_i64 << lod_level;
+                let origin = aligned_origin((x, z), step_chunks);
+                let inner_sq = match lod_level {
+                    1 => full_sq,
+                    2 => mid_sq,
+                    _ => low_sq,
+                };
+                if chunk_tile_min_distance_sq(center_chunk, origin, step_chunks) <= inner_sq {
+                    lod_level -= 1;
+                } else {
+                    break;
+                }
+            }
+            let step_chunks = 1_i64 << lod_level;
+            let origin = aligned_origin((x, z), step_chunks);
+            desired.insert(ChunkRenderKey {
+                origin_chunk: origin,
+                lod_level,
+            });
+        }
+    }
+
+    let mut ordered: Vec<_> = desired.into_iter().collect();
+    ordered.sort_by_key(|key| {
+        let span = 1_i64 << key.lod_level;
+        let center_x2 = center_chunk.0 as i128 * 2;
+        let center_z2 = center_chunk.1 as i128 * 2;
+        let key_center_x2 = key.origin_chunk.0 as i128 * 2 + span as i128;
+        let key_center_z2 = key.origin_chunk.1 as i128 * 2 + span as i128;
+        let dx = key_center_x2 - center_x2;
+        let dz = key_center_z2 - center_z2;
+        (dx * dx + dz * dz, key.lod_level)
+    });
+    ordered
+}
+
+fn chunk_tile_min_distance_sq(
+    center_chunk: (i64, i64),
+    origin_chunk: (i64, i64),
+    span_chunks: i64,
+) -> f32 {
     let center_x = center_chunk.0 as f32;
     let center_z = center_chunk.1 as f32;
-    let step_f = step as f32;
-
-    let mut origin_z = start_z;
-    while origin_z <= end_z {
-        let mut origin_x = start_x;
-        while origin_x <= end_x {
-            let tile_min_x = origin_x as f32;
-            let tile_min_z = origin_z as f32;
-            let tile_max_x = tile_min_x + step_f;
-            let tile_max_z = tile_min_z + step_f;
-
-            let nearest_x = center_x.clamp(tile_min_x, tile_max_x);
-            let nearest_z = center_z.clamp(tile_min_z, tile_max_z);
-            let min_dx = nearest_x - center_x;
-            let min_dz = nearest_z - center_z;
-            let tile_min_dist_sq = min_dx * min_dx + min_dz * min_dz;
-
-            let farthest_x = if (center_x - tile_min_x).abs() > (center_x - tile_max_x).abs() {
-                tile_min_x
-            } else {
-                tile_max_x
-            };
-            let farthest_z = if (center_z - tile_min_z).abs() > (center_z - tile_max_z).abs() {
-                tile_min_z
-            } else {
-                tile_max_z
-            };
-            let max_dx = farthest_x - center_x;
-            let max_dz = farthest_z - center_z;
-            let tile_max_dist_sq = max_dx * max_dx + max_dz * max_dz;
-
-            if tile_min_dist_sq <= max_sq && (min_radius == 0 || tile_max_dist_sq > min_sq) {
-                out.push(ChunkRenderKey {
-                    origin_chunk: (origin_x, origin_z),
-                    lod_level,
-                });
-            }
-            origin_x += step;
-        }
-        origin_z += step;
-    }
+    let tile_min_x = origin_chunk.0 as f32;
+    let tile_min_z = origin_chunk.1 as f32;
+    let tile_max_x = tile_min_x + span_chunks as f32;
+    let tile_max_z = tile_min_z + span_chunks as f32;
+    let nearest_x = center_x.clamp(tile_min_x, tile_max_x);
+    let nearest_z = center_z.clamp(tile_min_z, tile_max_z);
+    let dx = nearest_x - center_x;
+    let dz = nearest_z - center_z;
+    dx * dx + dz * dz
 }
 
 fn slider_f32(value: f32, min: f32, max: f32, width: usize) -> String {
@@ -2611,6 +3108,135 @@ fn random_i32_inclusive(state: &mut u64, min: i32, max: i32) -> i32 {
 
     let span = (max - min + 1) as u32;
     min + (value as u32 % span) as i32
+}
+
+fn step_sub_target_along_normal(target: &mut SubTarget, normal: FaceNormal, divisions: u8) -> bool {
+    if divisions <= 1 {
+        return false;
+    }
+    if normal.x > 0 {
+        step_sub_target_axis_i64(&mut target.base.0, &mut target.sx, divisions, 1);
+        return true;
+    }
+    if normal.x < 0 {
+        step_sub_target_axis_i64(&mut target.base.0, &mut target.sx, divisions, -1);
+        return true;
+    }
+    if normal.y > 0 {
+        step_sub_target_axis_i32(&mut target.base.1, &mut target.sy, divisions, 1);
+        return true;
+    }
+    if normal.y < 0 {
+        step_sub_target_axis_i32(&mut target.base.1, &mut target.sy, divisions, -1);
+        return true;
+    }
+    if normal.z > 0 {
+        step_sub_target_axis_i64(&mut target.base.2, &mut target.sz, divisions, 1);
+        return true;
+    }
+    if normal.z < 0 {
+        step_sub_target_axis_i64(&mut target.base.2, &mut target.sz, divisions, -1);
+        return true;
+    }
+    false
+}
+
+fn step_sub_target_axis_i64(base: &mut i64, slot: &mut u8, divisions: u8, dir: i32) {
+    if dir > 0 {
+        if *slot + 1 < divisions {
+            *slot += 1;
+        } else {
+            *slot = 0;
+            *base += 1;
+        }
+    } else if *slot > 0 {
+        *slot -= 1;
+    } else {
+        *slot = divisions - 1;
+        *base -= 1;
+    }
+}
+
+fn step_sub_target_axis_i32(base: &mut i32, slot: &mut u8, divisions: u8, dir: i32) {
+    if dir > 0 {
+        if *slot + 1 < divisions {
+            *slot += 1;
+        } else {
+            *slot = 0;
+            *base += 1;
+        }
+    } else if *slot > 0 {
+        *slot -= 1;
+    } else {
+        *slot = divisions - 1;
+        *base -= 1;
+    }
+}
+
+fn resolve_sub_target_overlap_along_normal(
+    world: &World,
+    mut target: SubTarget,
+    normal: FaceNormal,
+    divisions: u8,
+) -> Option<SubTarget> {
+    let max_steps = divisions as usize * 2 + 2;
+    for _ in 0..=max_steps {
+        if target.base.1 < WORLD_MIN_Y || target.base.1 > WORLD_MAX_Y {
+            return None;
+        }
+        if world
+            .block_at_i64(target.base.0, target.base.1, target.base.2)
+            .is_solid()
+        {
+            return None;
+        }
+        if !sub_slot_overlaps_existing(
+            world,
+            target.base,
+            divisions,
+            target.sx,
+            target.sy,
+            target.sz,
+        ) {
+            return Some(target);
+        }
+        if !step_sub_target_along_normal(&mut target, normal, divisions) {
+            return None;
+        }
+    }
+    None
+}
+
+fn sub_block_bounds(pos: SubBlockPos) -> (Vec3, Vec3) {
+    let step = 1.0 / pos.divisions as f32;
+    let min = Vec3::new(
+        pos.x as f32 + pos.sx as f32 * step,
+        pos.y as f32 + pos.sy as f32 * step,
+        pos.z as f32 + pos.sz as f32 * step,
+    );
+    let max = min + Vec3::splat(step);
+    (min, max)
+}
+
+fn sub_place_point_from_hit_sub(hit: RaycastHit, hit_sub: SubBlockPos) -> Vec3 {
+    let (sub_min, sub_max) = sub_block_bounds(hit_sub);
+    let step = 1.0 / hit_sub.divisions as f32;
+    let eps = (step * 0.04).clamp(0.001, 0.02);
+    let mut place_point = hit.point;
+    if hit.normal.x > 0 {
+        place_point.x = sub_max.x + eps;
+    } else if hit.normal.x < 0 {
+        place_point.x = sub_min.x - eps;
+    } else if hit.normal.y > 0 {
+        place_point.y = sub_max.y + eps;
+    } else if hit.normal.y < 0 {
+        place_point.y = sub_min.y - eps;
+    } else if hit.normal.z > 0 {
+        place_point.z = sub_max.z + eps;
+    } else if hit.normal.z < 0 {
+        place_point.z = sub_min.z - eps;
+    }
+    place_point
 }
 
 const SKY_BLOCK_GRID: usize = 8;
@@ -2696,57 +3322,240 @@ mod tests {
         }
     }
 
+    #[test]
+    fn lod_selection_assigns_exactly_one_key_per_chunk() {
+        let center = (0_i64, 0_i64);
+        for render_distance in [8_i64, 16, 24, 32, 48, 64, 96, 128] {
+            let keys = collect_visible_keys_for_test(center, render_distance);
+            for z in (center.1 - render_distance)..=(center.1 + render_distance) {
+                for x in (center.0 - render_distance)..=(center.0 + render_distance) {
+                    let dx = x as f32 - center.0 as f32;
+                    let dz = z as f32 - center.1 as f32;
+                    if dx * dx + dz * dz > (render_distance * render_distance) as f32 {
+                        continue;
+                    }
+                    let cover_count = keys
+                        .iter()
+                        .filter(|key| chunk_covered_by_key((x, z), **key))
+                        .count();
+                    assert_eq!(
+                        cover_count, 1,
+                        "expected exactly one key for chunk ({x}, {z}) at render distance {render_distance}, found {cover_count}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sub_block_vertical_stacking_advances_beyond_two_placements() {
+        let mut world = World::generate_default();
+        let base_x = 0_i64;
+        let base_z = 0_i64;
+        let anchor_y = 32_i32;
+        for y in (anchor_y - 2)..=(anchor_y + 24) {
+            world.set_block_i64(base_x, y, base_z, Block::Air);
+        }
+        world.set_block_i64(base_x, anchor_y, base_z, Block::Stone);
+
+        let divisions = 6_u8;
+        let mut placed_count = 0_u32;
+        for step in 0..10 {
+            let hit = raycast_world_detailed(
+                &world,
+                Vec3::new(
+                    base_x as f32 + 0.5,
+                    anchor_y as f32 + 8.0,
+                    base_z as f32 + 0.5,
+                ),
+                -Vec3::Y,
+                16.0,
+                0.01,
+                Some(divisions),
+            )
+            .expect("expected raycast hit while stacking sub blocks");
+
+            let target =
+                sub_placement_target_from_hit_for_test(&world, hit, divisions).unwrap_or_else(
+                    |err| {
+                        panic!(
+                            "expected placement target at step {step}, hit cell={:?} prev={:?} point={:?} normal=({}, {}, {}): {err}",
+                            hit.cell,
+                            hit.previous,
+                            hit.point,
+                            hit.normal.x,
+                            hit.normal.y,
+                            hit.normal.z
+                        )
+                    },
+                );
+            assert!(
+                world.set_sub_block_i64(
+                    target.base.0,
+                    target.base.1,
+                    target.base.2,
+                    divisions,
+                    target.sx,
+                    target.sy,
+                    target.sz,
+                    Block::Stone,
+                ),
+                "failed to place sub block at {:?} {} {} {}",
+                target.base,
+                target.sx,
+                target.sy,
+                target.sz
+            );
+            placed_count += 1;
+        }
+
+        assert!(
+            placed_count >= 6,
+            "expected to place at least 6 stacked sub blocks, only placed {placed_count}"
+        );
+        let top_y = anchor_y + 1 + (placed_count as i32 - 1) / divisions as i32;
+        let top_sy = ((placed_count as i32 - 1) % divisions as i32) as u8;
+        assert!(
+            world
+                .sub_block_i64(base_x, top_y, base_z, divisions, 3, top_sy, 3)
+                .is_some(),
+            "expected top stacked sub block at y={top_y}, sy={top_sy}, sx=3, sz=3"
+        );
+    }
+
+    #[test]
+    fn mixed_3x3_and_6x6_sub_blocks_share_snap_grid() {
+        let mut world = World::generate_default();
+        let base_x = 0_i64;
+        let base_z = 0_i64;
+        let anchor_y = 40_i32;
+        for y in (anchor_y - 2)..=(anchor_y + 24) {
+            world.set_block_i64(base_x, y, base_z, Block::Air);
+        }
+        world.set_block_i64(base_x, anchor_y, base_z, Block::Stone);
+
+        let mut divisions = 3_u8;
+        for step in 0..10 {
+            let hit = raycast_world_detailed(
+                &world,
+                Vec3::new(
+                    base_x as f32 + 0.5,
+                    anchor_y as f32 + 8.0,
+                    base_z as f32 + 0.5,
+                ),
+                -Vec3::Y,
+                16.0,
+                0.01,
+                Some(6),
+            )
+            .expect("expected raycast hit while mixed-grid stacking");
+
+            let target = sub_placement_target_from_hit_for_test(&world, hit, divisions)
+                .expect("expected mixed-grid placement target");
+            assert!(
+                world.set_sub_block_i64(
+                    target.base.0,
+                    target.base.1,
+                    target.base.2,
+                    divisions,
+                    target.sx,
+                    target.sy,
+                    target.sz,
+                    Block::Stone,
+                ),
+                "failed mixed-grid place at step {step}"
+            );
+            divisions = if divisions == 3 { 6 } else { 3 };
+        }
+
+        // Ensure the topmost placed voxel exists and that we actually used both grids.
+        let placed_3 = world
+            .sub_blocks_in_cell(base_x, anchor_y + 1, base_z)
+            .iter()
+            .any(|(sub, _)| sub.divisions == 3);
+        let placed_6 = world
+            .sub_blocks_in_cell(base_x, anchor_y + 1, base_z)
+            .iter()
+            .any(|(sub, _)| sub.divisions == 6);
+        assert!(placed_3, "expected at least one 3x3 placement in column");
+        assert!(placed_6, "expected at least one 6x6 placement in column");
+    }
+
     fn collect_visible_keys_for_test(
         center: (i64, i64),
         render_distance: i64,
     ) -> Vec<ChunkRenderKey> {
-        let mut desired = Vec::new();
-        collect_lod_ring(
-            &mut desired,
+        collect_visible_chunk_keys(
             center,
-            0,
-            render_distance.min(FULL_DETAIL_RADIUS_CHUNKS),
-            0,
-        );
-        if render_distance > FULL_DETAIL_RADIUS_CHUNKS {
-            collect_lod_ring(
-                &mut desired,
-                center,
-                FULL_DETAIL_RADIUS_CHUNKS,
-                render_distance.min(MID_DETAIL_RADIUS_CHUNKS),
-                1,
-            );
-        }
-        if render_distance > MID_DETAIL_RADIUS_CHUNKS {
-            collect_lod_ring(
-                &mut desired,
-                center,
-                MID_DETAIL_RADIUS_CHUNKS,
-                render_distance.min(LOW_DETAIL_RADIUS_CHUNKS),
-                2,
-            );
-        }
-        if render_distance > LOW_DETAIL_RADIUS_CHUNKS {
-            collect_lod_ring(
-                &mut desired,
-                center,
-                LOW_DETAIL_RADIUS_CHUNKS,
-                render_distance,
-                3,
-            );
-        }
-        desired
+            render_distance,
+            FULL_DETAIL_RADIUS_CHUNKS,
+            MID_DETAIL_RADIUS_CHUNKS,
+            LOW_DETAIL_RADIUS_CHUNKS,
+        )
     }
 
     fn chunk_covered_by_any_key(chunk: (i64, i64), keys: &[ChunkRenderKey]) -> bool {
-        keys.iter().any(|key| {
-            let span = 1_i64 << key.lod_level;
-            let min_x = key.origin_chunk.0;
-            let min_z = key.origin_chunk.1;
-            let max_x = min_x + span - 1;
-            let max_z = min_z + span - 1;
-            (min_x..=max_x).contains(&chunk.0) && (min_z..=max_z).contains(&chunk.1)
-        })
+        keys.iter().any(|key| chunk_covered_by_key(chunk, *key))
+    }
+
+    fn chunk_covered_by_key(chunk: (i64, i64), key: ChunkRenderKey) -> bool {
+        let span = 1_i64 << key.lod_level;
+        let min_x = key.origin_chunk.0;
+        let min_z = key.origin_chunk.1;
+        let max_x = min_x + span - 1;
+        let max_z = min_z + span - 1;
+        (min_x..=max_x).contains(&chunk.0) && (min_z..=max_z).contains(&chunk.1)
+    }
+
+    fn sub_placement_target_from_hit_for_test(
+        world: &World,
+        hit: RaycastHit,
+        divisions: u8,
+    ) -> Result<SubTarget, String> {
+        if divisions <= 1 {
+            return Err("invalid divisions".to_string());
+        }
+        let target = if let Some((hit_sub, _)) = find_sub_block_at_point(world, hit.cell, hit.point)
+        {
+            let place_point = sub_place_point_from_hit_sub(hit, hit_sub);
+            let target_base = voxel_coords(place_point);
+            if target_base.1 < WORLD_MIN_Y || target_base.1 > WORLD_MAX_Y {
+                return Err(format!("out of world bounds base y {}", target_base.1));
+            }
+            let initial_target = sub_target_from_world_point(target_base, place_point, divisions);
+            resolve_sub_target_overlap_along_normal(world, initial_target, hit.normal, divisions)
+                .ok_or_else(|| "failed to resolve non-overlapping mixed-grid target".to_string())?
+        } else {
+            let place_point = if hit.previous != hit.cell {
+                hit.previous_point
+            } else {
+                hit.point + hit.normal.as_vec3() * 0.0035
+            };
+            let target_base = voxel_coords(place_point);
+            sub_target_from_world_point(target_base, place_point, divisions)
+        };
+        if world
+            .block_at_i64(target.base.0, target.base.1, target.base.2)
+            .is_solid()
+        {
+            return Err(format!(
+                "target base is solid at {:?}",
+                (target.base.0, target.base.1, target.base.2)
+            ));
+        }
+        if sub_slot_overlaps_existing(
+            world,
+            target.base,
+            divisions,
+            target.sx,
+            target.sy,
+            target.sz,
+        ) {
+            return Err(format!(
+                "target overlaps existing sub slot at {:?} {} {} {}",
+                target.base, target.sx, target.sy, target.sz
+            ));
+        }
+        Ok(target)
     }
 }
-
