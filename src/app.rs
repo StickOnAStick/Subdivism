@@ -18,6 +18,11 @@ use winit::{
 
 use crate::{
     camera::{Camera, CameraLens},
+    client::{
+        camera_binding::{CameraRig, CameraTarget},
+        input::{InputCommandSequencer, RawInputFrame},
+        prediction::ClientPredictionState,
+    },
     debug_overlay::{DebugOverlay, MenuLayout, OverlayVertex},
     game::{
         actor::{ActorRoster, PLAYER_EYE_HEIGHT},
@@ -28,7 +33,7 @@ use crate::{
             sub_slot_overlaps_existing, sub_target_from_world_point, voxel_coords, world_to_screen,
         },
         inventory::{BACKPACK_COLS, BACKPACK_ROWS, BACKPACK_SIZE, HOTBAR_SIZE, Inventory},
-        physics::{self, MovementInput, PhysicsConfig},
+        physics::PhysicsConfig,
         terrain_params::TerrainParamRegistry,
         terrain_recipe::TerrainRecipe,
         world::{
@@ -38,6 +43,7 @@ use crate::{
     },
     mesh::Vertex,
     render::{ChunkRenderKey, GpuState, GraphicsSettings, RenderOutcome, celestial_state_for_time},
+    shared::{net::protocol::PlayerNetId, sim::step},
 };
 
 #[path = "app/components.rs"]
@@ -75,10 +81,16 @@ const LOW_DETAIL_RADIUS_CHUNKS: i64 = 64;
 const DEFAULT_TERRAIN_RECIPE_PATH: &str = "terrain/default.terrain";
 const TERRAIN_PRESET_RECIPE_DIR: &str = "terrain/presets";
 const MAX_TERRAIN_LAB_SAVE_NAME_CHARS: usize = 40;
+const MAX_SIM_STEPS_PER_FRAME: usize = 8;
+const INPUT_SEND_RATE_HZ: u32 = 20;
+const INPUT_COMMANDS_PER_PACKET: usize = 6;
+const LOCAL_PLAYER_NET_ID: PlayerNetId = 0;
+
 pub fn run() {
     let mut options = AppLaunchOptions::from_env();
     options.start_in_main_menu = !options.terrain_lab;
     let event_loop = EventLoop::new().expect("failed to create event loop");
+    event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::new(options);
     event_loop.run_app(&mut app).expect("event loop error");
 }
@@ -230,6 +242,7 @@ struct InputState {
     pressed: HashSet<KeyCode>,
     mouse_captured: bool,
     cursor_position: Option<(f32, f32)>,
+    look_delta_pixels: (f32, f32),
 }
 
 impl InputState {
@@ -238,11 +251,27 @@ impl InputState {
             pressed: HashSet::new(),
             mouse_captured: false,
             cursor_position: None,
+            look_delta_pixels: (0.0, 0.0),
         }
     }
 
     fn key(&self, key: KeyCode) -> bool {
         self.pressed.contains(&key)
+    }
+
+    fn accumulate_look_delta(&mut self, delta_x: f32, delta_y: f32) {
+        self.look_delta_pixels.0 += delta_x;
+        self.look_delta_pixels.1 += delta_y;
+    }
+
+    fn consume_look_delta(&mut self) -> (f32, f32) {
+        let look_delta = self.look_delta_pixels;
+        self.look_delta_pixels = (0.0, 0.0);
+        look_delta
+    }
+
+    fn clear_look_delta(&mut self) {
+        self.look_delta_pixels = (0.0, 0.0);
     }
 }
 
@@ -338,6 +367,8 @@ struct App {
     menu: MenuState,
     inventory_cursor: InventoryCursor,
     input: InputState,
+    input_sequencer: InputCommandSequencer,
+    prediction: ClientPredictionState,
     physics: PhysicsConfig,
     chunk_stream: ChunkStreamingState,
     inventory: Inventory,
@@ -417,7 +448,7 @@ impl App {
             options.terrain_lab,
             default_terrain_lab_save_name(world_seed),
         );
-        let mut runtime = RuntimeState::new(seed);
+        let mut runtime = RuntimeState::new(seed, step::DEFAULT_SIM_TICK_HZ);
         runtime.frame_cap_index = persisted_settings.frame_cap_index;
         let diagnostics =
             DiagnosticsState::new(debug_overlay, chunk_worker_count, chunk_worker_env_override);
@@ -433,6 +464,8 @@ impl App {
                 index: 0,
             },
             input: InputState::new(),
+            input_sequencer: InputCommandSequencer::new(LOCAL_PLAYER_NET_ID),
+            prediction: ClientPredictionState::new(INPUT_SEND_RATE_HZ, INPUT_COMMANDS_PER_PACKET),
             physics: PhysicsConfig::default(),
             chunk_stream,
             inventory: Inventory::new(),
@@ -460,10 +493,20 @@ impl App {
     }
 
     fn active_camera(&self) -> Camera {
-        match self.camera.mode {
-            CameraMode::Player => self.actors.local_player().camera(self.camera.lens),
-            CameraMode::Free => self.camera.free_camera,
+        let target = match self.camera.mode {
+            CameraMode::Player => CameraTarget::LocalPlayerEye,
+            CameraMode::Free => CameraTarget::Free,
+        };
+        CameraRig {
+            target,
+            yaw: self.camera.free_camera.yaw,
+            pitch: self.camera.free_camera.pitch,
         }
+        .resolve_basic(
+            self.actors.local_player(),
+            self.camera.free_camera,
+            self.camera.lens,
+        )
     }
 
     fn sync_active_camera(&mut self) {
@@ -684,6 +727,7 @@ impl App {
                 .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
             window.set_cursor_visible(false);
             self.input.mouse_captured = true;
+            self.input.clear_look_delta();
         }
     }
 
@@ -692,6 +736,7 @@ impl App {
             let _ = window.set_cursor_grab(CursorGrabMode::None);
             window.set_cursor_visible(true);
             self.input.mouse_captured = false;
+            self.input.clear_look_delta();
         }
     }
 
@@ -778,17 +823,34 @@ impl App {
         self.sync_active_camera();
     }
 
-    fn update_player(&mut self, dt: f32) {
-        let input = MovementInput {
-            forward: axis_value(self.input.key(KeyCode::KeyW), self.input.key(KeyCode::KeyS)),
-            strafe: axis_value(self.input.key(KeyCode::KeyD), self.input.key(KeyCode::KeyA)),
-            jump_pressed: self.input.key(KeyCode::Space),
-            sprint_held: self.input.key(KeyCode::ShiftLeft) || self.input.key(KeyCode::ShiftRight),
-        };
+    fn pump_outbound_input_packets(&mut self, frame_dt: Duration) {
+        self.prediction.tick_network_send(frame_dt);
+        while let Some(packet) = self.prediction.pop_outbound_packet() {
+            // Placeholder transport path. In the real client this is where we'd serialize
+            // and send the packet to the remote server socket.
+            self.prediction.acknowledge_through(packet.newest_seq);
+        }
+    }
 
-        physics::update_player(
+    fn update_player(&mut self, dt: f32) {
+        let look_delta = self.input.consume_look_delta();
+        let input_cmd = self.input_sequencer.build_on_foot_command(
+            self.runtime.sim_tick,
+            RawInputFrame {
+                forward: axis_value(self.input.key(KeyCode::KeyW), self.input.key(KeyCode::KeyS)),
+                strafe: axis_value(self.input.key(KeyCode::KeyD), self.input.key(KeyCode::KeyA)),
+                jump: self.input.key(KeyCode::Space),
+                sprint: self.input.key(KeyCode::ShiftLeft) || self.input.key(KeyCode::ShiftRight),
+                look_delta_yaw_radians: look_delta.0 * LOOK_SENSITIVITY,
+                look_delta_pitch_radians: -look_delta.1 * LOOK_SENSITIVITY,
+                ..RawInputFrame::default()
+            },
+        );
+        self.prediction.record_local_input(input_cmd);
+
+        step::apply_player_input_cmd(
             self.actors.local_player_mut(),
-            &input,
+            &input_cmd,
             &self.world,
             &self.physics,
             dt,
@@ -796,6 +858,11 @@ impl App {
     }
 
     fn update_free_camera(&mut self, dt: f32) {
+        let (look_delta_x, look_delta_y) = self.input.consume_look_delta();
+        self.camera.free_camera.yaw += look_delta_x * LOOK_SENSITIVITY;
+        self.camera.free_camera.pitch -= look_delta_y * LOOK_SENSITIVITY;
+        self.camera.free_camera.pitch = self.camera.free_camera.pitch.clamp(-MAX_PITCH, MAX_PITCH);
+
         let forward = self.camera.free_camera.forward();
         let right = forward.cross(Vec3::Y).normalize_or_zero();
         let mut move_dir = Vec3::ZERO;
@@ -1785,6 +1852,12 @@ impl App {
                     self.diagnostics.chunk_worker_count
                 ),
             },
+            format!(
+                "NET PENDING {} ACK {} SENT {}",
+                self.prediction.pending_input_count(),
+                self.prediction.last_acked_seq(),
+                self.prediction.last_sent_seq()
+            ),
         ];
         if self.session.dev_mode {
             lines.push(format!(
@@ -2280,6 +2353,8 @@ impl ApplicationHandler for App {
         self.platform.gpu = Some(gpu);
         self.runtime.last_frame = Instant::now();
         self.runtime.next_frame_at = self.runtime.last_frame;
+        self.runtime.sim_accumulator = Duration::ZERO;
+        self.input.clear_look_delta();
         self.chunk_stream.last_chunk_center = self.current_chunk_center();
         if self.menu.ui_mode == UiMode::Playing {
             self.schedule_visible_chunks();
@@ -2534,21 +2609,8 @@ impl ApplicationHandler for App {
         }
 
         if let DeviceEvent::MouseMotion { delta } = event {
-            match self.camera.mode {
-                CameraMode::Player => {
-                    let actor = self.actors.local_player_mut();
-                    actor.look.yaw += delta.0 as f32 * LOOK_SENSITIVITY;
-                    actor.look.pitch -= delta.1 as f32 * LOOK_SENSITIVITY;
-                    actor.look.pitch = actor.look.pitch.clamp(-MAX_PITCH, MAX_PITCH);
-                }
-                CameraMode::Free => {
-                    self.camera.free_camera.yaw += delta.0 as f32 * LOOK_SENSITIVITY;
-                    self.camera.free_camera.pitch -= delta.1 as f32 * LOOK_SENSITIVITY;
-                    self.camera.free_camera.pitch =
-                        self.camera.free_camera.pitch.clamp(-MAX_PITCH, MAX_PITCH);
-                }
-            }
-            self.sync_active_camera();
+            self.input
+                .accumulate_look_delta(delta.0 as f32, delta.1 as f32);
         }
     }
 
@@ -2571,11 +2633,33 @@ impl ApplicationHandler for App {
             event_loop.set_control_flow(ControlFlow::Poll);
         }
 
-        let dt = (now - self.runtime.last_frame).as_secs_f32();
+        let frame_dt = now - self.runtime.last_frame;
         self.runtime.last_frame = now;
-        self.runtime.world_time_seconds += dt;
-        self.diagnostics.debug_overlay.record_frame(dt);
-        self.update(dt);
+        self.runtime.world_time_seconds += frame_dt.as_secs_f32();
+        self.diagnostics
+            .debug_overlay
+            .record_frame(frame_dt.as_secs_f32());
+
+        let sim_interval = self.runtime.sim_tick_interval;
+        let max_accumulator = sim_interval * MAX_SIM_STEPS_PER_FRAME as u32;
+        self.runtime.sim_accumulator =
+            (self.runtime.sim_accumulator + frame_dt).min(max_accumulator);
+
+        let mut sim_steps = 0_usize;
+        while self.runtime.sim_accumulator >= sim_interval && sim_steps < MAX_SIM_STEPS_PER_FRAME {
+            self.runtime.sim_accumulator -= sim_interval;
+            self.runtime.sim_tick = self.runtime.sim_tick.wrapping_add(1);
+            let sim_dt = self.runtime.sim_dt_seconds();
+            self.update(sim_dt);
+            sim_steps += 1;
+        }
+        if sim_steps == MAX_SIM_STEPS_PER_FRAME && self.runtime.sim_accumulator >= sim_interval {
+            // Recover from hitches by dropping old sim time rather than spiraling forever.
+            self.runtime.sim_accumulator = Duration::ZERO;
+        }
+
+        self.pump_outbound_input_packets(frame_dt);
+
         if self.menu.ui_mode == UiMode::Playing {
             let center = self.current_chunk_center();
             if center != self.chunk_stream.last_chunk_center {

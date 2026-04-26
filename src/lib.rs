@@ -1,6 +1,9 @@
 pub mod app;
 pub mod camera;
+pub mod client;
 pub mod debug_overlay;
 pub mod game;
 pub mod mesh;
 pub mod render;
+pub mod server;
+pub mod shared;

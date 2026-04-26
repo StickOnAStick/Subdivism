@@ -123,21 +123,34 @@ pub(super) struct RuntimeState {
     pub(super) world_time_seconds: f32,
     pub(super) last_frame: Instant,
     pub(super) next_frame_at: Instant,
+    pub(super) sim_tick_hz: u32,
+    pub(super) sim_tick_interval: std::time::Duration,
+    pub(super) sim_accumulator: std::time::Duration,
+    pub(super) sim_tick: u32,
     pub(super) rng_state: u64,
     pub(super) should_exit: bool,
 }
 
 impl RuntimeState {
-    pub(super) fn new(seed: u64) -> Self {
+    pub(super) fn new(seed: u64, sim_tick_hz: u32) -> Self {
         let now = Instant::now();
+        let clamped_tick_hz = sim_tick_hz.max(1);
         Self {
             frame_cap_index: DEFAULT_FRAME_CAP_INDEX,
             world_time_seconds: 0.0,
             last_frame: now,
             next_frame_at: now,
+            sim_tick_hz: clamped_tick_hz,
+            sim_tick_interval: std::time::Duration::from_secs_f32(1.0 / clamped_tick_hz as f32),
+            sim_accumulator: std::time::Duration::ZERO,
+            sim_tick: 0,
             rng_state: seed,
             should_exit: false,
         }
+    }
+
+    pub(super) fn sim_dt_seconds(&self) -> f32 {
+        1.0 / self.sim_tick_hz as f32
     }
 }
 
