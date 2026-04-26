@@ -1,16 +1,21 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::Arc,
     time::Instant,
 };
 
+use glam::Vec3;
 use winit::window::{Window, WindowId};
 
 use crate::{
     camera::{Camera, CameraLens},
     debug_overlay::DebugOverlay,
-    game::world::Block,
+    game::{
+        actor::ActorState,
+        physics::MovementInput,
+        world::Block,
+    },
     render::{ChunkRenderKey, GpuState},
 };
 
@@ -78,6 +83,10 @@ impl PlatformRuntimeState {
 pub(super) struct CameraRuntimeState {
     pub(super) mode: CameraMode,
     pub(super) free_camera: Camera,
+    pub(super) chase_camera_position: Vec3,
+    pub(super) chase_distance: f32,
+    pub(super) chase_height: f32,
+    pub(super) chase_smoothing: f32,
     pub(super) lens: CameraLens,
 }
 
@@ -86,6 +95,10 @@ impl CameraRuntimeState {
         Self {
             mode,
             free_camera,
+            chase_camera_position: free_camera.position,
+            chase_distance: 5.5,
+            chase_height: 1.3,
+            chase_smoothing: 10.0,
             lens,
         }
     }
@@ -152,6 +165,107 @@ impl BuildModeState {
             subdivide_scale: SubdivideScale::Full,
             sub_unit_wallet: HashMap::new(),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SessionNetMode {
+    Solo,
+    HostLocal,
+    JoinLocal,
+}
+
+impl SessionNetMode {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Solo => "solo",
+            Self::HostLocal => "host-local",
+            Self::JoinLocal => "join-local",
+        }
+    }
+
+    pub(super) fn menu_label(self) -> &'static str {
+        match self {
+            Self::Solo => "SINGLEPLAYER (OFFLINE)",
+            Self::HostLocal => "HOST LOCAL SERVER",
+            Self::JoinLocal => "JOIN LOCAL SERVER",
+        }
+    }
+
+    pub(super) fn prediction_enabled(self) -> bool {
+        !matches!(self, Self::Solo)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct InputCommandFrame {
+    pub(super) sequence: u32,
+    pub(super) dt: f32,
+    pub(super) movement: MovementInput,
+    pub(super) yaw: f32,
+    pub(super) pitch: f32,
+}
+
+pub(super) struct QueuedServerCommand {
+    pub(super) frames_left: u8,
+    pub(super) command: InputCommandFrame,
+}
+
+pub(super) struct PredictionRuntimeState {
+    pub(super) pending_local_inputs: VecDeque<InputCommandFrame>,
+    pub(super) next_sequence: u32,
+    pub(super) last_authoritative_sequence: u32,
+    pub(super) last_position_error: f32,
+    pub(super) snap_distance: f32,
+    pub(super) correction_gain: f32,
+}
+
+impl PredictionRuntimeState {
+    pub(super) fn new() -> Self {
+        Self {
+            pending_local_inputs: VecDeque::new(),
+            next_sequence: 1,
+            last_authoritative_sequence: 0,
+            last_position_error: 0.0,
+            snap_distance: 1.2,
+            correction_gain: 0.18,
+        }
+    }
+}
+
+pub(super) struct NetcodeRuntimeState {
+    pub(super) selected_mode: SessionNetMode,
+    pub(super) active_mode: SessionNetMode,
+    pub(super) prediction: PredictionRuntimeState,
+    pub(super) queued_server_inputs: VecDeque<QueuedServerCommand>,
+    pub(super) server_actor: ActorState,
+    pub(super) simulated_latency_frames: u8,
+}
+
+impl NetcodeRuntimeState {
+    pub(super) fn new(local_actor: ActorState) -> Self {
+        Self {
+            selected_mode: SessionNetMode::Solo,
+            active_mode: SessionNetMode::Solo,
+            prediction: PredictionRuntimeState::new(),
+            queued_server_inputs: VecDeque::new(),
+            server_actor: local_actor,
+            simulated_latency_frames: 2,
+        }
+    }
+
+    pub(super) fn reset_for_actor(&mut self, actor: ActorState) {
+        self.server_actor = actor;
+        self.prediction.pending_local_inputs.clear();
+        self.queued_server_inputs.clear();
+        self.prediction.last_position_error = 0.0;
+        self.prediction.last_authoritative_sequence = 0;
+    }
+
+    pub(super) fn set_mode(&mut self, mode: SessionNetMode, actor: ActorState) {
+        self.selected_mode = mode;
+        self.active_mode = mode;
+        self.reset_for_actor(actor);
     }
 }
 

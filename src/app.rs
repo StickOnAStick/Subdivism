@@ -28,7 +28,7 @@ use crate::{
             sub_slot_overlaps_existing, sub_target_from_world_point, voxel_coords, world_to_screen,
         },
         inventory::{BACKPACK_COLS, BACKPACK_ROWS, BACKPACK_SIZE, HOTBAR_SIZE, Inventory},
-        physics::{self, MovementInput, PhysicsConfig},
+        physics::PhysicsConfig,
         terrain_params::TerrainParamRegistry,
         terrain_recipe::TerrainRecipe,
         world::{
@@ -48,9 +48,11 @@ mod perf;
 mod settings;
 #[path = "app/terrain_lab.rs"]
 mod terrain_lab;
+#[path = "app/movement.rs"]
+mod movement;
 use components::{
     BuildModeState, CameraRuntimeState, ChunkStreamingState, DiagnosticsState, MenuState,
-    PlatformRuntimeState, RuntimeState, WorldSessionState,
+    NetcodeRuntimeState, PlatformRuntimeState, RuntimeState, SessionNetMode, WorldSessionState,
 };
 use perf::StartupPerfReport;
 use settings::AppSettings;
@@ -154,6 +156,7 @@ impl AppLaunchOptions {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CameraMode {
     Player,
+    Chase,
     Free,
 }
 
@@ -161,6 +164,7 @@ impl CameraMode {
     fn label(self) -> &'static str {
         match self {
             Self::Player => "player",
+            Self::Chase => "chase",
             Self::Free => "free",
         }
     }
@@ -177,6 +181,7 @@ enum UiMode {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MenuPage {
     Startup,
+    StartupModeSelect,
     StartupPerfResults,
     Main,
     Settings,
@@ -340,6 +345,7 @@ struct App {
     input: InputState,
     physics: PhysicsConfig,
     chunk_stream: ChunkStreamingState,
+    netcode: NetcodeRuntimeState,
     inventory: Inventory,
     session: WorldSessionState,
     runtime: RuntimeState,
@@ -392,6 +398,7 @@ impl App {
         let lens = CameraLens::default();
         let actors = ActorRoster::new(world.spawn_point());
         let free_camera = actors.local_player().camera(lens);
+        let local_actor = *actors.local_player();
         let camera_mode = if options.terrain_lab {
             CameraMode::Free
         } else {
@@ -435,6 +442,7 @@ impl App {
             input: InputState::new(),
             physics: PhysicsConfig::default(),
             chunk_stream,
+            netcode: NetcodeRuntimeState::new(local_actor),
             inventory: Inventory::new(),
             session,
             runtime,
@@ -462,6 +470,12 @@ impl App {
     fn active_camera(&self) -> Camera {
         match self.camera.mode {
             CameraMode::Player => self.actors.local_player().camera(self.camera.lens),
+            CameraMode::Chase => Camera {
+                position: self.camera.chase_camera_position,
+                yaw: self.actors.local_player().look.yaw,
+                pitch: (self.actors.local_player().look.pitch * 0.7).clamp(-1.1, 0.8),
+                lens: self.camera.lens,
+            },
             CameraMode::Free => self.camera.free_camera,
         }
     }
@@ -557,6 +571,8 @@ impl App {
             self.actors.respawn_local_player(self.world.spawn_point());
             self.camera.free_camera = self.actors.local_player().camera(self.camera.lens);
         }
+        self.camera.chase_camera_position = self.actors.local_player().camera(self.camera.lens).position;
+        self.netcode.reset_for_actor(*self.actors.local_player());
         self.chunk_stream.last_chunk_center = self.current_chunk_center();
         self.schedule_visible_chunks();
         self.sync_active_camera();
@@ -647,8 +663,9 @@ impl App {
                 ""
             };
             window.set_title(&format!(
-                "Voxel Starter [{} | {} | RD {} | SEED {}{}{}]",
+                "Voxel Starter [{} | {} | {} | RD {} | SEED {}{}{}]",
                 self.frame_cap_label(),
+                self.netcode.active_mode.label(),
                 self.camera.mode.label(),
                 self.chunk_stream.render_distance_chunks,
                 self.session.world_seed,
@@ -668,7 +685,12 @@ impl App {
     fn toggle_camera_mode(&mut self) {
         self.camera.mode = match self.camera.mode {
             CameraMode::Player => {
-                self.camera.free_camera = self.actors.local_player().camera(self.camera.lens);
+                self.camera.chase_camera_position =
+                    self.actors.local_player().camera(self.camera.lens).position;
+                CameraMode::Chase
+            }
+            CameraMode::Chase => {
+                self.camera.free_camera = self.active_camera();
                 CameraMode::Free
             }
             CameraMode::Free => CameraMode::Player,
@@ -752,7 +774,14 @@ impl App {
             self.rebuild_world_from_terrain(TerrainConfig::balanced(), false);
         }
         self.camera.mode = CameraMode::Player;
+        self.camera.chase_camera_position = self.actors.local_player().camera(self.camera.lens).position;
+        self.netcode.reset_for_actor(*self.actors.local_player());
         self.activate_play_mode();
+    }
+
+    fn launch_game_mode_from_startup(&mut self, mode: SessionNetMode) {
+        self.netcode.set_mode(mode, *self.actors.local_player());
+        self.launch_regular_game_from_startup();
     }
 
     fn launch_terrain_lab_from_startup(&mut self) {
@@ -763,73 +792,10 @@ impl App {
         self.session.terrain_recipe_path = None;
         self.rebuild_world_from_terrain(TerrainConfig::zeroed(), false);
         self.camera.mode = CameraMode::Free;
+        self.netcode
+            .set_mode(SessionNetMode::Solo, *self.actors.local_player());
         self.diagnostics.debug_overlay.visible = true;
         self.activate_play_mode();
-    }
-
-    fn update(&mut self, dt: f32) {
-        if self.menu.ui_mode != UiMode::Playing {
-            return;
-        }
-        match self.camera.mode {
-            CameraMode::Player => self.update_player(dt),
-            CameraMode::Free => self.update_free_camera(dt),
-        }
-        self.sync_active_camera();
-    }
-
-    fn update_player(&mut self, dt: f32) {
-        let input = MovementInput {
-            forward: axis_value(self.input.key(KeyCode::KeyW), self.input.key(KeyCode::KeyS)),
-            strafe: axis_value(self.input.key(KeyCode::KeyD), self.input.key(KeyCode::KeyA)),
-            jump_pressed: self.input.key(KeyCode::Space),
-            sprint_held: self.input.key(KeyCode::ShiftLeft) || self.input.key(KeyCode::ShiftRight),
-        };
-
-        physics::update_player(
-            self.actors.local_player_mut(),
-            &input,
-            &self.world,
-            &self.physics,
-            dt,
-        );
-    }
-
-    fn update_free_camera(&mut self, dt: f32) {
-        let forward = self.camera.free_camera.forward();
-        let right = forward.cross(Vec3::Y).normalize_or_zero();
-        let mut move_dir = Vec3::ZERO;
-
-        if self.input.key(KeyCode::KeyW) {
-            move_dir += forward;
-        }
-        if self.input.key(KeyCode::KeyS) {
-            move_dir -= forward;
-        }
-        if self.input.key(KeyCode::KeyA) {
-            move_dir -= right;
-        }
-        if self.input.key(KeyCode::KeyD) {
-            move_dir += right;
-        }
-        if self.input.key(KeyCode::Space) {
-            move_dir += Vec3::Y;
-        }
-        if self.input.key(KeyCode::ShiftLeft) || self.input.key(KeyCode::ShiftRight) {
-            move_dir -= Vec3::Y;
-        }
-
-        if move_dir.length_squared() > 0.0 {
-            self.camera.free_camera.position += move_dir.normalize() * FREE_CAMERA_SPEED * dt;
-        }
-
-        if self.world.is_out_of_bounds(
-            self.camera.free_camera.position - Vec3::Y * PLAYER_EYE_HEIGHT,
-            self.physics.respawn_margin,
-        ) {
-            self.camera.free_camera.position =
-                self.world.spawn_point() + Vec3::Y * PLAYER_EYE_HEIGHT;
-        }
     }
 
     fn current_chunk_center(&self) -> (i64, i64) {
@@ -1063,6 +1029,8 @@ impl App {
 
         self.actors.respawn_local_player(spawn);
         self.camera.free_camera = self.actors.local_player().camera(self.camera.lens);
+        self.camera.chase_camera_position = self.camera.free_camera.position;
+        self.netcode.reset_for_actor(*self.actors.local_player());
         self.sync_active_camera();
     }
 
@@ -1094,6 +1062,15 @@ impl App {
                 self.menu_back_or_resume();
             }
             _ => {}
+        }
+        if self.menu.page == MenuPage::StartupModeSelect {
+            if self.menu.index <= 2 {
+                self.netcode.selected_mode = match self.menu.index {
+                    0 => SessionNetMode::Solo,
+                    1 => SessionNetMode::HostLocal,
+                    _ => SessionNetMode::JoinLocal,
+                };
+            }
         }
     }
 
@@ -1181,7 +1158,14 @@ impl App {
     fn activate_menu_item(&mut self) {
         match self.menu.page {
             MenuPage::Startup => match self.menu.index {
-                0 => self.launch_regular_game_from_startup(),
+                0 => {
+                    self.menu.page = MenuPage::StartupModeSelect;
+                    self.menu.index = match self.netcode.selected_mode {
+                        SessionNetMode::Solo => 0,
+                        SessionNetMode::HostLocal => 1,
+                        SessionNetMode::JoinLocal => 2,
+                    };
+                }
                 1 => self.launch_terrain_lab_from_startup(),
                 2 => self.run_startup_perf_suite_action(),
                 3 => {
@@ -1189,9 +1173,26 @@ impl App {
                 }
                 _ => {}
             },
+            MenuPage::StartupModeSelect => match self.menu.index {
+                0 => self.launch_game_mode_from_startup(SessionNetMode::Solo),
+                1 => self.launch_game_mode_from_startup(SessionNetMode::HostLocal),
+                2 => self.launch_game_mode_from_startup(SessionNetMode::JoinLocal),
+                3 => {
+                    self.menu.page = MenuPage::Startup;
+                    self.menu.index = 0;
+                }
+                _ => {}
+            },
             MenuPage::StartupPerfResults => match self.menu.index {
                 0 => self.run_startup_perf_suite_action(),
-                1 => self.launch_regular_game_from_startup(),
+                1 => {
+                    self.menu.page = MenuPage::StartupModeSelect;
+                    self.menu.index = match self.netcode.selected_mode {
+                        SessionNetMode::Solo => 0,
+                        SessionNetMode::HostLocal => 1,
+                        SessionNetMode::JoinLocal => 2,
+                    };
+                }
                 2 => self.launch_terrain_lab_from_startup(),
                 3 => {
                     self.menu.page = MenuPage::Startup;
@@ -1283,6 +1284,10 @@ impl App {
             MenuPage::Startup => {
                 self.runtime.should_exit = true;
             }
+            MenuPage::StartupModeSelect => {
+                self.menu.page = MenuPage::Startup;
+                self.menu.index = 0;
+            }
             MenuPage::StartupPerfResults => {
                 self.menu.page = MenuPage::Startup;
                 self.menu.index = 0;
@@ -1332,18 +1337,55 @@ impl App {
             MenuPage::Startup => (
                 "SUBDIVISM".to_string(),
                 vec![
-                    "START REGULAR GAME".to_string(),
+                    "PLAY".to_string(),
                     "START TERRAIN LAB".to_string(),
                     "RUN PERFORMANCE SUITE".to_string(),
                     "QUIT TO DESKTOP".to_string(),
                 ],
                 self.menu.index,
             ),
+            MenuPage::StartupModeSelect => {
+                let selected = self.netcode.selected_mode;
+                (
+                    "SELECT GAME MODE".to_string(),
+                    vec![
+                        format!(
+                            "{}{}",
+                            SessionNetMode::Solo.menu_label(),
+                            if selected == SessionNetMode::Solo {
+                                " [SELECTED]"
+                            } else {
+                                ""
+                            }
+                        ),
+                        format!(
+                            "{}{}",
+                            SessionNetMode::HostLocal.menu_label(),
+                            if selected == SessionNetMode::HostLocal {
+                                " [SELECTED]"
+                            } else {
+                                ""
+                            }
+                        ),
+                        format!(
+                            "{}{}",
+                            SessionNetMode::JoinLocal.menu_label(),
+                            if selected == SessionNetMode::JoinLocal {
+                                " [SELECTED]"
+                            } else {
+                                ""
+                            }
+                        ),
+                        "BACK".to_string(),
+                    ],
+                    self.menu.index,
+                )
+            }
             MenuPage::StartupPerfResults => (
                 "PERF RESULTS".to_string(),
                 vec![
                     "RUN PERFORMANCE SUITE AGAIN".to_string(),
-                    "START REGULAR GAME".to_string(),
+                    "PLAY".to_string(),
                     "START TERRAIN LAB".to_string(),
                     "BACK TO MAIN MENU".to_string(),
                     "QUIT TO DESKTOP".to_string(),
@@ -1465,6 +1507,21 @@ impl App {
     }
 
     fn adjust_menu_value(&mut self, delta: i32) {
+        if self.menu.page == MenuPage::StartupModeSelect {
+            if delta == 0 {
+                return;
+            }
+            let max_index = 2_usize;
+            let current = self.menu.index.min(max_index) as i32;
+            let next = (current + delta).clamp(0, max_index as i32) as usize;
+            self.menu.index = next;
+            self.netcode.selected_mode = match self.menu.index {
+                0 => SessionNetMode::Solo,
+                1 => SessionNetMode::HostLocal,
+                _ => SessionNetMode::JoinLocal,
+            };
+            return;
+        }
         if self.menu.page != MenuPage::Graphics {
             return;
         }
@@ -1746,6 +1803,11 @@ impl App {
             format!("SUN {:.1}", self.runtime.world_time_seconds),
             format!("SEED {}", self.session.world_seed),
             format!(
+                "MODE {} CAM {}",
+                self.netcode.active_mode.label(),
+                self.camera.mode.label()
+            ),
+            format!(
                 "XYZ {:.1} {:.1} {:.1}",
                 camera.position.x, camera.position.y, camera.position.z
             ),
@@ -1795,6 +1857,14 @@ impl App {
                 lines.push("DEV FILE ON".to_string());
                 lines.push("F6 RELOAD".to_string());
             }
+        }
+        if self.netcode.active_mode.prediction_enabled() {
+            lines.push(format!(
+                "PRED ERR {:.3} ACK {} Q {}",
+                self.netcode.prediction.last_position_error,
+                self.netcode.prediction.last_authoritative_sequence,
+                self.netcode.prediction.pending_local_inputs.len()
+            ));
         }
         if self.session.terrain_lab.enabled {
             lines.push("LAB F8 PANEL F9 SAVE".to_string());
@@ -2535,7 +2605,7 @@ impl ApplicationHandler for App {
 
         if let DeviceEvent::MouseMotion { delta } = event {
             match self.camera.mode {
-                CameraMode::Player => {
+                CameraMode::Player | CameraMode::Chase => {
                     let actor = self.actors.local_player_mut();
                     actor.look.yaw += delta.0 as f32 * LOOK_SENSITIVITY;
                     actor.look.pitch -= delta.1 as f32 * LOOK_SENSITIVITY;

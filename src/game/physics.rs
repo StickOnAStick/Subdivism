@@ -27,7 +27,7 @@ impl Default for PhysicsConfig {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct MovementInput {
     pub forward: f32,
     pub strafe: f32,
