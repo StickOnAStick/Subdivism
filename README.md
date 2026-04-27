@@ -27,6 +27,12 @@ cargo run -- --terrain-file terrain/alpine.terrain --seed 7
 
 # Enable dev mode (adds reload/debug affordances)
 cargo run -- --dev
+
+# Override direct-join target (used by JOIN SERVER mode)
+cargo run -- --server-addr 192.168.1.10:4000
+
+# Override host bind address (used by HOST OPEN SERVER mode)
+cargo run -- --server-bind 0.0.0.0:4000
 ```
 
 ## Core Controls
@@ -106,3 +112,16 @@ cargo run --bin perf_suite
 # Full suite
 cargo run --bin perf_suite -- --full
 ```
+
+### Dedicated multiplayer server
+```bash
+# Listen on default 0.0.0.0:4000
+cargo run --bin server
+
+# Listen on a custom bind address
+cargo run --bin server -- 0.0.0.0:5000
+```
+
+LAN note:
+- Host machine: run server bound to `0.0.0.0:<port>` (or choose `HOST (OPEN SERVER)` in-game).
+- Client machine: join using host LAN IP, e.g. `--server-addr 192.168.1.10:4000`.

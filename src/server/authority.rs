@@ -42,30 +42,46 @@ impl AuthorityState {
             .map(|player| player.player_id)
             .collect();
         for player_id in player_ids {
-            let Some(queue) = self.input_queues.get_mut(&player_id) else {
-                continue;
-            };
-            while let Some(cmd) = queue.pop_front() {
-                match cmd.target {
-                    ControlTarget::OnFoot => {
-                        if let Some(player) = self.world.player_mut(player_id) {
-                            let mut actor = player_to_actor(*player);
-                            step::apply_player_input_cmd(
-                                &mut actor,
-                                &cmd,
-                                &collision_view,
-                                physics,
-                                dt,
-                            );
-                            *player = actor_to_player(player.player_id, actor, player.mounted);
+            let mut consumed_command = false;
+            if let Some(queue) = self.input_queues.get_mut(&player_id) {
+                while let Some(cmd) = queue.pop_front() {
+                    consumed_command = true;
+                    match cmd.target {
+                        ControlTarget::OnFoot => {
+                            if let Some(player) = self.world.player_mut(player_id) {
+                                let mut actor = player_to_actor(*player);
+                                step::apply_player_input_cmd(
+                                    &mut actor,
+                                    &cmd,
+                                    &collision_view,
+                                    physics,
+                                    dt,
+                                );
+                                *player = actor_to_player(player.player_id, actor, player.mounted);
+                            }
                         }
-                    }
-                    ControlTarget::VehiclePilot { vehicle_id, .. } => {
-                        if let Some(vehicle) = self.world.vehicle_mut(vehicle_id) {
-                            step::apply_vehicle_pilot_input(vehicle, &cmd, dt);
+                        ControlTarget::VehiclePilot { vehicle_id, .. } => {
+                            if let Some(vehicle) = self.world.vehicle_mut(vehicle_id) {
+                                step::apply_vehicle_pilot_input(vehicle, &cmd, dt);
+                            }
                         }
                     }
                 }
+            }
+            if consumed_command {
+                continue;
+            }
+            // Keep authority-side physics running even when no new input arrives.
+            let idle_cmd = PlayerInputCmd {
+                tick: self.tick,
+                player_id,
+                target: ControlTarget::OnFoot,
+                ..PlayerInputCmd::default()
+            };
+            if let Some(player) = self.world.player_mut(player_id) {
+                let mut actor = player_to_actor(*player);
+                step::apply_player_input_cmd(&mut actor, &idle_cmd, &collision_view, physics, dt);
+                *player = actor_to_player(player.player_id, actor, player.mounted);
             }
         }
     }

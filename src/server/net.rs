@@ -67,8 +67,15 @@ pub fn run_udp_server(bind_addr: &str) {
 
         let now = Instant::now();
         if now >= next_tick {
-            session.tick(&world, &physics, tick_dt.as_secs_f32());
-            next_tick += tick_dt;
+            let mut steps = 0_u8;
+            while now >= next_tick && steps < 8 {
+                session.tick(&world, &physics, tick_dt.as_secs_f32());
+                next_tick += tick_dt;
+                steps += 1;
+            }
+            if steps == 8 && now >= next_tick {
+                next_tick = now + tick_dt;
+            }
 
             for (addr, player_id) in &clients {
                 let Some(snapshot) = session.latest_snapshot(*player_id) else {

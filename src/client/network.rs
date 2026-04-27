@@ -1,6 +1,8 @@
 use std::{
     collections::VecDeque,
     net::{SocketAddr, UdpSocket},
+    sync::OnceLock,
+    thread,
     time::Duration,
 };
 
@@ -60,17 +62,21 @@ pub trait ClientNetworkInterface {
 pub fn build_client_network(
     mode: StartupGameMode,
     local_player_id: PlayerNetId,
+    direct_server_addr: &str,
+    host_bind_addr: &str,
 ) -> Box<dyn ClientNetworkInterface> {
     match mode {
         StartupGameMode::SinglePlayer => {
             Box::new(InProcessAuthorityClient::new(mode, local_player_id, false))
         }
-        StartupGameMode::HostOpenServer => {
-            Box::new(InProcessAuthorityClient::new(mode, local_player_id, true))
-        }
+        StartupGameMode::HostOpenServer => Box::new(HostedLocalServerClient::new(
+            local_player_id,
+            host_bind_addr.to_string(),
+            direct_server_addr.to_string(),
+        )),
         StartupGameMode::MultiplayerDirect => Box::new(RemoteClient::new(
             local_player_id,
-            "127.0.0.1:4000".to_string(),
+            direct_server_addr.to_string(),
         )),
     }
 }
@@ -82,6 +88,7 @@ struct InProcessAuthorityClient {
     host_open: bool,
     session: ServerSession,
     inbound_snapshots: VecDeque<SnapshotPacket>,
+    server_tick_accumulator: Duration,
 }
 
 impl InProcessAuthorityClient {
@@ -92,6 +99,7 @@ impl InProcessAuthorityClient {
             host_open,
             session: ServerSession::new(),
             inbound_snapshots: VecDeque::new(),
+            server_tick_accumulator: Duration::ZERO,
         }
     }
 }
@@ -107,7 +115,12 @@ impl ClientNetworkInterface for InProcessAuthorityClient {
     }
 
     fn tick(&mut self, world: &World, physics: &PhysicsConfig, dt: f32) {
-        self.session.tick(world, physics, dt);
+        self.server_tick_accumulator += Duration::from_secs_f32(dt.max(0.0));
+        let server_step = Duration::from_secs_f32(1.0 / 60.0);
+        while self.server_tick_accumulator >= server_step {
+            self.server_tick_accumulator -= server_step;
+            self.session.tick(world, physics, server_step.as_secs_f32());
+        }
         if let Some(snapshot) = self.session.latest_snapshot(self.local_player_id) {
             self.inbound_snapshots.push_back(snapshot.clone());
         }
@@ -119,6 +132,56 @@ impl ClientNetworkInterface for InProcessAuthorityClient {
 
     fn take_assigned_player_id(&mut self) -> Option<PlayerNetId> {
         None
+    }
+}
+
+static HOST_SERVER_STARTED: OnceLock<()> = OnceLock::new();
+
+struct HostedLocalServerClient {
+    remote: RemoteClient,
+}
+
+impl HostedLocalServerClient {
+    fn new(
+        local_player_id: PlayerNetId,
+        host_bind_addr: String,
+        direct_server_addr: String,
+    ) -> Self {
+        HOST_SERVER_STARTED.get_or_init(|| {
+            let bind_addr_for_thread = host_bind_addr.clone();
+            thread::Builder::new()
+                .name("subdivism-host-server".to_string())
+                .spawn(move || {
+                    crate::server::net::run_udp_server(&bind_addr_for_thread);
+                })
+                .expect("failed to spawn host UDP server thread");
+        });
+        let loopback_addr = loopback_addr_for_bind(&host_bind_addr).unwrap_or(direct_server_addr);
+        Self {
+            remote: RemoteClient::new(local_player_id, loopback_addr),
+        }
+    }
+}
+
+impl ClientNetworkInterface for HostedLocalServerClient {
+    fn mode(&self) -> StartupGameMode {
+        StartupGameMode::HostOpenServer
+    }
+
+    fn enqueue_input_packet(&mut self, packet: InputPacket) {
+        self.remote.enqueue_input_packet(packet);
+    }
+
+    fn tick(&mut self, world: &World, physics: &PhysicsConfig, dt: f32) {
+        self.remote.tick(world, physics, dt);
+    }
+
+    fn drain_snapshots(&mut self) -> Vec<SnapshotPacket> {
+        self.remote.drain_snapshots()
+    }
+
+    fn take_assigned_player_id(&mut self) -> Option<PlayerNetId> {
+        self.remote.take_assigned_player_id()
     }
 }
 
@@ -238,4 +301,9 @@ impl ClientNetworkInterface for RemoteClient {
     fn take_assigned_player_id(&mut self) -> Option<PlayerNetId> {
         self.pending_assigned_player_id.take()
     }
+}
+
+fn loopback_addr_for_bind(bind_addr: &str) -> Option<String> {
+    let parsed = bind_addr.parse::<SocketAddr>().ok()?;
+    Some(format!("127.0.0.1:{}", parsed.port()))
 }

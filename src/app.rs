@@ -115,6 +115,8 @@ pub fn run_terrain_lab() {
 struct AppLaunchOptions {
     seed_override: Option<i64>,
     terrain_file: Option<PathBuf>,
+    server_addr: String,
+    server_bind_addr: String,
     dev_mode: bool,
     terrain_lab: bool,
     start_in_main_menu: bool,
@@ -124,6 +126,10 @@ impl AppLaunchOptions {
     fn from_env() -> Self {
         let mut seed_override = None;
         let mut terrain_file = None;
+        let mut server_addr =
+            std::env::var("SUBDIVISM_SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:4000".to_string());
+        let mut server_bind_addr =
+            std::env::var("SUBDIVISM_SERVER_BIND").unwrap_or_else(|_| "0.0.0.0:4000".to_string());
         let mut dev_mode = false;
         let mut terrain_lab = std::env::var("SUBDIVISM_TERRAIN_LAB")
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
@@ -145,6 +151,16 @@ impl AppLaunchOptions {
                         terrain_file = Some(PathBuf::from(path));
                     }
                 }
+                "--server-addr" => {
+                    if let Some(addr) = args.next() {
+                        server_addr = addr;
+                    }
+                }
+                "--server-bind" => {
+                    if let Some(addr) = args.next() {
+                        server_bind_addr = addr;
+                    }
+                }
                 "--dev" | "--dev-mode" => {
                     dev_mode = true;
                 }
@@ -163,6 +179,8 @@ impl AppLaunchOptions {
         Self {
             seed_override,
             terrain_file,
+            server_addr,
+            server_bind_addr,
             dev_mode,
             terrain_lab,
             start_in_main_menu: false,
@@ -379,6 +397,8 @@ struct App {
     input_sequencer: InputCommandSequencer,
     prediction: ClientPredictionState,
     startup_game_mode: StartupGameMode,
+    direct_server_addr: String,
+    host_server_bind_addr: String,
     network: Box<dyn ClientNetworkInterface>,
     remote_actors: HashMap<PlayerNetId, ActorState>,
     physics: PhysicsConfig,
@@ -465,6 +485,8 @@ impl App {
         let diagnostics =
             DiagnosticsState::new(debug_overlay, chunk_worker_count, chunk_worker_env_override);
         let startup_game_mode = StartupGameMode::SinglePlayer;
+        let direct_server_addr = options.server_addr.clone();
+        let host_server_bind_addr = options.server_bind_addr.clone();
 
         let mut app = Self {
             platform: PlatformRuntimeState::new(),
@@ -481,7 +503,14 @@ impl App {
             input_sequencer: InputCommandSequencer::new(LOCAL_PLAYER_NET_ID),
             prediction: ClientPredictionState::new(INPUT_SEND_RATE_HZ, INPUT_COMMANDS_PER_PACKET),
             startup_game_mode,
-            network: build_client_network(startup_game_mode, LOCAL_PLAYER_NET_ID),
+            direct_server_addr: direct_server_addr.clone(),
+            host_server_bind_addr: host_server_bind_addr.clone(),
+            network: build_client_network(
+                startup_game_mode,
+                LOCAL_PLAYER_NET_ID,
+                &direct_server_addr,
+                &host_server_bind_addr,
+            ),
             remote_actors: HashMap::new(),
             physics: PhysicsConfig::default(),
             chunk_stream,
@@ -707,10 +736,12 @@ impl App {
                 ""
             };
             window.set_title(&format!(
-                "Voxel Starter [{} | {} | NET {} | RD {} | SEED {}{}{}]",
+                "Voxel Starter [{} | {} | NET {}@{} | HOST {} | RD {} | SEED {}{}{}]",
                 self.frame_cap_label(),
                 self.camera.mode.label(),
                 self.network.mode().label(),
+                self.direct_server_addr,
+                self.host_server_bind_addr,
                 self.chunk_stream.render_distance_chunks,
                 self.session.world_seed,
                 dev_flag,
@@ -851,7 +882,12 @@ impl App {
         self.local_player_net_id = LOCAL_PLAYER_NET_ID;
         self.input_sequencer = InputCommandSequencer::new(self.local_player_net_id);
         self.prediction = ClientPredictionState::new(INPUT_SEND_RATE_HZ, INPUT_COMMANDS_PER_PACKET);
-        self.network = build_client_network(mode, self.local_player_net_id);
+        self.network = build_client_network(
+            mode,
+            self.local_player_net_id,
+            &self.direct_server_addr,
+            &self.host_server_bind_addr,
+        );
         self.remote_actors.clear();
         self.refresh_window_title();
     }
@@ -1525,8 +1561,13 @@ impl App {
                 "SUBDIVISM".to_string(),
                 vec![
                     format!(
-                        "START REGULAR GAME [{}]",
-                        self.startup_game_mode.network_label().to_uppercase()
+                        "START REGULAR GAME [{}{}]",
+                        self.startup_game_mode.network_label().to_uppercase(),
+                        if self.startup_game_mode == StartupGameMode::MultiplayerDirect {
+                            format!(" {}", self.direct_server_addr)
+                        } else {
+                            String::new()
+                        }
                     ),
                     "START TERRAIN LAB".to_string(),
                     "RUN PERFORMANCE SUITE".to_string(),
@@ -1994,6 +2035,8 @@ impl App {
                 "NET MODE {}",
                 self.network.mode().network_label().to_uppercase()
             ),
+            format!("NET TARGET {}", self.direct_server_addr),
+            format!("HOST BIND {}", self.host_server_bind_addr),
             format!(
                 "NET PENDING {} ACK {} SENT {}",
                 self.prediction.pending_input_count(),
