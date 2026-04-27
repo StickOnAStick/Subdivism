@@ -33,6 +33,7 @@ impl AuthorityState {
     pub fn step(&mut self, terrain_world: &World, physics: &PhysicsConfig, dt: f32) {
         self.tick = self.tick.wrapping_add(1);
         self.world.tick = self.tick;
+        let collision_view = terrain_world.collision_view();
 
         let player_ids: Vec<PlayerNetId> = self
             .world
@@ -52,7 +53,7 @@ impl AuthorityState {
                             step::apply_player_input_cmd(
                                 &mut actor,
                                 &cmd,
-                                terrain_world,
+                                &collision_view,
                                 physics,
                                 dt,
                             );

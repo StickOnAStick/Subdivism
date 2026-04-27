@@ -1,6 +1,9 @@
 use glam::Vec3;
 
-use super::{actor::ActorState, world::World};
+use super::{
+    actor::ActorState,
+    world::{Block, SubBlockPos, World, WorldCollisionView},
+};
 
 pub const PLAYER_RADIUS: f32 = 0.32;
 pub const PLAYER_HEIGHT: f32 = 1.8;
@@ -35,10 +38,64 @@ pub struct MovementInput {
     pub sprint_held: bool,
 }
 
-pub fn update_player(
+pub trait CollisionWorld {
+    fn is_solid_i64(&self, x: i64, y: i32, z: i64) -> bool;
+
+    fn for_each_sub_block_in_cell<F>(&self, x: i64, y: i32, z: i64, visit: F)
+    where
+        F: FnMut(SubBlockPos, Block) -> bool;
+
+    fn is_out_of_bounds(&self, position: Vec3, margin: f32) -> bool;
+
+    fn spawn_point(&self) -> Vec3;
+}
+
+impl CollisionWorld for World {
+    fn is_solid_i64(&self, x: i64, y: i32, z: i64) -> bool {
+        World::is_solid_i64(self, x, y, z)
+    }
+
+    fn for_each_sub_block_in_cell<F>(&self, x: i64, y: i32, z: i64, visit: F)
+    where
+        F: FnMut(SubBlockPos, Block) -> bool,
+    {
+        World::for_each_sub_block_in_cell(self, x, y, z, visit);
+    }
+
+    fn is_out_of_bounds(&self, position: Vec3, margin: f32) -> bool {
+        World::is_out_of_bounds(self, position, margin)
+    }
+
+    fn spawn_point(&self) -> Vec3 {
+        World::spawn_point(self)
+    }
+}
+
+impl CollisionWorld for WorldCollisionView<'_> {
+    fn is_solid_i64(&self, x: i64, y: i32, z: i64) -> bool {
+        WorldCollisionView::is_solid_i64(self, x, y, z)
+    }
+
+    fn for_each_sub_block_in_cell<F>(&self, x: i64, y: i32, z: i64, visit: F)
+    where
+        F: FnMut(SubBlockPos, Block) -> bool,
+    {
+        WorldCollisionView::for_each_sub_block_in_cell(self, x, y, z, visit);
+    }
+
+    fn is_out_of_bounds(&self, position: Vec3, margin: f32) -> bool {
+        WorldCollisionView::is_out_of_bounds(self, position, margin)
+    }
+
+    fn spawn_point(&self) -> Vec3 {
+        WorldCollisionView::spawn_point(self)
+    }
+}
+
+pub fn update_player<C: CollisionWorld>(
     actor: &mut ActorState,
     input: &MovementInput,
-    world: &World,
+    world: &C,
     physics: &PhysicsConfig,
     dt: f32,
 ) {
@@ -98,8 +155,8 @@ pub fn update_player(
     }
 }
 
-fn move_axis(
-    world: &World,
+fn move_axis<C: CollisionWorld>(
+    world: &C,
     mut position: Vec3,
     delta: Vec3,
     collision_step: f32,
@@ -131,7 +188,7 @@ fn move_axis(
     position
 }
 
-fn actor_collides(world: &World, position: Vec3) -> bool {
+fn actor_collides<C: CollisionWorld>(world: &C, position: Vec3) -> bool {
     let min = Vec3::new(
         position.x - PLAYER_RADIUS,
         position.y,
@@ -153,12 +210,13 @@ fn actor_collides(world: &World, position: Vec3) -> bool {
     for y in min_y..=max_y {
         for x in min_x..=max_x {
             for z in min_z..=max_z {
-                if world.is_solid(x, y, z) {
+                if world.is_solid_i64(x as i64, y, z as i64) {
                     return true;
                 }
-                for (sub, block) in world.sub_blocks_in_cell(x as i64, y, z as i64) {
+                let mut collided_sub_block = false;
+                world.for_each_sub_block_in_cell(x as i64, y, z as i64, |sub, block| {
                     if !block.is_solid() {
-                        continue;
+                        return true;
                     }
                     let step = 1.0 / sub.divisions as f32;
                     let sub_min = Vec3::new(
@@ -174,8 +232,13 @@ fn actor_collides(world: &World, position: Vec3) -> bool {
                         && sub_min.z < max.z
                         && sub_max.z > min.z
                     {
-                        return true;
+                        collided_sub_block = true;
+                        return false;
                     }
+                    true
+                });
+                if collided_sub_block {
+                    return true;
                 }
             }
         }

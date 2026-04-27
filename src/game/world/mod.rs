@@ -15,6 +15,7 @@ mod storage;
 mod terrain_gen;
 
 use noise::{smooth_range, value_noise_2d, value_noise_3d};
+pub use storage::WorldCollisionView;
 use storage::WorldStorage;
 
 pub const CHUNK_SIZE: i64 = 16;

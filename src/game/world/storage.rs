@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::RwLockReadGuard};
 
 use glam::Vec3;
 
@@ -64,6 +64,24 @@ impl SubOverrideState {
             .collect()
     }
 
+    fn for_each_entry_in_cell<F>(&self, x: i64, y: i32, z: i64, mut visit: F)
+    where
+        F: FnMut(SubBlockPos, Block) -> bool,
+    {
+        let key = BlockPos { x, y, z };
+        let Some(positions) = self.by_cell.get(&key) else {
+            return;
+        };
+        for pos in positions {
+            let Some(block) = self.by_pos.get(pos).copied() else {
+                continue;
+            };
+            if !visit(*pos, block) {
+                break;
+            }
+        }
+    }
+
     pub(super) fn iter_all(&self) -> impl Iterator<Item = (&SubBlockPos, &Block)> {
         self.by_pos.iter()
     }
@@ -79,6 +97,12 @@ pub(super) struct WorldStorage {
     pub(super) sub_overrides: std::sync::Arc<std::sync::RwLock<SubOverrideState>>,
     pub(super) spawn_point: Vec3,
     pub(super) center_column: (i32, i32),
+}
+
+pub struct WorldCollisionView<'a> {
+    world: &'a World,
+    overrides: RwLockReadGuard<'a, HashMap<BlockPos, Block>>,
+    sub_overrides: RwLockReadGuard<'a, SubOverrideState>,
 }
 
 impl World {
@@ -210,6 +234,36 @@ impl World {
             .entries_in_cell(x, y, z)
     }
 
+    pub fn for_each_sub_block_in_cell<F>(&self, x: i64, y: i32, z: i64, visit: F)
+    where
+        F: FnMut(SubBlockPos, Block) -> bool,
+    {
+        if !contains_world_y(y) {
+            return;
+        }
+        self.storage
+            .sub_overrides
+            .read()
+            .expect("sub overrides read lock poisoned")
+            .for_each_entry_in_cell(x, y, z, visit);
+    }
+
+    pub fn collision_view(&self) -> WorldCollisionView<'_> {
+        WorldCollisionView {
+            world: self,
+            overrides: self
+                .storage
+                .overrides
+                .read()
+                .expect("overrides read lock poisoned"),
+            sub_overrides: self
+                .storage
+                .sub_overrides
+                .read()
+                .expect("sub overrides read lock poisoned"),
+        }
+    }
+
     pub fn spawn_point_for_column(&self, x: i32, z: i32) -> Option<Vec3> {
         let x = x as i64;
         let z = z as i64;
@@ -249,5 +303,31 @@ impl World {
             return block;
         }
         self.procedural_block(x, y, z)
+    }
+}
+
+impl WorldCollisionView<'_> {
+    pub fn is_solid_i64(&self, x: i64, y: i32, z: i64) -> bool {
+        self.world
+            .block_at_with_overrides(&self.overrides, x, y, z)
+            .is_solid()
+    }
+
+    pub fn for_each_sub_block_in_cell<F>(&self, x: i64, y: i32, z: i64, visit: F)
+    where
+        F: FnMut(SubBlockPos, Block) -> bool,
+    {
+        if !contains_world_y(y) {
+            return;
+        }
+        self.sub_overrides.for_each_entry_in_cell(x, y, z, visit);
+    }
+
+    pub fn is_out_of_bounds(&self, position: Vec3, margin: f32) -> bool {
+        self.world.is_out_of_bounds(position, margin)
+    }
+
+    pub fn spawn_point(&self) -> Vec3 {
+        self.world.spawn_point()
     }
 }

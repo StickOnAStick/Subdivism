@@ -14,6 +14,7 @@ pub fn reconcile_local_actor(
     physics: &PhysicsConfig,
     dt: f32,
 ) {
+    let collision_view = world.collision_view();
     actor.motion.position = authoritative.position;
     actor.motion.velocity = authoritative.velocity;
     actor.look.yaw = authoritative.yaw;
@@ -21,6 +22,6 @@ pub fn reconcile_local_actor(
     actor.on_ground = false;
 
     for cmd in pending_inputs {
-        step::apply_player_input_cmd(actor, &cmd, world, physics, dt);
+        step::apply_player_input_cmd(actor, &cmd, &collision_view, physics, dt);
     }
 }

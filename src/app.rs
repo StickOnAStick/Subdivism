@@ -21,7 +21,9 @@ use crate::{
     client::{
         camera_binding::{CameraRig, CameraTarget},
         input::{InputCommandSequencer, RawInputFrame},
+        network::{ClientNetworkInterface, StartupGameMode, build_client_network},
         prediction::ClientPredictionState,
+        reconciliation::reconcile_local_actor,
     },
     debug_overlay::{DebugOverlay, MenuLayout, OverlayVertex},
     game::{
@@ -43,7 +45,10 @@ use crate::{
     },
     mesh::Vertex,
     render::{ChunkRenderKey, GpuState, GraphicsSettings, RenderOutcome, celestial_state_for_time},
-    shared::{net::protocol::PlayerNetId, sim::step},
+    shared::{
+        net::protocol::{PlayerNetId, SnapshotPacket},
+        sim::step,
+    },
 };
 
 #[path = "app/components.rs"]
@@ -189,6 +194,7 @@ enum UiMode {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MenuPage {
     Startup,
+    StartupGameMode,
     StartupPerfResults,
     Main,
     Settings,
@@ -369,6 +375,8 @@ struct App {
     input: InputState,
     input_sequencer: InputCommandSequencer,
     prediction: ClientPredictionState,
+    startup_game_mode: StartupGameMode,
+    network: Box<dyn ClientNetworkInterface>,
     physics: PhysicsConfig,
     chunk_stream: ChunkStreamingState,
     inventory: Inventory,
@@ -452,6 +460,7 @@ impl App {
         runtime.frame_cap_index = persisted_settings.frame_cap_index;
         let diagnostics =
             DiagnosticsState::new(debug_overlay, chunk_worker_count, chunk_worker_env_override);
+        let startup_game_mode = StartupGameMode::SinglePlayer;
 
         let mut app = Self {
             platform: PlatformRuntimeState::new(),
@@ -466,6 +475,8 @@ impl App {
             input: InputState::new(),
             input_sequencer: InputCommandSequencer::new(LOCAL_PLAYER_NET_ID),
             prediction: ClientPredictionState::new(INPUT_SEND_RATE_HZ, INPUT_COMMANDS_PER_PACKET),
+            startup_game_mode,
+            network: build_client_network(startup_game_mode, LOCAL_PLAYER_NET_ID),
             physics: PhysicsConfig::default(),
             chunk_stream,
             inventory: Inventory::new(),
@@ -690,9 +701,10 @@ impl App {
                 ""
             };
             window.set_title(&format!(
-                "Voxel Starter [{} | {} | RD {} | SEED {}{}{}]",
+                "Voxel Starter [{} | {} | NET {} | RD {} | SEED {}{}{}]",
                 self.frame_cap_label(),
                 self.camera.mode.label(),
+                self.network.mode().label(),
                 self.chunk_stream.render_distance_chunks,
                 self.session.world_seed,
                 dev_flag,
@@ -788,6 +800,7 @@ impl App {
     }
 
     fn launch_regular_game_from_startup(&mut self) {
+        self.configure_network_for_mode(self.startup_game_mode);
         if self.session.terrain_lab.enabled {
             self.session.terrain_lab.enabled = false;
             self.session.terrain_lab.panel_visible = false;
@@ -801,6 +814,7 @@ impl App {
     }
 
     fn launch_terrain_lab_from_startup(&mut self) {
+        self.configure_network_for_mode(StartupGameMode::SinglePlayer);
         self.session.terrain_lab.enabled = true;
         self.session.terrain_lab.panel_visible = true;
         self.session.terrain_lab.editing_save_name = false;
@@ -810,6 +824,28 @@ impl App {
         self.camera.mode = CameraMode::Free;
         self.diagnostics.debug_overlay.visible = true;
         self.activate_play_mode();
+    }
+
+    fn startup_game_mode_index(mode: StartupGameMode) -> usize {
+        match mode {
+            StartupGameMode::SinglePlayer => 0,
+            StartupGameMode::HostOpenServer => 1,
+            StartupGameMode::MultiplayerDirect => 2,
+        }
+    }
+
+    fn open_startup_game_mode_menu(&mut self) {
+        self.menu.page = MenuPage::StartupGameMode;
+        self.menu.index = Self::startup_game_mode_index(self.startup_game_mode);
+        self.menu.hover_index = None;
+    }
+
+    fn configure_network_for_mode(&mut self, mode: StartupGameMode) {
+        self.startup_game_mode = mode;
+        self.input_sequencer = InputCommandSequencer::new(LOCAL_PLAYER_NET_ID);
+        self.prediction = ClientPredictionState::new(INPUT_SEND_RATE_HZ, INPUT_COMMANDS_PER_PACKET);
+        self.network = build_client_network(mode, LOCAL_PLAYER_NET_ID);
+        self.refresh_window_title();
     }
 
     fn update(&mut self, dt: f32) {
@@ -826,10 +862,41 @@ impl App {
     fn pump_outbound_input_packets(&mut self, frame_dt: Duration) {
         self.prediction.tick_network_send(frame_dt);
         while let Some(packet) = self.prediction.pop_outbound_packet() {
-            // Placeholder transport path. In the real client this is where we'd serialize
-            // and send the packet to the remote server socket.
-            self.prediction.acknowledge_through(packet.newest_seq);
+            self.network.enqueue_input_packet(packet);
         }
+        self.network
+            .tick(&self.world, &self.physics, frame_dt.as_secs_f32());
+        for snapshot in self.network.drain_snapshots() {
+            self.apply_server_snapshot(snapshot);
+        }
+    }
+
+    fn apply_server_snapshot(&mut self, snapshot: SnapshotPacket) {
+        self.prediction.acknowledge_through(snapshot.ack_input_seq);
+        let Some(authoritative_local_actor) = snapshot
+            .actors
+            .iter()
+            .find(|actor| actor.player_id == LOCAL_PLAYER_NET_ID)
+            .copied()
+        else {
+            return;
+        };
+
+        let pending = self
+            .prediction
+            .pending_inputs()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let sim_dt = self.runtime.sim_dt_seconds();
+        reconcile_local_actor(
+            self.actors.local_player_mut(),
+            &authoritative_local_actor,
+            pending,
+            &self.world,
+            &self.physics,
+            sim_dt,
+        );
     }
 
     fn update_player(&mut self, dt: f32) {
@@ -848,10 +915,11 @@ impl App {
         );
         self.prediction.record_local_input(input_cmd);
 
+        let collision_view = self.world.collision_view();
         step::apply_player_input_cmd(
             self.actors.local_player_mut(),
             &input_cmd,
-            &self.world,
+            &collision_view,
             &self.physics,
             dt,
         );
@@ -1248,7 +1316,7 @@ impl App {
     fn activate_menu_item(&mut self) {
         match self.menu.page {
             MenuPage::Startup => match self.menu.index {
-                0 => self.launch_regular_game_from_startup(),
+                0 => self.open_startup_game_mode_menu(),
                 1 => self.launch_terrain_lab_from_startup(),
                 2 => self.run_startup_perf_suite_action(),
                 3 => {
@@ -1256,9 +1324,28 @@ impl App {
                 }
                 _ => {}
             },
+            MenuPage::StartupGameMode => match self.menu.index {
+                0 => {
+                    self.startup_game_mode = StartupGameMode::SinglePlayer;
+                    self.launch_regular_game_from_startup();
+                }
+                1 => {
+                    self.startup_game_mode = StartupGameMode::HostOpenServer;
+                    self.launch_regular_game_from_startup();
+                }
+                2 => {
+                    self.startup_game_mode = StartupGameMode::MultiplayerDirect;
+                    self.launch_regular_game_from_startup();
+                }
+                3 => {
+                    self.menu.page = MenuPage::Startup;
+                    self.menu.index = 0;
+                }
+                _ => {}
+            },
             MenuPage::StartupPerfResults => match self.menu.index {
                 0 => self.run_startup_perf_suite_action(),
-                1 => self.launch_regular_game_from_startup(),
+                1 => self.open_startup_game_mode_menu(),
                 2 => self.launch_terrain_lab_from_startup(),
                 3 => {
                     self.menu.page = MenuPage::Startup;
@@ -1350,6 +1437,10 @@ impl App {
             MenuPage::Startup => {
                 self.runtime.should_exit = true;
             }
+            MenuPage::StartupGameMode => {
+                self.menu.page = MenuPage::Startup;
+                self.menu.index = 0;
+            }
             MenuPage::StartupPerfResults => {
                 self.menu.page = MenuPage::Startup;
                 self.menu.index = 0;
@@ -1399,10 +1490,23 @@ impl App {
             MenuPage::Startup => (
                 "SUBDIVISM".to_string(),
                 vec![
-                    "START REGULAR GAME".to_string(),
+                    format!(
+                        "START REGULAR GAME [{}]",
+                        self.startup_game_mode.network_label().to_uppercase()
+                    ),
                     "START TERRAIN LAB".to_string(),
                     "RUN PERFORMANCE SUITE".to_string(),
                     "QUIT TO DESKTOP".to_string(),
+                ],
+                self.menu.index,
+            ),
+            MenuPage::StartupGameMode => (
+                "SELECT GAME MODE".to_string(),
+                vec![
+                    StartupGameMode::SinglePlayer.menu_label().to_string(),
+                    StartupGameMode::HostOpenServer.menu_label().to_string(),
+                    StartupGameMode::MultiplayerDirect.menu_label().to_string(),
+                    "BACK".to_string(),
                 ],
                 self.menu.index,
             ),
@@ -1852,6 +1956,10 @@ impl App {
                     self.diagnostics.chunk_worker_count
                 ),
             },
+            format!(
+                "NET MODE {}",
+                self.network.mode().network_label().to_uppercase()
+            ),
             format!(
                 "NET PENDING {} ACK {} SENT {}",
                 self.prediction.pending_input_count(),

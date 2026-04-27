@@ -4,7 +4,6 @@ use crate::{
     game::{
         actor::ActorState,
         physics::{self, MovementInput, PhysicsConfig},
-        world::World,
     },
     shared::{
         net::protocol::{ControlTarget, PlayerInputCmd},
@@ -25,10 +24,10 @@ pub fn axis_i8_to_f32(value: i8) -> f32 {
     (value as f32 / i8::MAX as f32).clamp(-1.0, 1.0)
 }
 
-pub fn apply_player_input_cmd(
+pub fn apply_player_input_cmd<C: physics::CollisionWorld>(
     actor: &mut ActorState,
     cmd: &PlayerInputCmd,
-    world: &World,
+    world: &C,
     physics: &PhysicsConfig,
     dt: f32,
 ) {
