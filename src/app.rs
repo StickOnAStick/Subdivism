@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -27,7 +27,7 @@ use crate::{
     },
     debug_overlay::{DebugOverlay, MenuLayout, OverlayVertex},
     game::{
-        actor::{ActorRoster, PLAYER_EYE_HEIGHT},
+        actor::{ActorRoster, ActorState, PLAYER_EYE_HEIGHT},
         hud::HudFormatter,
         interact::{
             RaycastHit, SubTarget, direction_to_screen, face_plane_points, find_sub_block_at_point,
@@ -43,10 +43,10 @@ use crate::{
             WORLD_OVERWORLD_FLOOR, World,
         },
     },
-    mesh::Vertex,
+    mesh::{Vertex, push_quad},
     render::{ChunkRenderKey, GpuState, GraphicsSettings, RenderOutcome, celestial_state_for_time},
     shared::{
-        net::protocol::{PlayerNetId, SnapshotPacket},
+        net::protocol::{ActorSnapshot, PlayerNetId, SnapshotPacket},
         sim::step,
     },
 };
@@ -90,6 +90,8 @@ const MAX_SIM_STEPS_PER_FRAME: usize = 8;
 const INPUT_SEND_RATE_HZ: u32 = 20;
 const INPUT_COMMANDS_PER_PACKET: usize = 6;
 const LOCAL_PLAYER_NET_ID: PlayerNetId = 0;
+const AVATAR_HALF_WIDTH: f32 = 0.28;
+const AVATAR_HEIGHT: f32 = 1.75;
 
 pub fn run() {
     let mut options = AppLaunchOptions::from_env();
@@ -373,10 +375,12 @@ struct App {
     menu: MenuState,
     inventory_cursor: InventoryCursor,
     input: InputState,
+    local_player_net_id: PlayerNetId,
     input_sequencer: InputCommandSequencer,
     prediction: ClientPredictionState,
     startup_game_mode: StartupGameMode,
     network: Box<dyn ClientNetworkInterface>,
+    remote_actors: HashMap<PlayerNetId, ActorState>,
     physics: PhysicsConfig,
     chunk_stream: ChunkStreamingState,
     inventory: Inventory,
@@ -473,10 +477,12 @@ impl App {
                 index: 0,
             },
             input: InputState::new(),
+            local_player_net_id: LOCAL_PLAYER_NET_ID,
             input_sequencer: InputCommandSequencer::new(LOCAL_PLAYER_NET_ID),
             prediction: ClientPredictionState::new(INPUT_SEND_RATE_HZ, INPUT_COMMANDS_PER_PACKET),
             startup_game_mode,
             network: build_client_network(startup_game_mode, LOCAL_PLAYER_NET_ID),
+            remote_actors: HashMap::new(),
             physics: PhysicsConfig::default(),
             chunk_stream,
             inventory: Inventory::new(),
@@ -842,9 +848,11 @@ impl App {
 
     fn configure_network_for_mode(&mut self, mode: StartupGameMode) {
         self.startup_game_mode = mode;
-        self.input_sequencer = InputCommandSequencer::new(LOCAL_PLAYER_NET_ID);
+        self.local_player_net_id = LOCAL_PLAYER_NET_ID;
+        self.input_sequencer = InputCommandSequencer::new(self.local_player_net_id);
         self.prediction = ClientPredictionState::new(INPUT_SEND_RATE_HZ, INPUT_COMMANDS_PER_PACKET);
-        self.network = build_client_network(mode, LOCAL_PLAYER_NET_ID);
+        self.network = build_client_network(mode, self.local_player_net_id);
+        self.remote_actors.clear();
         self.refresh_window_title();
     }
 
@@ -860,6 +868,14 @@ impl App {
     }
 
     fn pump_outbound_input_packets(&mut self, frame_dt: Duration) {
+        if let Some(assigned_player_id) = self.network.take_assigned_player_id() {
+            if assigned_player_id != self.local_player_net_id {
+                self.local_player_net_id = assigned_player_id;
+                self.input_sequencer = InputCommandSequencer::new(self.local_player_net_id);
+                self.prediction =
+                    ClientPredictionState::new(INPUT_SEND_RATE_HZ, INPUT_COMMANDS_PER_PACKET);
+            }
+        }
         self.prediction.tick_network_send(frame_dt);
         while let Some(packet) = self.prediction.pop_outbound_packet() {
             self.network.enqueue_input_packet(packet);
@@ -873,12 +889,18 @@ impl App {
 
     fn apply_server_snapshot(&mut self, snapshot: SnapshotPacket) {
         self.prediction.acknowledge_through(snapshot.ack_input_seq);
-        let Some(authoritative_local_actor) = snapshot
-            .actors
-            .iter()
-            .find(|actor| actor.player_id == LOCAL_PLAYER_NET_ID)
-            .copied()
-        else {
+        let mut next_remote_actors = HashMap::with_capacity(snapshot.actors.len());
+        let mut authoritative_local_actor = None;
+        for actor in &snapshot.actors {
+            if actor.player_id == self.local_player_net_id {
+                authoritative_local_actor = Some(*actor);
+                continue;
+            }
+            next_remote_actors.insert(actor.player_id, actor_state_from_snapshot(actor));
+        }
+        self.remote_actors = next_remote_actors;
+
+        let Some(authoritative_local_actor) = authoritative_local_actor else {
             return;
         };
 
@@ -897,6 +919,18 @@ impl App {
             &self.physics,
             sim_dt,
         );
+    }
+
+    fn remote_avatar_vertices(&self) -> Vec<Vertex> {
+        let mut vertices = Vec::with_capacity(self.remote_actors.len() * 36);
+        for (player_id, actor) in &self.remote_actors {
+            push_avatar_prism(
+                &mut vertices,
+                actor.motion.position,
+                player_avatar_color(*player_id),
+            );
+        }
+        vertices
     }
 
     fn update_player(&mut self, dt: f32) {
@@ -2549,6 +2583,11 @@ impl ApplicationHandler for App {
                 } else {
                     Vec::new()
                 };
+                let avatar_vertices = if self.menu.ui_mode == UiMode::Playing {
+                    self.remote_avatar_vertices()
+                } else {
+                    Vec::new()
+                };
                 let hud_lines = self.hud_lines();
                 let sky_overlay = self.sky_body_overlay();
                 if let Some(gpu) = self.platform.gpu.as_mut() {
@@ -2566,7 +2605,7 @@ impl ApplicationHandler for App {
                     if let Some(lab_vertices) = terrain_lab_overlay {
                         overlay_vertices.extend(lab_vertices);
                     }
-                    match gpu.render(&overlay_vertices) {
+                    match gpu.render(&avatar_vertices, &overlay_vertices) {
                         RenderOutcome::Success | RenderOutcome::SkipFrame => {}
                         RenderOutcome::Reconfigure => {
                             if let Some(window) = &self.platform.window {
@@ -2799,6 +2838,57 @@ impl ApplicationHandler for App {
 
 fn axis_value(positive: bool, negative: bool) -> f32 {
     positive as i8 as f32 - negative as i8 as f32
+}
+
+fn actor_state_from_snapshot(snapshot: &ActorSnapshot) -> ActorState {
+    ActorState {
+        motion: crate::game::actor::MotionState {
+            position: snapshot.position,
+            velocity: snapshot.velocity,
+        },
+        look: crate::game::actor::LookState {
+            yaw: snapshot.yaw,
+            pitch: snapshot.pitch,
+        },
+        on_ground: false,
+    }
+}
+
+fn player_avatar_color(player_id: PlayerNetId) -> [f32; 3] {
+    let seed = player_id.wrapping_mul(0x9E37_79B9).rotate_left(7);
+    let r = 0.35 + ((seed & 0xFF) as f32 / 255.0) * 0.55;
+    let g = 0.35 + (((seed >> 8) & 0xFF) as f32 / 255.0) * 0.55;
+    let b = 0.35 + (((seed >> 16) & 0xFF) as f32 / 255.0) * 0.55;
+    [r, g, b]
+}
+
+fn push_avatar_prism(vertices: &mut Vec<Vertex>, feet_position: Vec3, color: [f32; 3]) {
+    let min = Vec3::new(
+        feet_position.x - AVATAR_HALF_WIDTH,
+        feet_position.y,
+        feet_position.z - AVATAR_HALF_WIDTH,
+    );
+    let max = Vec3::new(
+        feet_position.x + AVATAR_HALF_WIDTH,
+        feet_position.y + AVATAR_HEIGHT,
+        feet_position.z + AVATAR_HALF_WIDTH,
+    );
+
+    let p000 = Vec3::new(min.x, min.y, min.z);
+    let p001 = Vec3::new(min.x, min.y, max.z);
+    let p010 = Vec3::new(min.x, max.y, min.z);
+    let p011 = Vec3::new(min.x, max.y, max.z);
+    let p100 = Vec3::new(max.x, min.y, min.z);
+    let p101 = Vec3::new(max.x, min.y, max.z);
+    let p110 = Vec3::new(max.x, max.y, min.z);
+    let p111 = Vec3::new(max.x, max.y, max.z);
+
+    push_quad(vertices, [p100, p101, p111, p110], color, Vec3::X);
+    push_quad(vertices, [p001, p000, p010, p011], color, -Vec3::X);
+    push_quad(vertices, [p001, p101, p100, p000], color, -Vec3::Y);
+    push_quad(vertices, [p010, p110, p111, p011], color, Vec3::Y);
+    push_quad(vertices, [p101, p001, p011, p111], color, Vec3::Z);
+    push_quad(vertices, [p000, p100, p110, p010], color, -Vec3::Z);
 }
 
 fn digit_to_hotbar_index(code: KeyCode) -> Option<usize> {

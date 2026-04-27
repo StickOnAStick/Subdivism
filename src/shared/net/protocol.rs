@@ -1,11 +1,12 @@
 use glam::{Quat, Vec3};
+use serde::{Deserialize, Serialize};
 
 pub type Tick = u32;
 pub type InputSeq = u32;
 pub type PlayerNetId = u32;
 pub type VehicleNetId = u32;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlTarget {
     OnFoot,
     VehiclePilot {
@@ -20,7 +21,7 @@ impl Default for ControlTarget {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct InputAxes {
     pub forward: i8,
     pub strafe: i8,
@@ -30,7 +31,7 @@ pub struct InputAxes {
     pub roll: i8,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct InputButtons {
     pub jump: bool,
     pub sprint: bool,
@@ -39,7 +40,7 @@ pub struct InputButtons {
     pub primary_action: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct PlayerInputCmd {
     pub seq: InputSeq,
     pub tick: Tick,
@@ -51,13 +52,13 @@ pub struct PlayerInputCmd {
     pub look_delta_pitch: i16,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct InputPacket {
     pub newest_seq: InputSeq,
     pub commands: Vec<PlayerInputCmd>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct ActorSnapshot {
     pub player_id: PlayerNetId,
     pub position: Vec3,
@@ -68,7 +69,7 @@ pub struct ActorSnapshot {
     pub mounted_seat: Option<u8>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct VehicleSnapshot {
     pub vehicle_id: VehicleNetId,
     pub position: Vec3,
@@ -78,7 +79,7 @@ pub struct VehicleSnapshot {
     pub throttle: f32,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SnapshotPacket {
     pub server_tick: Tick,
     pub ack_input_seq: InputSeq,
@@ -86,7 +87,7 @@ pub struct SnapshotPacket {
     pub vehicles: Vec<VehicleSnapshot>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum SeatRequestKind {
     Enter {
         vehicle_id: VehicleNetId,
@@ -95,7 +96,7 @@ pub enum SeatRequestKind {
     Exit,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct SeatRequest {
     pub player_id: PlayerNetId,
     pub tick: Tick,

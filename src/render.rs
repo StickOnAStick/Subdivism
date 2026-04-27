@@ -178,6 +178,8 @@ pub struct GpuState {
     overlay_pipeline: wgpu::RenderPipeline,
     overlay_vertex_buffer: wgpu::Buffer,
     overlay_vertex_capacity: usize,
+    entity_vertex_buffer: wgpu::Buffer,
+    entity_vertex_capacity: usize,
     screen_uniform: ScreenUniform,
     screen_uniform_buffer: wgpu::Buffer,
     screen_bind_group: wgpu::BindGroup,
@@ -441,6 +443,13 @@ impl GpuState {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let entity_vertex_capacity = 256;
+        let entity_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("entity_vertex_buffer"),
+            size: (entity_vertex_capacity * std::mem::size_of::<Vertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let depth = DepthTexture::create(&device, &config);
 
         Self {
@@ -466,6 +475,8 @@ impl GpuState {
             overlay_pipeline,
             overlay_vertex_buffer,
             overlay_vertex_capacity,
+            entity_vertex_buffer,
+            entity_vertex_capacity,
             screen_uniform,
             screen_uniform_buffer,
             screen_bind_group,
@@ -618,15 +629,22 @@ impl GpuState {
         let depth_texture_bytes = self.config.width as u64 * self.config.height as u64 * 4;
         let overlay_vertex_bytes =
             self.overlay_vertex_capacity as u64 * std::mem::size_of::<OverlayVertex>() as u64;
+        let entity_vertex_bytes =
+            self.entity_vertex_capacity as u64 * std::mem::size_of::<Vertex>() as u64;
 
         world_vertex_bytes
             + camera_uniform_bytes
             + screen_uniform_bytes
             + depth_texture_bytes
             + overlay_vertex_bytes
+            + entity_vertex_bytes
     }
 
-    pub fn render(&mut self, overlay_vertices: &[OverlayVertex]) -> RenderOutcome {
+    pub fn render(
+        &mut self,
+        entity_vertices: &[Vertex],
+        overlay_vertices: &[OverlayVertex],
+    ) -> RenderOutcome {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
@@ -639,6 +657,14 @@ impl GpuState {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+        if !entity_vertices.is_empty() {
+            self.ensure_entity_capacity(entity_vertices.len());
+            self.queue.write_buffer(
+                &self.entity_vertex_buffer,
+                0,
+                bytemuck::cast_slice(entity_vertices),
+            );
+        }
         if !overlay_vertices.is_empty() {
             self.ensure_overlay_capacity(overlay_vertices.len());
             self.queue.write_buffer(
@@ -690,6 +716,10 @@ impl GpuState {
                 render_pass.set_vertex_buffer(0, chunk.vertex_buffer.slice(..));
                 render_pass.draw(0..chunk.vertex_count, 0..1);
             }
+            if !entity_vertices.is_empty() {
+                render_pass.set_vertex_buffer(0, self.entity_vertex_buffer.slice(..));
+                render_pass.draw(0..entity_vertices.len() as u32, 0..1);
+            }
         }
 
         if !overlay_vertices.is_empty() {
@@ -738,6 +768,20 @@ impl GpuState {
         self.overlay_vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("overlay_vertex_buffer"),
             size: (self.overlay_vertex_capacity * std::mem::size_of::<OverlayVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+    }
+
+    fn ensure_entity_capacity(&mut self, vertex_count: usize) {
+        if vertex_count <= self.entity_vertex_capacity {
+            return;
+        }
+
+        self.entity_vertex_capacity = vertex_count.next_power_of_two();
+        self.entity_vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("entity_vertex_buffer"),
+            size: (self.entity_vertex_capacity * std::mem::size_of::<Vertex>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });

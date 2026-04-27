@@ -33,12 +33,20 @@ impl ServerSession {
     }
 
     pub fn ingest_input_packet(&mut self, player_id: PlayerNetId, packet: InputPacket) {
+        if !self.clients.contains_key(&player_id) {
+            let spawn_x = player_id as f32 * 2.5;
+            self.authority
+                .ensure_player(player_id, Vec3::new(spawn_x, 96.0, 0.0));
+        }
         let client = self.clients.entry(player_id).or_insert(ClientSessionState {
             player_id,
             last_acknowledged_input_seq: 0,
         });
 
         for cmd in packet.commands {
+            if cmd.player_id != player_id {
+                continue;
+            }
             self.authority.enqueue_input(cmd);
         }
         client.last_acknowledged_input_seq =

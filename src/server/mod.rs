@@ -1,4 +1,5 @@
 pub mod authority;
+pub mod net;
 pub mod session;
 pub mod snapshot;
 
@@ -29,4 +30,8 @@ pub fn run_headless() {
         "subdivism server stub: {} ticks @ {}hz in {}ms",
         ticks, tick_hz, elapsed_ms
     );
+}
+
+pub fn run_dedicated_udp(bind_addr: &str) {
+    net::run_udp_server(bind_addr);
 }
